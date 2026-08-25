@@ -1,0 +1,97 @@
+name: Reusable PR Diff Review And Merge
+
+# Wraps reusable_pr-diff-review.yml (nested workflow_call - GitHub supports
+# this) and adds one more job that merges the PR when that review's verdict
+# is "clean". Kept as a SEPARATE file, not a flag on the plain review
+# workflow: GitHub validates a reusable workflow's declared job permissions
+# against the caller at parse time, for every job in the file, regardless of
+# any `if:` condition - so a single file can't offer both "just comment"
+# (contents: read, safe for reviewing arbitrary/fork PRs) and "comment and
+# merge" (contents: write) without forcing contents: write onto callers that
+# only ever want the former. Two files keeps least-privilege for the plain
+# reviewer (ai-review.yml) while giving the merge-capable one (renovate
+# PRs only) exactly the extra permission it needs.
+
+on:
+  workflow_call:
+    inputs:
+      system_prompt_extra:
+        required: false
+        type: string
+        default: ''
+      comment_marker:
+        required: false
+        type: string
+        default: '<!-- ai-code-review -->'
+      comment_heading:
+        required: false
+        type: string
+        default: 'AI Code Review'
+      max_chars:
+        required: false
+        type: number
+        default: 140000
+      timeout_seconds:
+        required: false
+        type: number
+        default: 120
+      openrouter_model:
+        required: false
+        type: string
+        default: ''
+      openrouter_endpoint:
+        required: false
+        type: string
+        default: ''
+      openrouter_site_url:
+        required: false
+        type: string
+        default: ''
+      openrouter_app_name:
+        required: false
+        type: string
+        default: ''
+      merge_method:
+        description: 'merge method passed to gh pr merge: merge | squash | rebase'
+        required: false
+        type: string
+        default: 'squash'
+    secrets:
+      openrouter_api_key:
+        required: false
+
+permissions: {}
+
+jobs:
+  review:
+    uses: ./.github/workflows/reusable_pr-diff-review.yml
+    with:
+      system_prompt_extra: ${{ inputs.system_prompt_extra }}
+      comment_marker: ${{ inputs.comment_marker }}
+      comment_heading: ${{ inputs.comment_heading }}
+      max_chars: ${{ inputs.max_chars }}
+      timeout_seconds: ${{ inputs.timeout_seconds }}
+      openrouter_model: ${{ inputs.openrouter_model }}
+      openrouter_endpoint: ${{ inputs.openrouter_endpoint }}
+      openrouter_site_url: ${{ inputs.openrouter_site_url }}
+      openrouter_app_name: ${{ inputs.openrouter_app_name }}
+    secrets:
+      openrouter_api_key: ${{ secrets.openrouter_api_key }}
+
+  merge:
+    needs: review
+    if: needs.review.outputs.clean == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Merge the PR
+        run: |
+          set -euo pipefail
+          echo "Review is clean — merging PR #${{ github.event.pull_request.number }}."
+          gh pr merge "${{ github.event.pull_request.number }}" \
+            --${{ inputs.merge_method }} \
+            --repo "${{ github.repository }}"
+        env:
+          GH_TOKEN: ${{ github.token }}

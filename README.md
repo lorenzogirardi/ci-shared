@@ -51,6 +51,34 @@ Secret: `openrouter_api_key` (optional — omit or pass empty to no-op the AI
 step while still posting a "did not run" comment; used by the caller to blank
 the key on fork PRs).
 
+Job permissions: `contents: read`, `pull-requests: write`. Never merges
+anything — it exposes a `clean` output (`"true"` only when the review
+actually ran and found no `[Critical]` finding) for a caller that wants to
+act on the verdict, e.g. the merge wrapper below.
+
+### `reusable_pr-diff-review-and-merge.yml`
+
+Same review as above (calls it as a nested reusable workflow — same inputs,
+same secret) plus one more job that runs `gh pr merge` when the nested call's
+`clean` output is `"true"`. Kept as a **separate file** rather than a flag on
+the plain reviewer: GitHub validates every job's declared `permissions:` in a
+reusable workflow against what the caller grants, for every job in the file,
+regardless of any `if:` condition — so a single file can't offer both
+"comment only" (`contents: read`, safe to use on arbitrary/fork PRs) and
+"comment and merge" (`contents: write`) without forcing `contents: write`
+onto every caller, including ones that never want it. (This actually broke
+`ai-review.yml` in flask-test-api the first time it was tried as a flag —
+see commit history.)
+
+Same inputs as `reusable_pr-diff-review.yml` plus `merge_method` (default
+`squash`). No `auto_merge_if_clean` input — calling this file at all means
+"merge when clean"; if a caller doesn't want that, it calls the plain
+reviewer instead.
+
+Use this only for PRs whose diff you're comfortable merging unattended on a
+clean verdict — e.g. a dependency bot with no application code in the diff.
+Never for human-authored PRs or anything that touches app source.
+
 ### `reusable_ci-analysis.yml`
 
 Post-pipeline informative report: downloads `ai-context-*` artifacts uploaded
