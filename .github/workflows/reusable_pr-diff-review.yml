@@ -53,6 +53,16 @@ on:
         required: false
         type: string
         default: ''
+      auto_merge_if_clean:
+        description: 'Merge the PR automatically if the review contains no [Critical] finding. Only merges when the AI review actually ran (never on a skipped/failed review).'
+        required: false
+        type: boolean
+        default: false
+      merge_method:
+        description: 'merge method passed to gh pr merge: merge | squash | rebase'
+        required: false
+        type: string
+        default: 'squash'
     secrets:
       openrouter_api_key:
         description: 'API key for the OpenAI-compatible endpoint. Left empty on fork PRs by the caller.'
@@ -64,7 +74,7 @@ jobs:
   review:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       pull-requests: write
     env:
       OPENROUTER_API_KEY: ${{ secrets.openrouter_api_key }}
@@ -239,3 +249,26 @@ jobs:
                 body,
               });
             }
+
+      - name: Auto-merge if the review is clean
+        # Only merges when review.md exists (the AI review actually completed —
+        # never on a skipped/fork/failed run) AND it contains no [Critical]
+        # marker. [Warning]/[Suggestion] findings don't block. Major vs
+        # minor/patch bump makes no difference — same bar for all.
+        if: inputs.auto_merge_if_clean
+        run: |
+          set -euo pipefail
+          if [ ! -f .ai/review.md ]; then
+            echo "No review.md (AI review did not run) — not merging."
+            exit 0
+          fi
+          if grep -qi '\[critical\]' .ai/review.md; then
+            echo "Review found a [Critical] finding — not merging."
+            exit 0
+          fi
+          echo "Review is clean — merging PR #${{ github.event.pull_request.number }}."
+          gh pr merge "${{ github.event.pull_request.number }}" \
+            --${{ inputs.merge_method }} \
+            --repo "${{ github.repository }}"
+        env:
+          GH_TOKEN: ${{ github.token }}
