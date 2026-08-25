@@ -13,12 +13,16 @@ Claude Code routines — plain HTTP call from a stdlib-only Python script.
 ## Versioning
 
 Consumers pin a tag (`@v1`), never `@main`, so a change here can't silently
-break every consumer at once. Both reusable workflows resolve
-`github.workflow_ref` at run time to check out `scripts/` at the **same**
-ref the consumer pinned — the workflow logic and the scripts it calls can
-never drift apart across a version bump.
+break every consumer at once. Each reusable workflow checks out `scripts/`
+with a **literal** `ref: v1` in its own "Checkout shared scripts" step —
+not resolved dynamically (`github.workflow_ref` inside a called reusable
+workflow reflects the *caller's* ref, e.g. a PR merge ref in the consumer
+repo, not the tag pinned in this repo's own `uses:` line, so that can't be
+used to self-reference). Because the checkout step ships as part of the
+tag's own content, bumping the tag and bumping that literal ref happen in
+the same commit by construction — they can't drift apart.
 
-A behavior change moves the `v1` tag forward (`git tag -f v1 && git push -f origin v1`) once verified against the real consumers; a breaking change instead gets a new `v2` tag so existing `@v1` consumers are unaffected until they bump on purpose.
+A behavior change moves the `v1` tag forward (`git tag -f v1 && git push -f origin v1`) once verified against the real consumers; a breaking change instead gets a new `v2` tag (and its own `ref: v2` literal in the checkout steps) so existing `@v1` consumers are unaffected until they bump on purpose.
 
 ## Workflows
 

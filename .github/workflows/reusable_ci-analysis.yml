@@ -75,20 +75,16 @@ jobs:
       - name: Checkout caller repo
         uses: actions/checkout@v4
 
-      - name: Resolve shared repo ref
-        id: shared_ref
-        env:
-          WORKFLOW_REF: ${{ github.workflow_ref }}
-        run: |
-          # Reuse whatever ref/tag the consumer pinned in its own `uses:` line, so
-          # scripts and workflow logic never drift apart across a version bump.
-          echo "ref=${WORKFLOW_REF##*@}" >> "$GITHUB_OUTPUT"
-
       - name: Checkout shared scripts
+        # github.workflow_ref resolves to the CALLER's ref (e.g. the pipeline
+        # run's own ref), not the tag pinned in this reusable workflow's `uses:`
+        # line — there is no context that reflects that. Pin literally instead:
+        # this line ships as part of the v1 tag's own content, so bumping the
+        # tag and bumping this ref happen in the same commit by construction.
         uses: actions/checkout@v4
         with:
           repository: lorenzogirardi/ci-shared
-          ref: ${{ steps.shared_ref.outputs.ref }}
+          ref: v1
           path: .shared
 
       - name: Download AI context artifacts
