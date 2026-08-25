@@ -1,0 +1,227 @@
+name: Reusable CI Analysis
+
+# Called after a consumer repo's own deterministic gates (lint, tests, container
+# scan, IaC checks, k8s probe) have run and uploaded their output as
+# `ai-context-*` artifacts. Downloads them, bundles them with the app source,
+# and produces an informative Markdown report. Never gates the pipeline itself
+# — the caller decides whether this job's outcome affects anything.
+#
+# Extracted from flask-test-api's pipeline.yml `ai-analysis` job.
+
+on:
+  workflow_call:
+    inputs:
+      source_glob:
+        description: 'Glob (relative to repo root) of source files to bundle for the security review, e.g. app'
+        required: false
+        type: string
+        default: 'app'
+      max_bytes_source:
+        required: false
+        type: number
+        default: 40000
+      max_bytes_total:
+        required: false
+        type: number
+        default: 120000
+      max_output_tokens:
+        required: false
+        type: number
+        default: 32000
+      max_prompt_chars:
+        required: false
+        type: number
+        default: 150000
+      timeout_seconds:
+        required: false
+        type: number
+        default: 300
+      openrouter_model:
+        required: false
+        type: string
+        default: ''
+      openrouter_endpoint:
+        required: false
+        type: string
+        default: ''
+      openrouter_site_url:
+        required: false
+        type: string
+        default: ''
+      openrouter_app_name:
+        required: false
+        type: string
+        default: ''
+    secrets:
+      openrouter_api_key:
+        required: true
+
+permissions: {}
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+      actions: read
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.openrouter_api_key }}
+      OPENROUTER_MODEL: ${{ inputs.openrouter_model }}
+      OPENROUTER_ENDPOINT: ${{ inputs.openrouter_endpoint }}
+      OPENROUTER_SITE_URL: ${{ inputs.openrouter_site_url }}
+      OPENROUTER_APP_NAME: ${{ inputs.openrouter_app_name }}
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@v4
+
+      - name: Resolve shared repo ref
+        id: shared_ref
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          # Reuse whatever ref/tag the consumer pinned in its own `uses:` line, so
+          # scripts and workflow logic never drift apart across a version bump.
+          echo "ref=${WORKFLOW_REF##*@}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout shared scripts
+        uses: actions/checkout@v4
+        with:
+          repository: lorenzogirardi/ci-shared
+          ref: ${{ steps.shared_ref.outputs.ref }}
+          path: .shared
+
+      - name: Download AI context artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: .ai/
+          pattern: 'ai-context-*'
+          merge-multiple: true
+          if-no-files-found: warn
+
+      - name: Sanitize contexts and build prompt
+        run: |
+          mkdir -p .ai
+          if [ ! -s .ai/lint-errors.txt ]; then
+            echo "no lint output available, creating empty marker" > .ai/lint-errors.txt
+          fi
+          if [ ! -s .ai/tests.txt ]; then
+            echo "no test output available" > .ai/tests.txt
+          fi
+          find "${{ inputs.source_glob }}" -name '*.py' -print0 | sort -z > /tmp/srclist
+          if [ -s /tmp/srclist ]; then
+            python3 .shared/scripts/ai_sanitize.py \
+              --out .ai/source-context.txt \
+              --max-bytes ${{ inputs.max_bytes_source }} \
+              $(xargs -0 < /tmp/srclist) || rm -f .ai/source-context.txt
+          fi
+          python3 .shared/scripts/ai_sanitize.py \
+            --out .ai/security-context.txt \
+            --max-bytes ${{ inputs.max_bytes_total }} \
+            .ai/lint-errors.txt .ai/tests.txt .ai/source-context.txt \
+            .ai/trivy-results.txt .ai/results.sarif .ai/k8s-probe.txt || rm -f .ai/security-context.txt
+
+      - name: Create AI analysis prompt
+        shell: bash
+        run: |
+          cat > .ai/analysis-system.txt <<'EOF'
+          You are a QA/DevOps/security analyst. You are given the CI output of a full
+          pipeline (lint, tests, container scan, helm/IaC checks, K8s probe) and the
+          application source code. ALL the data you need is in the prompt below. Treat
+          it as ground truth: do not guess, compute, or hedge.
+
+          RULES:
+          - Be direct and concise. Output the report only; no chain-of-thought.
+          - Cite evidence for every claim: exact test counts as printed, file paths and
+            line numbers for code findings, CVE ids and Checkov rule ids as printed.
+          - Pointed suggestions: for each issue give a concrete actionable fix:
+            "in <file>:<line>, change X to Y because <reason>". No abstract advice.
+          - No hedging: ban words like "I think", "likely", "maybe", "let me count",
+            "I am not sure", "could be". If the data is ambiguous, say which value the
+            context reports and stop; never invent numbers.
+          - Confidence: if a claim is not verifiable from the prompt, skip it or mark
+            it explicitly as an assumption (one line only).
+
+          Produce a technical report in Markdown with:
+          - **Summary**: overall pipeline outcome, lint errors by kind/file, test
+            pass/fail/skip counts exactly as printed, container/IaC/k8s findings
+            with ids.
+          - **High severity issues** (anything likely to break behavior), each with
+            file:line and the minimal fix.
+          - **Failures / flaky tests** (report only what appears).
+          - **Security review**: analyze the source for logical vulnerabilities:
+            authorization/authentication bypasses, inverted conditions, missing
+            access control, hardcoded secrets, mass assignment, IDOR, SSRF,
+            trusting client input, data exposure through debug endpoints.
+          - **Code style / maintainability issues** (low severity).
+          - **False positives** (note any code that looks alarming but is safe).
+          - **Concrete suggestions**: numbered, each with file:line + exact change.
+          The report is INFORMATIVE only - it never changes the pipeline result.
+          EOF
+          cat > .ai/analysis-user.txt <<EOF
+          Repository event: ${{ github.event_name }}
+          Branch: ${{ github.ref_name }}
+          Source: flake8 + pytest output + gate outputs + app source (for security review)
+          EOF
+          echo "== CI OUTPUT + SOURCE + GATE RESULTS ==" >> .ai/analysis-user.txt
+          cat .ai/security-context.txt >> .ai/analysis-user.txt
+
+      - name: Run AI analysis
+        if: env.OPENROUTER_API_KEY != ''
+        run: |
+          python3 .shared/scripts/openrouter_ai.py \
+            --system-file .ai/analysis-system.txt \
+            --prompt-file .ai/analysis-user.txt \
+            --max-chars ${{ inputs.max_prompt_chars }} \
+            --max-tokens ${{ inputs.max_output_tokens }} \
+            --timeout ${{ inputs.timeout_seconds }} \
+            --usage-file .ai/usage.json \
+            > .ai/ai-report.md
+
+      - name: Append token usage & cost to report
+        if: env.OPENROUTER_API_KEY != ''
+        run: |
+          python3 .shared/scripts/ai_append_cost.py \
+            --usage-file .ai/usage.json \
+            --report-file .ai/ai-report.md
+
+      - name: Mask secrets in report before upload
+        if: env.OPENROUTER_API_KEY != ''
+        run: |
+          python3 .shared/scripts/ai_sanitize.py --redact-file .ai/ai-report.md \
+            >/dev/null 2>&1 || echo "::warning::AI report contained secret-like patterns, they have been masked"
+
+      - name: Show tests results in pipeline summary
+        run: |
+          {
+            echo "## 🧪 Tests"
+            echo ""
+            echo '```text'
+            if [ -s .ai/tests.txt ]; then
+              tail -40 .ai/tests.txt
+            else
+              echo "no test output"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show AI analysis in pipeline summary
+        if: env.OPENROUTER_API_KEY != ''
+        run: |
+          echo "::group::🤖 AI Analysis Report"
+          cat .ai/ai-report.md
+          echo "::endgroup::"
+          {
+            echo "## 🤖 AI Analysis Report"
+            echo ""
+            cat .ai/ai-report.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload AI analysis report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-analysis-report
+          path: .ai/ai-report.md
+          if-no-files-found: ignore
+          retention-days: 7
