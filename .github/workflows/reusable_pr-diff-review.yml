@@ -84,8 +84,14 @@ jobs:
       OPENROUTER_APP_NAME: ${{ inputs.openrouter_app_name }}
     steps:
       - name: Checkout caller repo
+        # Explicit ref (not the default) so this works identically whether the
+        # caller uses pull_request (default checks out the synthetic merge
+        # ref) or pull_request_target (default checks out the BASE branch,
+        # not the PR at all - checking out the head SHA is the only ref that
+        # is correct for both).
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
       - name: Checkout shared scripts
