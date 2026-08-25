@@ -59,7 +59,7 @@ on:
         required: false
     outputs:
       clean:
-        description: '"true" if the review ran and found no [Critical] finding. "false" if it found one, or never ran (skipped/failed) - never merge on "false".'
+        description: '"true" only if the review ran and its last line was exactly "VERDICT: CLEAN". "false" for any other outcome (NEEDS_REVIEW, malformed, or the review never ran) - never merge on "false".'
         value: ${{ jobs.review.outputs.clean }}
 
 permissions: {}
@@ -181,6 +181,13 @@ jobs:
               "- Classify each finding as [Critical] | [Warning] | [Suggestion].",
               "- If no relevant problems are found, state that explicitly and do not invent issues.",
               "- Never propose commands to run, never edit code.",
+              "- The LAST line of your entire response must be exactly one of these two",
+              "  literal strings, on its own line, with nothing before or after it on",
+              "  that line: \"VERDICT: CLEAN\" or \"VERDICT: NEEDS_REVIEW\". Output",
+              "  VERDICT: CLEAN only if you found zero [Critical] findings anywhere",
+              "  above. Output VERDICT: NEEDS_REVIEW if you found at least one. This is",
+              "  parsed by an exact string match on the last line, not read by a human -",
+              "  do not add punctuation, formatting, or explanation on that line.",
             ];
             const system = base.concat(extra ? [extra, ""] : []).concat(tail).join("\n");
             const user = ["PR title: " + (process.env.PR_TITLE || "")].join("\n");
@@ -225,7 +232,10 @@ jobs:
             const num = context.issue.number;
             let body;
             if (fs.existsSync(".ai/review.md")) {
-              const content = fs.readFileSync(".ai/review.md", "utf8").slice(0, 60000);
+              // Strip the machine-readable VERDICT line - it's for the merge
+              // job, not useful to a human reading the PR comment.
+              const raw = fs.readFileSync(".ai/review.md", "utf8");
+              const content = raw.replace(/\n?VERDICT: (CLEAN|NEEDS_REVIEW)\s*$/, "").slice(0, 60000);
               body = `${marker}\n\n## ${heading}\n\n${content}`;
             } else {
               body = `${marker}\n\n## ${heading}\n\n⚠️ The AI review did not run. Check the workflow logs.`;
@@ -254,14 +264,19 @@ jobs:
 
       - name: Compute clean verdict
         # "clean" = the AI review actually ran (review.md exists - never true
-        # on a skipped/fork/failed run) AND found no [Critical] marker.
-        # [Warning]/[Suggestion] don't count. This job never merges anything
-        # itself (contents: read only) - it just hands the verdict to whoever
-        # called it, e.g. reusable_pr-diff-review-and-merge.yml.
+        # on a skipped/fork/failed run) AND its LAST line is the exact string
+        # "VERDICT: CLEAN" (see the prompt rule above). Exact match on a
+        # dedicated last line, not a substring search over free-form prose -
+        # a sentence like "no [Critical] issues found" can't false-positive
+        # this the way it could a plain grep for "[critical]" anywhere in the
+        # text. Any other last line (missing, malformed, NEEDS_REVIEW) means
+        # not clean. This job never merges anything itself (contents: read
+        # only) - it just hands the verdict to whoever called it, e.g.
+        # reusable_pr-diff-review-and-merge.yml.
         id: verdict
         if: always()
         run: |
-          if [ -f .ai/review.md ] && ! grep -qi '\[critical\]' .ai/review.md; then
+          if [ -f .ai/review.md ] && [ "$(tail -n 1 .ai/review.md)" = "VERDICT: CLEAN" ]; then
             echo "clean=true" >> "$GITHUB_OUTPUT"
           else
             echo "clean=false" >> "$GITHUB_OUTPUT"
