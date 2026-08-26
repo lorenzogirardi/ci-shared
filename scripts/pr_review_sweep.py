@@ -478,14 +478,24 @@ def autofix_one(pr: dict, args: argparse.Namespace, repo: str,
     if error:
         return "rejected", error
 
+    # A runner checkout has no committer identity and `git commit` refuses
+    # without one. Set it here rather than assuming the caller did.
+    run(["git", "config", "user.name", "ci-shared autofix"], check=False)
+    run(["git", "config", "user.email", "actions@github.com"], check=False)
+
     run(["git", "add", *changed])
     message = (
         f"fix(deps): repair CI on this PR\n\n{explanation}\n\n"
         "Written by the ci-shared CI autofix and pushed unreviewed. The "
         "required checks re-run on this commit and decide whether it merges."
     )
-    if run(["git", "commit", "--quiet", "-m", message], check=False).returncode != 0:
-        return "skipped", "the edit produced no change"
+    committed = run(["git", "commit", "--quiet", "-m", message], check=False)
+    if committed.returncode != 0:
+        # Report git's own reason. An earlier version said "the edit produced
+        # no change" for every failure, which hid the missing identity above
+        # behind a confidently wrong diagnosis.
+        reason = (committed.stderr or committed.stdout or "").strip()[:200]
+        return "skipped", f"commit failed: {reason or 'no output from git'}"
 
     pushed = run(["git", "push", "origin", f"HEAD:refs/heads/{branch}"], check=False)
     if pushed.returncode != 0:
