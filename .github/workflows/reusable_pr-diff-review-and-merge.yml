@@ -60,10 +60,20 @@ on:
       openrouter_api_key:
         required: false
 
-permissions: {}
-
 jobs:
   review:
+    # No top-level `permissions:` on this file (unlike the plain reviewer) -
+    # a job that doesn't declare its own `permissions:` inherits from the
+    # FILE's own top-level block if one is set, not from the caller. With
+    # `permissions: {}` here (copied from the plain file without realizing
+    # this), GitHub capped this nested call to `contents: none,
+    # pull-requests: none` regardless of what renovate-ai-review.yml granted -
+    # confirmed by the actual GitHub error: "is only allowed 'contents: none,
+    # pull-requests: none'". Declaring it explicitly here instead removes the
+    # ambiguity either way.
+    permissions:
+      contents: read
+      pull-requests: write
     uses: ./.github/workflows/reusable_pr-diff-review.yml
     with:
       system_prompt_extra: ${{ inputs.system_prompt_extra }}
