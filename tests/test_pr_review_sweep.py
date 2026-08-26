@@ -84,6 +84,50 @@ def test_no_checks_is_not_treated_as_green(monkeypatch):
     assert checks_state("o/r", "sha")[0] == "none"
 
 
+def test_only_skipped_checks_is_not_green(monkeypatch):
+    """Regression: this merged real PRs with nothing tested.
+
+    A Renovate PR's only check run was the review workflow reporting
+    `skipped` (it skips bot authors). "Nothing failed" read as green, so the
+    sweep merged it without a single test having run.
+    """
+    _fake_check_runs(monkeypatch, [
+        {"name": "review", "status": "completed", "conclusion": "skipped"},
+    ])
+    state, detail = checks_state("o/r", "sha")
+    assert state == "none"
+    assert "no check actually ran" in detail
+
+
+def test_required_check_must_be_present_and_successful(monkeypatch):
+    _fake_check_runs(monkeypatch, [
+        {"name": "review", "status": "completed", "conclusion": "skipped"},
+        {"name": "checks", "status": "completed", "conclusion": "success"},
+    ])
+    assert checks_state("o/r", "sha", ("checks",))[0] == "green"
+    # A required check that never ran is pending, not green — and not failing
+    # either, since a fresh push may not have registered it yet.
+    assert checks_state("o/r", "sha", ("checks", "e2e"))[0] == "pending"
+
+
+def test_required_check_failing_blocks_even_if_others_pass(monkeypatch):
+    _fake_check_runs(monkeypatch, [
+        {"name": "checks", "status": "completed", "conclusion": "failure"},
+        {"name": "workflows", "status": "completed", "conclusion": "success"},
+    ])
+    state, detail = checks_state("o/r", "sha", ("checks", "workflows"))
+    assert state == "failing"
+    assert "checks" in detail
+
+
+def test_required_check_skipped_is_not_success(monkeypatch):
+    """Skipping the gate is not passing it, even when named as required."""
+    _fake_check_runs(monkeypatch, [
+        {"name": "checks", "status": "completed", "conclusion": "skipped"},
+    ])
+    assert checks_state("o/r", "sha", ("checks",))[0] == "failing"
+
+
 @pytest.mark.parametrize(
     "review, expected_clean",
     [

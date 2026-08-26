@@ -36,6 +36,11 @@ on:
         required: false
         type: string
         default: 'squash'
+      required_checks:
+        description: 'Comma-separated check-run names that must have SUCCEEDED before a merge (e.g. "checks,workflows"). Strongly recommended with auto_merge: without it the gate only asks that nothing failed, which a single skipped check satisfies — that is how PRs got merged here with nothing tested.'
+        required: false
+        type: string
+        default: ''
       triage_on_failure:
         description: 'When CI is already failing on a PR, explain the failure (quoting the job logs) instead of reviewing the diff. Same single model call either way — and a proven failure is something a model can explain, unlike predicting from a diff whether code will install and run.'
         required: false
@@ -128,5 +133,6 @@ jobs:
             --timeout ${{ inputs.timeout_seconds }} \
             --heading "${{ inputs.comment_heading }}" \
             --merge-method "${{ inputs.merge_method }}" \
+            --required-checks "${{ inputs.required_checks }}" \
             ${{ inputs.auto_merge && '--auto-merge' || '' }} \
             ${{ inputs.triage_on_failure && '--triage-on-failure' || '' }}

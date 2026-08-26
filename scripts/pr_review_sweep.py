@@ -63,21 +63,45 @@ def existing_sweep_comment(repo: str, number: int) -> dict | None:
     return ours[-1] if ours else None
 
 
-def checks_state(repo: str, head_sha: str) -> tuple[str, str]:
+def checks_state(repo: str, head_sha: str,
+                 required: tuple[str, ...] = ()) -> tuple[str, str]:
     """('green'|'failing'|'pending'|'none', human-readable detail).
 
     A model reading a diff cannot know whether the code still builds, installs,
     or serves a request -- a CI run does. So the merge gate is the CI result;
     the review verdict only decides whether a human should look at it.
 
-    'none' (no checks configured) is deliberately NOT treated as green: a repo
-    with no CI should not get unattended merges just because nothing objected.
+    `required` names the checks that must have actually SUCCEEDED. Without it
+    this gate is close to vacuous, and was: an earlier version accepted "at
+    least one check run exists and none failed", so a Renovate PR whose only
+    check was the review workflow reporting `skipped` (it skips bot authors)
+    counted as green and got merged with nothing tested at all. "Nothing
+    objected" is not the same as "something verified".
+
+    Absent a required check, the state is 'pending', not 'failing': on a fresh
+    push the run may simply not have registered yet, and the next sweep will
+    look again.
     """
     runs = gh_json([f"repos/{repo}/commits/{head_sha}/check-runs"]) or {}
     checks = runs.get("check_runs", []) if isinstance(runs, dict) else []
-    # The sweep's own review posts no check run, so nothing here is self-referential.
     if not checks:
         return "none", "no check runs reported for this commit"
+
+    by_name = {c.get("name"): c for c in checks}
+
+    if required:
+        missing = [name for name in required if name not in by_name]
+        incomplete = [name for name in required
+                      if name in by_name and by_name[name].get("status") != "completed"]
+        failing = [name for name in required
+                   if name in by_name and by_name[name].get("status") == "completed"
+                   and by_name[name].get("conclusion") != "success"]
+        if failing:
+            return "failing", f"required check(s) not successful: {', '.join(sorted(failing))}"
+        if missing or incomplete:
+            waiting = sorted(missing + incomplete)
+            return "pending", f"required check(s) not finished: {', '.join(waiting)}"
+        return "green", f"required check(s) passed: {', '.join(required)}"
 
     pending = [c["name"] for c in checks if c.get("status") != "completed"]
     if pending:
@@ -87,7 +111,13 @@ def checks_state(repo: str, head_sha: str) -> tuple[str, str]:
            if c.get("conclusion") not in ("success", "neutral", "skipped")]
     if bad:
         return "failing", f"failing: {', '.join(sorted(bad)[:5])}"
-    return "green", f"{len(checks)} check(s) passed"
+
+    # Without a required list, insist on at least one genuine success: a lone
+    # skipped check proves nothing was run, let alone that it passed.
+    succeeded = [c["name"] for c in checks if c.get("conclusion") == "success"]
+    if not succeeded:
+        return "none", "no check actually ran (all skipped or neutral)"
+    return "green", f"{len(succeeded)} check(s) passed"
 
 
 def failed_check_runs(repo: str, head_sha: str) -> list[dict]:
@@ -335,14 +365,15 @@ def comment_body(
     )
 
 
-def try_merge(repo: str, number: int, head_sha: str, method: str) -> str:
+def try_merge(repo: str, number: int, head_sha: str, method: str,
+              required: tuple[str, ...] = ()) -> str:
     """Attempt the merge, gated on CI. Returns a merge_outcome string.
 
     CI is the gate, not the review verdict: a model reading a diff cannot know
     whether the code still installs and serves requests, and two bumps it
     waved through as clean broke main precisely there.
     """
-    state, detail = checks_state(repo, head_sha)
+    state, detail = checks_state(repo, head_sha, required)
     if state != "green":
         print(f"Not merging PR #{number}: {detail}.")
         return {"failing": "checks failing",
@@ -383,6 +414,13 @@ def main() -> int:
     parser.add_argument("--heading", default="AI Review (sweep)")
     parser.add_argument("--auto-merge", action="store_true")
     parser.add_argument(
+        "--required-checks",
+        default="",
+        help="Comma-separated check-run names that must have SUCCEEDED before a "
+             "merge. Strongly recommended with --auto-merge: without it the gate "
+             "only asks that nothing failed, which a lone skipped check satisfies.",
+    )
+    parser.add_argument(
         "--triage-on-failure",
         action="store_true",
         help="When CI is already failing on a PR, explain the failure instead of "
@@ -395,6 +433,10 @@ def main() -> int:
     pathlib.Path(".ai").mkdir(exist_ok=True)
     system_file = pathlib.Path(args.system_file)
     authors = {a.strip() for a in args.authors.split(",") if a.strip()}
+    required = tuple(c.strip() for c in args.required_checks.split(",") if c.strip())
+    if args.auto_merge and not required:
+        print("::warning::--auto-merge without --required-checks: the gate only "
+              "asks that nothing failed, which a single skipped check satisfies.")
 
     reviewed = merged = skipped = triaged = 0
     for pr in list_open_prs(args.repo):
@@ -414,7 +456,7 @@ def main() -> int:
             # PR is still open, CI was probably not finished last time -- retry
             # just the merge, without paying for the review again.
             if args.auto_merge and "<!-- verdict: clean -->" in existing_body:
-                outcome = try_merge(args.repo, number, head_sha, args.merge_method)
+                outcome = try_merge(args.repo, number, head_sha, args.merge_method, required)
                 if outcome == "merged":
                     merged += 1
                 else:
@@ -425,7 +467,7 @@ def main() -> int:
             # once CI goes green (a re-run of a flaky job), it is stale and the
             # PR deserves a real review even though the SHA never changed.
             stale_triage = ("<!-- verdict: ci-failure -->" in existing_body
-                            and checks_state(args.repo, head_sha)[0] != "failing")
+                            and checks_state(args.repo, head_sha, required)[0] != "failing")
             if not stale_triage:
                 print(f"PR #{number} already reviewed at {head_sha[:7]} — skipping.")
                 skipped += 1
@@ -435,7 +477,8 @@ def main() -> int:
         # Check CI before spending a model call: on a red PR, explaining the
         # failure is worth more than reviewing the diff, and it costs the same
         # one call either way.
-        ci_state = checks_state(args.repo, head_sha)[0] if args.triage_on_failure else None
+        ci_state = (checks_state(args.repo, head_sha, required)[0]
+                    if args.triage_on_failure else None)
 
         if ci_state == "failing":
             print(f"::group::Triaging failed CI on PR #{number} ({author}): {pr['title']}")
@@ -465,7 +508,7 @@ def main() -> int:
         # happened rather than what was about to be attempted.
         merge_outcome = "not attempted"
         if is_clean and args.auto_merge:
-            merge_outcome = try_merge(args.repo, number, head_sha, args.merge_method)
+            merge_outcome = try_merge(args.repo, number, head_sha, args.merge_method, required)
             if merge_outcome == "merged":
                 merged += 1
 
