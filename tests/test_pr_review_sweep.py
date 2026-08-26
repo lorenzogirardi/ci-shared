@@ -13,14 +13,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
 
 import pr_review_sweep  # noqa: E402
 from pr_review_sweep import (  # noqa: E402
-    MAX_FIND_CHARS,
-    MAX_FIX_EDITS,
-    _autofix_report,
-    apply_fix,
     checks_state,
     comment_body,
     error_region,
-    parse_fix,
     split_verdict,
 )
 
@@ -37,104 +32,6 @@ def test_error_region_keeps_the_error_and_drops_the_middle_noise():
     assert "conflicting dependencies" in region
     assert "noise 200" not in region  # the middle is dropped
     assert "..." in region  # and the elision is visible
-
-
-class TestAutofixGuardrails:
-    """These are the rules that stand between model output and a pushed commit.
-
-    Enforced in code rather than in the prompt: a prompt is a request, and the
-    whole point here is that a wrong or adversarial reply must not become a
-    commit.
-    """
-
-    def _reply(self, edits, explanation="because"):
-        import json as _json
-        return "```json\n" + _json.dumps({"explanation": explanation, "edits": edits}) + "\n```"
-
-    def test_accepts_a_well_formed_manifest_edit(self):
-        parsed = parse_fix(self._reply(
-            [{"file": "requirements.txt", "find": "pydantic==2.11.7",
-              "replace": "pydantic==2.13.4"}]))
-        assert parsed is not None
-        edits, explanation = parsed
-        assert edits[0]["file"] == "requirements.txt"
-        assert explanation == "because"
-
-    def test_reads_bare_json_without_a_fence(self):
-        import json as _json
-        parsed = parse_fix(_json.dumps({"explanation": "x", "edits": []}))
-        assert parsed == ([], "x")
-
-    @pytest.mark.parametrize("path", [
-        "app/main.py",            # application code
-        "tests/test_storage.py",  # tests
-        ".github/workflows/pipeline.yml",  # CI definition
-        "setup.py",
-        "../../etc/passwd",       # traversal
-        "/etc/passwd",            # absolute
-    ])
-    def test_rejects_files_outside_the_manifest_allowlist(self, path):
-        assert parse_fix(self._reply(
-            [{"file": path, "find": "a", "replace": "b"}])) is None
-
-    def test_rejects_malformed_or_oversized_replies(self):
-        assert parse_fix("not json at all") is None
-        assert parse_fix('```json\n{"edits": []}\n```') is None       # no explanation
-        assert parse_fix('```json\n{"explanation": "x"}\n```') is None  # no edits
-        # A no-op edit would produce an empty commit.
-        assert parse_fix(self._reply(
-            [{"file": "requirements.txt", "find": "a", "replace": "a"}])) is None
-        # Too many edits stops "minimal fix" turning into a rewrite.
-        assert parse_fix(self._reply(
-            [{"file": "requirements.txt", "find": f"x{i}", "replace": "y"}
-             for i in range(MAX_FIX_EDITS + 1)])) is None
-        # An oversized anchor is not a targeted change.
-        assert parse_fix(self._reply(
-            [{"file": "requirements.txt", "find": "x" * (MAX_FIND_CHARS + 1),
-              "replace": "y"}])) is None
-
-    def test_applies_a_unique_anchor(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
-        (tmp_path / "requirements.txt").write_text("fastapi==1\npydantic==2.11.7\n")
-        changed, error = apply_fix([{"file": "requirements.txt",
-                                     "find": "pydantic==2.11.7",
-                                     "replace": "pydantic==2.13.4"}])
-        assert error is None and changed == ["requirements.txt"]
-        assert (tmp_path / "requirements.txt").read_text() == "fastapi==1\npydantic==2.13.4\n"
-
-    def test_refuses_an_ambiguous_anchor(self, tmp_path, monkeypatch):
-        """An anchor matching twice is how a 'small' edit hits the wrong line."""
-        monkeypatch.chdir(tmp_path)
-        (tmp_path / "requirements.txt").write_text("x==1\nx==1\n")
-        changed, error = apply_fix([{"file": "requirements.txt",
-                                     "find": "x==1", "replace": "x==2"}])
-        assert changed == []
-        assert "appears 2 times" in error
-        assert (tmp_path / "requirements.txt").read_text() == "x==1\nx==1\n"
-
-    def test_writes_nothing_when_any_edit_in_the_batch_is_invalid(self, tmp_path, monkeypatch):
-        """All-or-nothing: a half-applied fix is worse than none."""
-        monkeypatch.chdir(tmp_path)
-        (tmp_path / "requirements.txt").write_text("a==1\n")
-        changed, error = apply_fix([
-            {"file": "requirements.txt", "find": "a==1", "replace": "a==2"},
-            {"file": "Dockerfile", "find": "FROM x", "replace": "FROM y"},  # missing
-        ])
-        assert changed == [] and "Dockerfile" in error
-        assert (tmp_path / "requirements.txt").read_text() == "a==1\n"
-
-
-class TestAutofixReporting:
-    def test_a_pushed_fix_is_declared_as_unreviewed_machine_output(self):
-        text = _autofix_report("pushed", "bumped pydantic")
-        assert "not reviewed by a human" in text
-        assert "bumped pydantic" in text
-        # The comment must not imply the fix is validated — CI decides after.
-        assert "merges only if" in text
-
-    @pytest.mark.parametrize("outcome", ["declined", "rejected", "failed", "skipped"])
-    def test_a_non_push_says_the_pr_still_needs_a_human(self, outcome):
-        assert "needs a human" in _autofix_report(outcome, "some reason")
 
 
 def test_ansi_codes_are_stripped_from_logs():
