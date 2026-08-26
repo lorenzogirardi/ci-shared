@@ -39,6 +39,31 @@ def test_error_region_keeps_the_error_and_drops_the_middle_noise():
     assert "..." in region  # and the elision is visible
 
 
+class TestRunVerify:
+    """run_verify is what makes autofix agentic: it proves an edit works, in
+    this job, before anything is pushed — instead of finding out a CI round
+    trip later, the way the first version worked."""
+
+    def test_empty_command_means_no_local_verification(self):
+        # Preserves the original behavior when a consumer configures nothing.
+        assert pr_review_sweep.run_verify("", timeout=5) == (True, "")
+
+    def test_passing_command_reports_ok(self):
+        ok, detail = pr_review_sweep.run_verify("exit 0", timeout=5)
+        assert ok is True and detail == ""
+
+    def test_failing_command_reports_the_real_output(self):
+        ok, detail = pr_review_sweep.run_verify(
+            "echo 'ResolutionImpossible: pydantic conflict' >&2; exit 1", timeout=5)
+        assert ok is False
+        assert "ResolutionImpossible" in detail
+
+    def test_timeout_is_reported_as_a_failure_not_a_crash(self):
+        ok, detail = pr_review_sweep.run_verify("sleep 5", timeout=1)
+        assert ok is False
+        assert "exceeded" in detail
+
+
 class TestAutofixGuardrails:
     """These are the rules that stand between model output and a pushed commit.
 

@@ -46,6 +46,25 @@ on:
         required: false
         type: boolean
         default: false
+      python_version:
+        description: 'Python version for the setup-python step verify_command runs under. Must match the version pr-checks.yml (or equivalent) uses, or a local pass here can mean nothing about the real gate — this is literally how the pydantic/mcp incident happened: it only failed on Python 3.14.'
+        required: false
+        type: string
+        default: '3.12'
+      verify_command:
+        description: 'Shell command that proves an autofix edit actually works, run in this job BEFORE anything is pushed. Should mirror the real CI gate (dependency resolution, install, a smoke test) as closely as practical. Empty = skip local verification and push on the model''s word alone, as the first version of autofix did.'
+        required: false
+        type: string
+        default: ''
+      verify_timeout_seconds:
+        required: false
+        type: number
+        default: 180
+      max_autofix_attempts:
+        description: 'How many propose-verify rounds to try, IN THIS JOB, before giving up on one PR. Each round that fails verify feeds the real failure back to the model and retries locally — no CI round trip, no extra pushed commits — so this is cheap compared to letting CI itself be the retry loop.'
+        required: false
+        type: number
+        default: 3
       triage_on_failure:
         description: 'When CI is already failing on a PR, explain the failure (quoting the job logs) instead of reviewing the diff. Same single model call either way — and a proven failure is something a model can explain, unlike predicting from a diff whether code will install and run.'
         required: false
@@ -114,6 +133,13 @@ jobs:
           ref: v1
           path: .shared
 
+      - name: Set up Python for verify_command
+        # Matches the interpreter pr-checks.yml verifies against — see the
+        # python_version input description for why that match matters.
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
       - name: Render the system prompt
         env:
           EXTRA: ${{ inputs.system_prompt_extra }}
@@ -124,6 +150,15 @@ jobs:
             --template .shared/prompts/pr-review-system.md \
             --rules-file .github/ai-review-rules.md \
             --out .ai/review-system.txt
+
+      - name: Write verify_command to a file
+        # A file, not a CLI arg: verify_command is user-authored multiline
+        # shell and quoting it safely into an argv string is not worth it.
+        env:
+          VERIFY_COMMAND: ${{ inputs.verify_command }}
+        run: |
+          mkdir -p .ai
+          printf '%s\n' "$VERIFY_COMMAND" > .ai/verify-command.sh
 
       - name: Sweep open PRs
         run: |
@@ -139,6 +174,9 @@ jobs:
             --heading "${{ inputs.comment_heading }}" \
             --merge-method "${{ inputs.merge_method }}" \
             --required-checks "${{ inputs.required_checks }}" \
+            --verify-command-file .ai/verify-command.sh \
+            --verify-timeout ${{ inputs.verify_timeout_seconds }} \
+            --max-autofix-attempts ${{ inputs.max_autofix_attempts }} \
             ${{ inputs.auto_merge && '--auto-merge' || '' }} \
             ${{ inputs.triage_on_failure && '--triage-on-failure' || '' }} \
             ${{ inputs.autofix && '--autofix' || '' }}

@@ -427,13 +427,46 @@ def triage_one(pr: dict, args: argparse.Namespace, repo: str, head_sha: str) -> 
     return _call_model(args, system_path, user_path, pr["number"])
 
 
+def run_verify(command: str, timeout: int) -> tuple[bool, str]:
+    """Run the consumer-supplied verification command against the working
+    tree with a proposed fix already applied.
+
+    This is what makes autofix agentic instead of one-shot: the model finds
+    out whether ITS OWN edit actually works, in this job, before anything is
+    pushed -- rather than only discovering it a CI round trip later, the way
+    the first version of this worked. Empty command = no local verification;
+    push on the model's word alone (the old behavior).
+    """
+    if not command.strip():
+        return True, ""
+    try:
+        proc = subprocess.run(
+            ["bash", "-c", command],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"verify_command exceeded {timeout}s and was killed"
+    if proc.returncode == 0:
+        return True, ""
+    tail = (proc.stdout + "\n" + proc.stderr).strip()
+    return False, tail[-4000:]
+
+
 def autofix_one(pr: dict, args: argparse.Namespace, repo: str,
                 head_sha: str) -> tuple[str, str]:
-    """Try to repair a red PR by pushing a fix to its branch.
+    """Try to repair a red PR by pushing a VERIFIED fix to its branch.
 
-    Returns (outcome, detail). The fix is never merged here: it is pushed, CI
+    Loops up to --max-autofix-attempts: propose an edit, apply it, run
+    --verify-command-file against the result. A pass pushes immediately. A
+    failure feeds the real verification output back to the model as "your
+    previous attempt didn't work, here's why" and tries again, with the
+    failed edit reverted first. Nothing is pushed until one attempt verifies,
+    or every attempt is exhausted.
+
+    Returns (outcome, detail). Even a verified push is never merged here: CI
     re-runs on the new commit, and a later sweep merges only if the required
-    checks pass. The model proposes; the deterministic gate still decides.
+    checks pass -- this loop's verification is a local, cheaper proxy for
+    that gate, not a replacement for it.
     """
     number = pr["number"]
     head = pr.get("head") or {}
@@ -450,57 +483,79 @@ def autofix_one(pr: dict, args: argparse.Namespace, repo: str,
     if diff is None:
         return "skipped", "could not fetch the PR head"
 
-    system_path = pathlib.Path(".ai/autofix-system.txt")
-    system_path.write_text(AUTOFIX_SYSTEM)
-    user_path = pathlib.Path(".ai/autofix-user.txt")
-    user_path.write_text(
-        f"PR #{number} title: {pr['title']}\n\n"
-        f"## Failing CI output\n{logs}\n\n"
-        f"## Diff\n{diff[: args.max_chars // 2]}\n"
-    )
-    reply = _call_model(args, system_path, user_path, number)
-    if reply is None:
-        return "skipped", "model call failed"
-
-    parsed = parse_fix(reply)
-    if parsed is None:
-        return "rejected", "model reply was malformed or outside the allowed scope"
-    edits, explanation = parsed
-    if not edits:
-        # A refusal is a valid answer, and better than a guessed edit.
-        return "declined", explanation or "the model found no concrete fix"
-
-    # Work on the PR branch itself so the push updates the PR.
     if run(["git", "checkout", "--quiet", "-B", branch, head_sha], check=False).returncode != 0:
         return "skipped", f"could not check out {branch}"
 
-    changed, error = apply_fix(edits)
-    if error:
-        return "rejected", error
+    verify_command = ""
+    if args.verify_command_file:
+        vf = pathlib.Path(args.verify_command_file)
+        if vf.is_file():
+            verify_command = vf.read_text()
 
-    # A runner checkout has no committer identity and `git commit` refuses
-    # without one. Set it here rather than assuming the caller did.
-    run(["git", "config", "user.name", "ci-shared autofix"], check=False)
-    run(["git", "config", "user.email", "actions@github.com"], check=False)
+    feedback = ""  # what went wrong last attempt, fed back into the next prompt
+    last_verify_output = ""
+    for attempt in range(1, args.max_autofix_attempts + 1):
+        system_path = pathlib.Path(".ai/autofix-system.txt")
+        system_path.write_text(AUTOFIX_SYSTEM)
+        user_path = pathlib.Path(".ai/autofix-user.txt")
+        user_path.write_text(
+            f"PR #{number} title: {pr['title']}\n\n"
+            f"## Failing CI output\n{logs}\n\n"
+            f"## Diff\n{diff[: args.max_chars // 2]}\n"
+            + (f"\n## Your previous attempt (#{attempt - 1}) did not work\n{feedback}\n"
+               if feedback else "")
+        )
+        reply = _call_model(args, system_path, user_path, number)
+        if reply is None:
+            detail = "model call failed"
+            if attempt > 1:
+                detail += f" after {attempt - 1} verified-failing attempt(s)"
+            return "skipped", detail
 
-    run(["git", "add", *changed])
-    message = (
-        f"fix(deps): repair CI on this PR\n\n{explanation}\n\n"
-        "Written by the ci-shared CI autofix and pushed unreviewed. The "
-        "required checks re-run on this commit and decide whether it merges."
+        parsed = parse_fix(reply)
+        if parsed is None:
+            return "rejected", "model reply was malformed or outside the allowed scope"
+        edits, explanation = parsed
+        if not edits:
+            # A refusal is a valid answer, and better than a guessed edit.
+            return "declined", explanation or "the model found no concrete fix"
+
+        changed, error = apply_fix(edits)
+        if error:
+            return "rejected", error
+
+        ok, verify_output = run_verify(verify_command, args.verify_timeout)
+        if ok:
+            run(["git", "config", "user.name", "ci-shared autofix"], check=False)
+            run(["git", "config", "user.email", "actions@github.com"], check=False)
+            run(["git", "add", *changed])
+            message = (
+                f"fix(deps): repair CI on this PR\n\n{explanation}\n\n"
+                f"Written by the ci-shared CI autofix and pushed unreviewed "
+                f"(verified locally in {attempt} attempt(s)). The required "
+                "checks re-run on this commit and decide whether it merges."
+            )
+            committed = run(["git", "commit", "--quiet", "-m", message], check=False)
+            if committed.returncode != 0:
+                reason = (committed.stderr or committed.stdout or "").strip()[:200]
+                return "skipped", f"commit failed: {reason or 'no output from git'}"
+            pushed = run(["git", "push", "origin", f"HEAD:refs/heads/{branch}"], check=False)
+            if pushed.returncode != 0:
+                return "failed", f"push rejected: {pushed.stderr.strip()[:200]}"
+            return "pushed", (
+                f"{explanation} (edited {', '.join(changed)}, "
+                f"verified locally in {attempt} attempt(s))"
+            )
+
+        # Verification failed: undo this attempt before proposing the next one.
+        run(["git", "checkout", "--", *changed], check=False)
+        last_verify_output = verify_output
+        feedback = f"Tried:\n{explanation}\n\nBut local verification then failed:\n{verify_output}"
+
+    return "exhausted", (
+        f"tried {args.max_autofix_attempts} fix(es) locally, none passed verification. "
+        f"Last failure:\n{last_verify_output[-1500:]}"
     )
-    committed = run(["git", "commit", "--quiet", "-m", message], check=False)
-    if committed.returncode != 0:
-        # Report git's own reason. An earlier version said "the edit produced
-        # no change" for every failure, which hid the missing identity above
-        # behind a confidently wrong diagnosis.
-        reason = (committed.stderr or committed.stdout or "").strip()[:200]
-        return "skipped", f"commit failed: {reason or 'no output from git'}"
-
-    pushed = run(["git", "push", "origin", f"HEAD:refs/heads/{branch}"], check=False)
-    if pushed.returncode != 0:
-        return "failed", f"push rejected: {pushed.stderr.strip()[:200]}"
-    return "pushed", f"{explanation} (edited {', '.join(changed)})"
 
 
 def _autofix_report(outcome: str, detail: str) -> str:
@@ -521,6 +576,7 @@ def _autofix_report(outcome: str, detail: str) -> str:
         "rejected": "An automated fix was proposed but discarded before being applied",
         "failed": "An automated fix was written but could not be pushed",
         "skipped": "No automated fix was attempted",
+        "exhausted": "Automated fixes were tried and verified locally, but none worked",
     }.get(outcome, "No automated fix was applied")
     return f"{headline}: {detail}\n\nCI is failing and this PR needs a human."
 
@@ -658,6 +714,20 @@ def main() -> int:
         help="When CI is failing, push a model-written fix to the PR branch instead of "
              "only explaining the failure. Never merges it: the required checks re-run "
              "on the new commit and decide. Implies --triage-on-failure.",
+    )
+    parser.add_argument(
+        "--verify-command-file",
+        default="",
+        help="File containing a shell command that proves an autofix edit works, run "
+             "before anything is pushed. Empty/missing = push on the model's word alone.",
+    )
+    parser.add_argument("--verify-timeout", type=int, default=180)
+    parser.add_argument(
+        "--max-autofix-attempts",
+        type=int,
+        default=3,
+        help="Propose-then-verify rounds tried locally, in this job, before giving up on "
+             "one PR. A failed round feeds the real verify output back to the model.",
     )
     parser.add_argument(
         "--triage-on-failure",
