@@ -133,9 +133,28 @@ def split_verdict(review: str) -> tuple[bool, str]:
     return is_clean, stripped
 
 
-def comment_body(heading: str, review: str, head_sha: str, is_clean: bool, will_merge: bool) -> str:
+def comment_body(
+    heading: str,
+    review: str,
+    head_sha: str,
+    is_clean: bool,
+    *,
+    merge_outcome: str = "not attempted",
+) -> str:
+    """Render the sweep comment.
+
+    `merge_outcome` reports what actually happened, not what was intended:
+    an earlier version wrote "clean - merging" before trying to merge, so a
+    PR that GitHub then refused to merge (e.g. a diff touching
+    .github/workflows/, which GITHUB_TOKEN may not update) carried a comment
+    claiming a merge that never happened.
+    """
     if is_clean:
-        verdict = "clean — merging" if will_merge else "clean"
+        verdict = {
+            "merged": "clean — merged",
+            "failed": "clean, but the merge was refused — see the run log",
+            "not attempted": "clean",
+        }[merge_outcome]
     else:
         verdict = "needs a human"
     return (
@@ -202,21 +221,29 @@ def main() -> int:
             continue
 
         is_clean, body_text = split_verdict(review)
-        will_merge = is_clean and args.auto_merge
-        post_comment(args.repo, number,
-                     comment_body(args.heading, body_text, head_sha, is_clean, will_merge),
-                     existing)
-        reviewed += 1
 
-        if will_merge:
+        # Merge first, comment second, so the comment can state what actually
+        # happened rather than what was about to be attempted.
+        merge_outcome = "not attempted"
+        if is_clean and args.auto_merge:
             done = run(["gh", "pr", "merge", str(number),
                         f"--{args.merge_method}", "--repo", args.repo], check=False)
             if done.returncode == 0:
                 print(f"Merged PR #{number}.")
+                merge_outcome = "merged"
                 merged += 1
             else:
-                print(f"::warning::Review was clean but merging PR #{number} failed: "
-                      f"{done.stderr.strip()[:300]}")
+                merge_outcome = "failed"
+                print(f"::warning::Review of PR #{number} was clean but the merge was "
+                      f"refused: {done.stderr.strip()[:300]}")
+
+        post_comment(
+            args.repo, number,
+            comment_body(args.heading, body_text, head_sha, is_clean,
+                         merge_outcome=merge_outcome),
+            existing,
+        )
+        reviewed += 1
         print("::endgroup::")
 
     summary = (

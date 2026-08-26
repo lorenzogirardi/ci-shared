@@ -53,7 +53,7 @@ def test_unrecognized_last_line_is_left_in_body():
 
 def test_comment_body_carries_marker_and_sha_for_dedup():
     sha = "0123456789abcdef0123456789abcdef01234567"
-    body = comment_body("AI Review", "findings", sha, is_clean=True, will_merge=True)
+    body = comment_body("AI Review", "findings", sha, is_clean=True, merge_outcome="merged")
     assert "<!-- ai-review-sweep -->" in body
     # The sweep skips a PR when this exact line already matches its head SHA.
     assert f"<!-- reviewed-sha: {sha} -->" in body
@@ -61,8 +61,14 @@ def test_comment_body_carries_marker_and_sha_for_dedup():
     assert "findings" in body
 
 
-def test_comment_body_states_the_verdict_it_acted_on():
+def test_comment_reports_what_happened_not_what_was_intended():
     sha = "a" * 40
-    assert "clean — merging" in comment_body("h", "x", sha, is_clean=True, will_merge=True)
-    assert "clean" in comment_body("h", "x", sha, is_clean=True, will_merge=False)
-    assert "needs a human" in comment_body("h", "x", sha, is_clean=False, will_merge=False)
+    assert "clean — merged" in comment_body("h", "x", sha, is_clean=True, merge_outcome="merged")
+    # A clean review whose merge GitHub refused (e.g. the diff touches
+    # .github/workflows/) must not claim it merged.
+    refused = comment_body("h", "x", sha, is_clean=True, merge_outcome="failed")
+    assert "refused" in refused
+    assert "merged" not in refused
+    # auto_merge off: clean, with no claim either way.
+    assert "clean" in comment_body("h", "x", sha, is_clean=True, merge_outcome="not attempted")
+    assert "needs a human" in comment_body("h", "x", sha, is_clean=False)
