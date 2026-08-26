@@ -34,6 +34,14 @@ def test_error_region_keeps_the_error_and_drops_the_middle_noise():
     assert "..." in region  # and the elision is visible
 
 
+def test_ansi_codes_are_stripped_from_logs():
+    """CI logs are full of colour codes; they waste prompt budget and obscure
+    the text. (They also make `gh api` refuse to emit the body at all without
+    --allow-escape-sequences, which is why job_log passes that flag.)"""
+    coloured = "\x1b[31m##[error]it broke\x1b[0m\n\x1b[1mdetail\x1b[0m"
+    assert pr_review_sweep._ANSI_RE.sub("", coloured) == "##[error]it broke\ndetail"
+
+
 def test_error_region_always_keeps_the_tail():
     """A traceback usually sits right before the process exits."""
     log = "\n".join([f"line {i}" for i in range(500)])

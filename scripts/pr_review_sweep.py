@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -156,8 +157,25 @@ def error_region(log: str, max_chars: int) -> str:
     return text[-max_chars:] if len(text) > max_chars else text
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def job_log(repo: str, job_id: int) -> str | None:
+    """A job's log, de-coloured, or None when there is none to fetch."""
+    # --allow-escape-sequences is required, not cosmetic: CI logs are full of
+    # ANSI colour codes and without the flag `gh api` refuses to emit the body
+    # at all and exits non-zero, which reads exactly like "no log exists".
+    result = run(
+        ["gh", "api", "--allow-escape-sequences", f"repos/{repo}/actions/jobs/{job_id}/logs"],
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return _ANSI_RE.sub("", result.stdout)
+
+
 def collect_failure_logs(repo: str, head_sha: str, max_chars: int) -> str:
-    """Sanitized error output from every failed job on this commit."""
+    """Error output from every failed job on this commit."""
     parts: list[str] = []
     budget = max_chars
     for check in failed_check_runs(repo, head_sha):
@@ -165,13 +183,13 @@ def collect_failure_logs(repo: str, head_sha: str, max_chars: int) -> str:
         name = check.get("name", "unknown")
         if not job_id or budget <= 0:
             continue
-        # A check run created by an app rather than an Actions job has no log
+        # A check run posted by an app rather than an Actions job has no log
         # endpoint; that 404 is expected, not an error worth failing over.
-        result = run(["gh", "api", f"repos/{repo}/actions/jobs/{job_id}/logs"], check=False)
-        if result.returncode != 0 or not result.stdout.strip():
+        log = job_log(repo, job_id)
+        if log is None:
             parts.append(f"### {name}\n(no job log available for this check)\n")
             continue
-        region = error_region(result.stdout, min(budget, max_chars // 2))
+        region = error_region(log, min(budget, max_chars // 2))
         parts.append(f"### {name}\n```\n{region}\n```\n")
         budget -= len(region)
     return "\n".join(parts)
