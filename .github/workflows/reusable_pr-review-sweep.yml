@@ -41,6 +41,11 @@ on:
         required: false
         type: string
         default: ''
+      autofix:
+        description: 'When CI is failing, push a model-written fix to the PR branch instead of only explaining the failure. It is NEVER merged on the strength of the model: the required checks re-run on the new commit and decide. Edits are restricted in code to dependency manifests — never application code, tests, or CI workflows — and the anchor must be unique in its file. Enable only for a dependency bot on a repo whose CI actually exercises the app.'
+        required: false
+        type: boolean
+        default: false
       triage_on_failure:
         description: 'When CI is already failing on a PR, explain the failure (quoting the job logs) instead of reviewing the diff. Same single model call either way — and a proven failure is something a model can explain, unlike predicting from a diff whether code will install and run.'
         required: false
@@ -135,4 +140,5 @@ jobs:
             --merge-method "${{ inputs.merge_method }}" \
             --required-checks "${{ inputs.required_checks }}" \
             ${{ inputs.auto_merge && '--auto-merge' || '' }} \
-            ${{ inputs.triage_on_failure && '--triage-on-failure' || '' }}
+            ${{ inputs.triage_on_failure && '--triage-on-failure' || '' }} \
+            ${{ inputs.autofix && '--autofix' || '' }}
