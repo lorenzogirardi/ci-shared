@@ -36,6 +36,11 @@ on:
         required: false
         type: string
         default: 'squash'
+      triage_on_failure:
+        description: 'When CI is already failing on a PR, explain the failure (quoting the job logs) instead of reviewing the diff. Same single model call either way — and a proven failure is something a model can explain, unlike predicting from a diff whether code will install and run.'
+        required: false
+        type: boolean
+        default: false
       system_prompt_extra:
         description: 'Extra prompt text describing this project / this class of PR'
         required: false
@@ -123,4 +128,5 @@ jobs:
             --timeout ${{ inputs.timeout_seconds }} \
             --heading "${{ inputs.comment_heading }}" \
             --merge-method "${{ inputs.merge_method }}" \
-            ${{ inputs.auto_merge && '--auto-merge' || '' }}
+            ${{ inputs.auto_merge && '--auto-merge' || '' }} \
+            ${{ inputs.triage_on_failure && '--triage-on-failure' || '' }}
