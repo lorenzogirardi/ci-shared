@@ -1,0 +1,126 @@
+name: Reusable PR Review Sweep
+
+# Scheduled sweep over OPEN pull requests: review the ones whose head SHA
+# hasn't been reviewed yet, and (optionally) merge the ones whose review comes
+# back clean. All the actual logic lives in scripts/pr_review_sweep.py.
+#
+# Why a sweep instead of per-PR triggers: a `schedule` run has no PR actor, no
+# fork, and no bot-author special-casing, so it always gets the repo's full
+# GITHUB_TOKEN. Every failure mode the event-driven review workflows in this
+# repo had to work around simply does not exist here -- GitHub capping
+# GITHUB_TOKEN to read-only for bot-authored `pull_request` runs, needing
+# `pull_request_target` (and its attack surface) to get around that, and
+# PRs opened before the workflow existed never firing an event at all.
+# Mirrors how openwrt/openwrt actually drives its LLM review: cron plus
+# workflow_dispatch, no pull_request trigger.
+
+on:
+  workflow_call:
+    inputs:
+      authors:
+        description: 'Comma-separated PR author logins to review (e.g. "renovate[bot]"). Empty = every open PR.'
+        required: false
+        type: string
+        default: ''
+      max_prs:
+        description: 'Max PRs to review in one sweep (caps model spend per run)'
+        required: false
+        type: number
+        default: 10
+      auto_merge:
+        description: 'Merge PRs whose review ends in VERDICT: CLEAN. Enable only where merging unattended is acceptable (e.g. dependency-bot PRs with no application code).'
+        required: false
+        type: boolean
+        default: false
+      merge_method:
+        required: false
+        type: string
+        default: 'squash'
+      system_prompt_extra:
+        description: 'Extra prompt text describing this project / this class of PR'
+        required: false
+        type: string
+        default: ''
+      comment_heading:
+        required: false
+        type: string
+        default: 'AI Review (sweep)'
+      max_chars:
+        required: false
+        type: number
+        default: 140000
+      timeout_seconds:
+        required: false
+        type: number
+        default: 120
+      openrouter_model:
+        required: false
+        type: string
+        default: ''
+      openrouter_endpoint:
+        required: false
+        type: string
+        default: ''
+      openrouter_site_url:
+        required: false
+        type: string
+        default: ''
+      openrouter_app_name:
+        required: false
+        type: string
+        default: ''
+    secrets:
+      openrouter_api_key:
+        required: true
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # only used when auto_merge is on
+      pull-requests: write   # post/update the review comment
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.openrouter_api_key }}
+      OPENROUTER_MODEL: ${{ inputs.openrouter_model }}
+      OPENROUTER_ENDPOINT: ${{ inputs.openrouter_endpoint }}
+      OPENROUTER_SITE_URL: ${{ inputs.openrouter_site_url }}
+      OPENROUTER_APP_NAME: ${{ inputs.openrouter_app_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout shared prompts and scripts
+        uses: actions/checkout@v4
+        with:
+          repository: lorenzogirardi/ci-shared
+          ref: v1
+          path: .shared
+
+      - name: Render the system prompt
+        env:
+          EXTRA: ${{ inputs.system_prompt_extra }}
+        run: |
+          set -euo pipefail
+          mkdir -p .ai
+          python3 .shared/scripts/render_prompt.py \
+            --template .shared/prompts/pr-review-system.md \
+            --rules-file .github/ai-review-rules.md \
+            --out .ai/review-system.txt
+
+      - name: Sweep open PRs
+        run: |
+          set -euo pipefail
+          python3 .shared/scripts/pr_review_sweep.py \
+            --repo "${{ github.repository }}" \
+            --system-file .ai/review-system.txt \
+            --ai-script .shared/scripts/openrouter_ai.py \
+            --authors "${{ inputs.authors }}" \
+            --max-prs ${{ inputs.max_prs }} \
+            --max-chars ${{ inputs.max_chars }} \
+            --timeout ${{ inputs.timeout_seconds }} \
+            --heading "${{ inputs.comment_heading }}" \
+            --merge-method "${{ inputs.merge_method }}" \
+            ${{ inputs.auto_merge && '--auto-merge' || '' }}
