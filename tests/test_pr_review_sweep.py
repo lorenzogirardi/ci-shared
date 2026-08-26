@@ -11,7 +11,46 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
 
-from pr_review_sweep import comment_body, split_verdict  # noqa: E402
+import pr_review_sweep  # noqa: E402
+from pr_review_sweep import checks_state, comment_body, split_verdict  # noqa: E402
+
+
+def _fake_check_runs(monkeypatch, runs):
+    monkeypatch.setattr(pr_review_sweep, "gh_json", lambda _args: {"check_runs": runs})
+
+
+def test_checks_state_green_when_all_completed_successfully(monkeypatch):
+    _fake_check_runs(monkeypatch, [
+        {"name": "checks", "status": "completed", "conclusion": "success"},
+        # skipped/neutral are not failures — a conditional job that didn't run
+        # must not block a merge forever.
+        {"name": "optional", "status": "completed", "conclusion": "skipped"},
+    ])
+    assert checks_state("o/r", "sha")[0] == "green"
+
+
+def test_checks_state_failing_blocks_merge(monkeypatch):
+    _fake_check_runs(monkeypatch, [
+        {"name": "checks", "status": "completed", "conclusion": "success"},
+        {"name": "smoke", "status": "completed", "conclusion": "failure"},
+    ])
+    state, detail = checks_state("o/r", "sha")
+    assert state == "failing"
+    assert "smoke" in detail
+
+
+def test_checks_state_pending_is_not_green(monkeypatch):
+    """Merging mid-run would defeat the gate; the next sweep retries."""
+    _fake_check_runs(monkeypatch, [
+        {"name": "checks", "status": "in_progress", "conclusion": None},
+    ])
+    assert checks_state("o/r", "sha")[0] == "pending"
+
+
+def test_no_checks_is_not_treated_as_green(monkeypatch):
+    """A repo with no CI must not get unattended merges by default."""
+    _fake_check_runs(monkeypatch, [])
+    assert checks_state("o/r", "sha")[0] == "none"
 
 
 @pytest.mark.parametrize(
@@ -72,3 +111,15 @@ def test_comment_reports_what_happened_not_what_was_intended():
     # auto_merge off: clean, with no claim either way.
     assert "clean" in comment_body("h", "x", sha, is_clean=True, merge_outcome="not attempted")
     assert "needs a human" in comment_body("h", "x", sha, is_clean=False)
+    # CI is the gate: a clean review with red CI must say so, not claim a merge.
+    red = comment_body("h", "x", sha, is_clean=True, merge_outcome="checks failing")
+    assert "CI is failing" in red and "merged" not in red
+
+
+def test_verdict_marker_lets_the_next_sweep_retry_a_pending_merge():
+    """A clean review whose CI hadn't finished must be retryable without
+    re-running the model, so the marker records the verdict, not just the SHA."""
+    sha = "b" * 40
+    pending = comment_body("h", "x", sha, is_clean=True, merge_outcome="checks pending")
+    assert "<!-- verdict: clean -->" in pending
+    assert "<!-- verdict: clean -->" not in comment_body("h", "x", sha, is_clean=False)

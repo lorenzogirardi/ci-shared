@@ -63,6 +63,33 @@ def existing_sweep_comment(repo: str, number: int) -> dict | None:
     return ours[-1] if ours else None
 
 
+def checks_state(repo: str, head_sha: str) -> tuple[str, str]:
+    """('green'|'failing'|'pending'|'none', human-readable detail).
+
+    A model reading a diff cannot know whether the code still builds, installs,
+    or serves a request -- a CI run does. So the merge gate is the CI result;
+    the review verdict only decides whether a human should look at it.
+
+    'none' (no checks configured) is deliberately NOT treated as green: a repo
+    with no CI should not get unattended merges just because nothing objected.
+    """
+    runs = gh_json([f"repos/{repo}/commits/{head_sha}/check-runs"]) or {}
+    checks = runs.get("check_runs", []) if isinstance(runs, dict) else []
+    # The sweep's own review posts no check run, so nothing here is self-referential.
+    if not checks:
+        return "none", "no check runs reported for this commit"
+
+    pending = [c["name"] for c in checks if c.get("status") != "completed"]
+    if pending:
+        return "pending", f"still running: {', '.join(sorted(pending)[:5])}"
+
+    bad = [c["name"] for c in checks
+           if c.get("conclusion") not in ("success", "neutral", "skipped")]
+    if bad:
+        return "failing", f"failing: {', '.join(sorted(bad)[:5])}"
+    return "green", f"{len(checks)} check(s) passed"
+
+
 def build_diff(base_sha: str, local_ref: str, out_path: pathlib.Path) -> None:
     cmd = ["git", "diff", f"{base_sha}...{local_ref}", "--"]
     cmd += [f":(exclude){p}" for p in DIFF_EXCLUDES]
@@ -154,16 +181,46 @@ def comment_body(
             "merged": "clean — merged",
             "failed": "clean, but the merge was refused — see the run log",
             "not attempted": "clean",
+            "checks failing": "clean, but CI is failing — not merging",
+            "checks pending": "clean, but CI has not finished — will retry next sweep",
+            "no checks": "clean, but no CI checks reported — not merging unattended",
         }[merge_outcome]
     else:
         verdict = "needs a human"
     return (
         f"{MARKER}\n"
-        f"<!-- reviewed-sha: {head_sha} -->\n\n"
+        f"<!-- reviewed-sha: {head_sha} -->\n"
+        # Read back by the next sweep: a PR already reviewed clean at this SHA
+        # but not yet merged (CI was still running) gets its merge retried
+        # without paying for the review again.
+        f"<!-- verdict: {'clean' if is_clean else 'needs-review'} -->\n\n"
         f"## {heading}\n\n"
         f"{review}\n\n"
         f"_Verdict: {verdict}. Reviewed commit `{head_sha[:7]}`._\n"
     )
+
+
+def try_merge(repo: str, number: int, head_sha: str, method: str) -> str:
+    """Attempt the merge, gated on CI. Returns a merge_outcome string.
+
+    CI is the gate, not the review verdict: a model reading a diff cannot know
+    whether the code still installs and serves requests, and two bumps it
+    waved through as clean broke main precisely there.
+    """
+    state, detail = checks_state(repo, head_sha)
+    if state != "green":
+        print(f"Not merging PR #{number}: {detail}.")
+        return {"failing": "checks failing",
+                "pending": "checks pending",
+                "none": "no checks"}[state]
+
+    done = run(["gh", "pr", "merge", str(number), f"--{method}", "--repo", repo], check=False)
+    if done.returncode == 0:
+        print(f"Merged PR #{number} ({detail}).")
+        return "merged"
+    print(f"::warning::Review of PR #{number} was clean and CI green, but the merge was "
+          f"refused: {done.stderr.strip()[:300]}")
+    return "failed"
 
 
 def post_comment(repo: str, number: int, body: str, existing: dict | None) -> None:
@@ -209,7 +266,19 @@ def main() -> int:
             continue
 
         existing = existing_sweep_comment(args.repo, number)
-        if existing and f"reviewed-sha: {head_sha}" in (existing.get("body") or ""):
+        existing_body = (existing or {}).get("body") or ""
+        if existing and f"reviewed-sha: {head_sha}" in existing_body:
+            # Already reviewed at this commit. If that review was clean and the
+            # PR is still open, CI was probably not finished last time -- retry
+            # just the merge, without paying for the review again.
+            if args.auto_merge and "<!-- verdict: clean -->" in existing_body:
+                outcome = try_merge(args.repo, number, head_sha, args.merge_method)
+                if outcome == "merged":
+                    merged += 1
+                else:
+                    print(f"PR #{number} reviewed clean at {head_sha[:7]}, still not "
+                          f"mergeable ({outcome}).")
+                continue
             print(f"PR #{number} already reviewed at {head_sha[:7]} — skipping.")
             skipped += 1
             continue
@@ -226,16 +295,9 @@ def main() -> int:
         # happened rather than what was about to be attempted.
         merge_outcome = "not attempted"
         if is_clean and args.auto_merge:
-            done = run(["gh", "pr", "merge", str(number),
-                        f"--{args.merge_method}", "--repo", args.repo], check=False)
-            if done.returncode == 0:
-                print(f"Merged PR #{number}.")
-                merge_outcome = "merged"
+            merge_outcome = try_merge(args.repo, number, head_sha, args.merge_method)
+            if merge_outcome == "merged":
                 merged += 1
-            else:
-                merge_outcome = "failed"
-                print(f"::warning::Review of PR #{number} was clean but the merge was "
-                      f"refused: {done.stderr.strip()[:300]}")
 
         post_comment(
             args.repo, number,
