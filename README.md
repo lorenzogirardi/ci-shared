@@ -10,119 +10,112 @@ endpoint OpenCode Zen, works with any `OPENROUTER_ENDPOINT`/`OPENROUTER_MODEL`
 including OpenRouter) that consumer repos already had. No Claude API, no
 Claude Code routines — plain HTTP call from a stdlib-only Python script.
 
+Full design rationale, diagrams, and the story behind each non-obvious
+decision live in [`docs/architecture.md`](docs/architecture.md). This file is
+the quick reference.
+
 ## Versioning
 
 Consumers pin a tag (`@v1`), never `@main`, so a change here can't silently
 break every consumer at once. Each reusable workflow checks out `scripts/`
-with a **literal** `ref: v1` in its own "Checkout shared scripts" step —
-not resolved dynamically (`github.workflow_ref` inside a called reusable
-workflow reflects the *caller's* ref, e.g. a PR merge ref in the consumer
-repo, not the tag pinned in this repo's own `uses:` line, so that can't be
-used to self-reference). Because the checkout step ships as part of the
-tag's own content, bumping the tag and bumping that literal ref happen in
-the same commit by construction — they can't drift apart.
+with a **literal** `ref: v1` in its own "Checkout shared scripts" step — not
+resolved dynamically. `github.workflow_ref` inside a called reusable workflow
+reflects the *caller's* ref (observed: a consumer PR's merge ref), not the
+tag pinned in this repo's own `uses:` line — there is no context that
+reflects that. Because the checkout step's `ref: v1` ships as part of the tag's
+own content, bumping the tag and bumping that literal happen in the same
+commit by construction — they cannot drift apart.
 
-A behavior change moves the `v1` tag forward (`git tag -f v1 && git push -f origin v1`) once verified against the real consumers; a breaking change instead gets a new `v2` tag (and its own `ref: v2` literal in the checkout steps) so existing `@v1` consumers are unaffected until they bump on purpose.
+A behavior change moves the `v1` tag forward
+(`git tag -f v1 && git push -f origin v1`) once verified against the real
+consumers; a breaking change instead gets a new `v2` tag (and its own
+`ref: v2` literal) so existing `@v1` consumers are unaffected until they bump
+on purpose.
 
 ## Workflows
 
 ### `reusable_pr-diff-review.yml`
 
 Diffs `base...head` of a PR, sends it to the model, posts/updates a single PR
-comment. Called from a `pull_request`-triggered workflow for normal PR review,
-or from a `pull_request_target`-triggered workflow for cases needing secrets
-that `pull_request` won't provide (see Dependabot below).
+comment. Job permissions: `contents: read`, `pull-requests: write` — safe to
+call on arbitrary/human/fork PRs.
 
-Inputs: `system_prompt_extra` (project-specific review focus, appended to the
-generic prompt — meant for short, caller-specific overrides like the
-Dependabot prompt below), `comment_marker` / `comment_heading` (so two callers
-in the same repo — e.g. normal review + Dependabot review — don't fight over
-the same comment), `max_chars`, `timeout_seconds`, `openrouter_model` /
-`openrouter_endpoint` / `openrouter_site_url` / `openrouter_app_name` (forward
-your repo vars here — `workflow_call` does not inherit `vars.*` automatically).
+Key inputs: `system_prompt_extra` (project-specific focus), `comment_marker` /
+`comment_heading` (so two callers in one repo don't fight over the same
+comment), `openrouter_*` (forward your repo vars — `workflow_call` does not
+inherit `vars.*` automatically). If the consumer repo has a
+`.github/ai-review-rules.md` file, it's read and appended to the prompt
+automatically.
 
-If the consumer repo has a `.github/ai-review-rules.md` file, it's read and
-appended to the prompt automatically (no input needed) — this is where a
-project keeps its own durable review guidance (deprecated patterns to flag,
-domain-specific gotchas), living next to the code it concerns instead of in
-this repo.
+Secret: `openrouter_api_key` (optional — empty means "skip the model call,
+post a did-not-run comment"; used to blank the key on fork PRs).
 
-Secret: `openrouter_api_key` (optional — omit or pass empty to no-op the AI
-step while still posting a "did not run" comment; used by the caller to blank
-the key on fork PRs).
+Output: `clean` — `"true"` only if the review ran and its **exact last line**
+was `VERDICT: CLEAN` (not a substring match — see architecture.md for why
+that distinction is load-bearing).
 
-Job permissions: `contents: read`, `pull-requests: write`. Never merges
-anything — it exposes a `clean` output (`"true"` only when the review
-actually ran and found no `[Critical]` finding) for a caller that wants to
-act on the verdict, e.g. the merge wrapper below.
+### `reusable_pr-review-sweep.yml`
 
-### `reusable_pr-diff-review-and-merge.yml`
+The main event. A **scheduled** sweep (called from a `schedule` +
+`workflow_dispatch` trigger, not `pull_request`) over open PRs: review the
+ones not yet reviewed at their current head SHA, merge the clean ones whose
+CI actually passed, and — opt-in — repair the broken ones.
 
-Same review as above (calls it as a nested reusable workflow — same inputs,
-same secret) plus one more job that runs `gh pr merge` when the nested call's
-`clean` output is `"true"`. Kept as a **separate file** rather than a flag on
-the plain reviewer: GitHub validates every job's declared `permissions:` in a
-reusable workflow against what the caller grants, for every job in the file,
-regardless of any `if:` condition — so a single file can't offer both
-"comment only" (`contents: read`, safe to use on arbitrary/fork PRs) and
-"comment and merge" (`contents: write`) without forcing `contents: write`
-onto every caller, including ones that never want it. (This actually broke
-`ai-review.yml` in flask-test-api the first time it was tried as a flag —
-see commit history.)
-
-Same inputs as `reusable_pr-diff-review.yml` plus `merge_method` (default
-`squash`). No `auto_merge_if_clean` input — calling this file at all means
-"merge when clean"; if a caller doesn't want that, it calls the plain
-reviewer instead.
-
-Use this only for PRs whose diff you're comfortable merging unattended on a
-clean verdict — e.g. a dependency bot with no application code in the diff.
-Never for human-authored PRs or anything that touches app source.
-
-### `reusable_ci-analysis.yml`
-
-Post-pipeline informative report: downloads `ai-context-*` artifacts uploaded
-by earlier jobs in the same run (lint/test/trivy/checkov/k8s-probe output),
-bundles them with the app source, asks the model for a security/quality
-report, posts it to the job summary and as an artifact. Never gates the
-pipeline — `continue-on-error: true` is set inside the reusable workflow's job
-(a job that calls a reusable workflow can't set that itself).
-
-Inputs: `source_glob` (default `app`), size/token/timeout caps, same
-`openrouter_*` passthrough as above.
+| Input | Default | Purpose |
+|---|---|---|
+| `authors` | `''` (all) | Comma-separated PR author logins to sweep |
+| `max_prs` | `10` | Cap per run |
+| `auto_merge` | `false` | Merge PRs whose review + CI are both clean |
+| `required_checks` | `''` | Check-run names that must have **succeeded** before merge — see below, this is not optional in practice |
+| `merge_method` | `squash` | |
+| `triage_on_failure` | `false` | On red CI, explain the failure instead of reviewing the diff |
+| `autofix` | `false` | On red CI, push a verified fix instead of only explaining. Implies `triage_on_failure`. |
+| `python_version` | `3.12` | Interpreter `verify_command` runs under — **must match the real CI gate's version** |
+| `verify_command` | `''` | Shell command proving an autofix edit works, run before pushing anything |
+| `verify_timeout_seconds` | `180` | |
+| `max_autofix_attempts` | `3` | Propose→verify rounds tried locally before giving up on one PR |
 
 Secret: `openrouter_api_key` (required).
 
-## Why Dependabot needs its own caller workflow
+**The merge gate is CI, not the review verdict.** `required_checks` names
+checks that must show `conclusion: success` — not merely "didn't fail".
+Without it, the fallback only requires *some* check to have succeeded, which
+is close to vacuous: a PR whose only check is `ai-review.yml` reporting
+`skipped` (it skips bot authors) used to read as green and get merged with
+nothing tested. Two dependency bumps that a clean AI review waved through
+broke `main` in one session — a resolver conflict and a runtime 500 — both
+things a command proves in seconds and a diff review can only guess at.
 
-GitHub gives `pull_request`-triggered runs a **read-only `GITHUB_TOKEN` and no
-repo secrets** when the PR was opened by Dependabot — even though it's not a
-fork. A plain `pull_request`-triggered `ai-review.yml` silently no-ops on
-every Dependabot PR (`OPENROUTER_API_KEY` is empty, comment posting has no
-write token). The fix: a **separate** workflow triggered by
-`pull_request_target` (which always runs with the base repo's token/secrets,
-regardless of actor), gated to `github.actor == 'dependabot[bot]'`, calling
-the same `reusable_pr-diff-review.yml` with a dependency-bump-focused
-`system_prompt_extra`. It only ever reads/diffs the PR branch — never checks
-out or executes anything from it beyond `git diff` — so it doesn't reopen the
-classic `pull_request_target` code-execution hole.
+**Autofix is agentic, not one-shot.** On a red PR it proposes an edit
+(strict-JSON, `{file, find, replace}`, validated in code: manifest files
+only, unique anchor, ≤5 edits, never a fork), applies it, and runs
+`verify_command` **in this job** before pushing anything. A pass commits
+(with an explicit git identity — a fresh checkout has none) and pushes
+immediately; a failure reverts the edit, feeds the real verification output
+back into the next prompt, and retries. Nothing reaches the PR branch until
+one attempt verifies or every attempt is exhausted. The commit and PR
+comment both say plainly that a machine wrote it, unreviewed, and that the
+real CI on the pushed commit — not this loop — decides whether it merges.
 
-## Consumer wrapper example
+### `reusable_ci-analysis.yml`
+
+Post-pipeline informative report: downloads `ai-context-*` artifacts from
+earlier jobs (lint/test/trivy/checkov/k8s-probe), bundles them with the app
+source, asks the model for a security/quality report, posts it to the job
+summary and as an artifact. Never gates the pipeline —
+`continue-on-error: true` is set inside the reusable workflow's own job (a
+job that *calls* a reusable workflow can't set that itself).
+
+Secret: `openrouter_api_key` (required).
+
+## Consumer wrapper examples
+
+Plain review (safe for any PR, including forks):
 
 ```yaml
-name: AI Code Review
-
-on:
-  pull_request:
-    types: [opened, synchronize, reopened]
-
-permissions:
-  contents: read
-  pull-requests: write
-
 jobs:
   review:
-    if: vars.AI_ENABLED == 'true'
+    if: vars.AI_ENABLED == 'true' && github.actor != 'renovate[bot]'
     uses: lorenzogirardi/ci-shared/.github/workflows/reusable_pr-diff-review.yml@v1
     with:
       openrouter_model: ${{ vars.OPENROUTER_MODEL }}
@@ -133,13 +126,65 @@ jobs:
       openrouter_api_key: ${{ secrets.OPENROUTER_API_KEY }}
 ```
 
-See `flask-test-api/.github/workflows/ai-review.yml`,
-`flask-test-api/.github/workflows/dependabot-ai-review.yml` and
-`flask-test-api/.github/workflows/pipeline.yml` (`ai-analysis` job) for the
-real wrappers. `flask-test-api/.github/workflows/release-notes.yml` and
-`issue-triage.yml` call `scripts/openrouter_ai.py` directly (not through a
-reusable workflow, since they don't fit either shape above) — they check out
-this repo at `.shared` and invoke `.shared/scripts/openrouter_ai.py`.
+Scheduled sweep with merge + self-repair, for a dependency bot only:
+
+```yaml
+on:
+  schedule: [{cron: '0 4,16 * * *'}]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  sweep:
+    if: vars.AI_ENABLED == 'true'
+    permissions:
+      contents: write
+      pull-requests: write
+    uses: lorenzogirardi/ci-shared/.github/workflows/reusable_pr-review-sweep.yml@v1
+    with:
+      authors: 'renovate[bot]'
+      auto_merge: true
+      required_checks: 'checks,workflows'   # your pr-checks.yml job names
+      triage_on_failure: true
+      autofix: true
+      python_version: "3.14"                # must match your real CI gate
+      verify_command: |
+        set -euo pipefail
+        pip install --dry-run -r requirements.txt
+        pip install -q -r requirements.txt
+        uvicorn app.main:app --host 127.0.0.1 --port 8000 &
+        UVICORN_PID=$!
+        trap 'kill $UVICORN_PID 2>/dev/null || true' EXIT
+        for i in $(seq 1 30); do
+          curl -sf -o /dev/null http://127.0.0.1:8000/api/mgmt/ready && exit 0
+          sleep 1
+        done
+        exit 1
+    secrets:
+      openrouter_api_key: ${{ secrets.OPENROUTER_API_KEY }}
+```
+
+See `flask-test-api/.github/workflows/ai-review.yml`, `ai-review-sweep.yml`,
+and `pipeline.yml`'s `ai-analysis` job for the real wrappers.
+`release-notes.yml` and `issue-triage.yml` don't fit either reusable shape —
+they check this repo out at `.shared` and call
+`.shared/scripts/openrouter_ai.py` directly.
+
+## Why the dependency-bot path evolved the way it did
+
+1. **`pull_request` + actor gate** — first attempt. Broke: GitHub gives
+   `pull_request` runs a read-only `GITHUB_TOKEN` and no secrets when the
+   actor is a bot — turns out **not** Dependabot-specific,
+   `renovate[bot]` hit it too.
+2. **`pull_request_target`** — the usual fix for #1. Its default checkout is
+   the *base* branch, not the PR (fixed by explicitly checking out
+   `head.sha`) — and it still can't retroactively fire for PRs opened before
+   the workflow existed.
+3. **Scheduled sweep** (current) — a `schedule` run has no PR actor at all,
+   so #1 doesn't exist to begin with, and it picks up a whole backlog on its
+   first run. Confirmed by reading `openwrt/openwrt`'s real
+   `llm-review.yml`: cron + `workflow_dispatch`, no `pull_request` trigger.
 
 ## Per-repo setup
 
@@ -151,3 +196,14 @@ Each consumer repo needs, in *Settings → Secrets and variables → Actions*:
 - Secret `OPENROUTER_API_KEY`
 
 Nothing needs to be configured in this repo per consumer — it's stateless.
+
+## Tests
+
+```bash
+pytest tests/ -v
+```
+
+63 tests, no network, no `gh` calls — `checks_state`, verdict parsing,
+autofix guardrails (`parse_fix`/`apply_fix`), and `run_verify` are all
+exercised against fakes. `.github/workflows/test.yml` runs them on every
+push/PR to this repo.

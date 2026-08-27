@@ -9,10 +9,10 @@ identically between `flask-test-api` and `cloudflare-free-exporter`.
 No Claude API, no Claude Code routines. Every call goes through
 `scripts/openrouter_ai.py`, a stdlib-only Python client for any
 OpenAI-compatible chat-completions endpoint (default: OpenCode Zen,
-`https://opencode.ai/zen/v1/chat/completions`, model `deepseek-v4-flash-free`
-— but that model has been intermittently unavailable; `flask-test-api`
-currently overrides it to `hy3-free` via the `OPENROUTER_MODEL` repo
-variable).
+`https://opencode.ai/zen/v1/chat/completions`). The default model,
+`deepseek-v4-flash-free`, went fully unavailable from the provider mid-project
+(verified with a direct `curl` against the endpoint, not assumed); consumers
+override via `OPENROUTER_MODEL` — `flask-test-api` currently runs `hy3-free`.
 
 ## Versioning
 
@@ -34,19 +34,30 @@ cannot drift apart. (This was tried the dynamic way first; it failed with
 ```
 ci-shared/
 ├── .github/workflows/
-│   ├── reusable_pr-diff-review.yml           review + comment only
-│   ├── reusable_pr-diff-review-and-merge.yml review + comment + auto-merge
-│   ├── reusable_ci-analysis.yml              post-pipeline informative report
-│   └── test.yml                              CI for this repo's own scripts
+│   ├── reusable_pr-diff-review.yml    review + comment only, contents: read
+│   ├── reusable_pr-review-sweep.yml   scheduled sweep: review, merge, self-repair
+│   ├── reusable_ci-analysis.yml       post-pipeline informative report
+│   └── test.yml                       CI for this repo's own scripts
+├── prompts/
+│   └── pr-review-system.md            shared review prompt template, one source of truth
 ├── scripts/
 │   ├── openrouter_ai.py    minimal OpenAI-compatible chat-completions client
 │   ├── ai_sanitize.py      redact secrets / cap size before sending to the model
-│   └── ai_append_cost.py   append a token-usage/cost footer to a report
+│   ├── ai_append_cost.py   append a token-usage/cost footer to a report
+│   ├── render_prompt.py    fills the shared template with per-caller context
+│   └── pr_review_sweep.py  the sweep's own logic — review, merge gate, triage, autofix
 ├── tests/
-│   └── test_openrouter_ai.py   13 tests, mocked HTTP server, no network calls
+│   ├── test_openrouter_ai.py     13 tests, mocked HTTP server, no network calls
+│   └── test_pr_review_sweep.py   50 tests — verdict parsing, checks_state, autofix guardrails
 ├── README.md               quick-start / inputs reference
 └── docs/architecture.md    this file
 ```
+
+`reusable_pr-diff-review-and-merge.yml` existed briefly and is gone —
+superseded by the sweep below, which does the same job without its
+permission-model problems. See "Why the sweep, not the merge-wrapper file"
+further down; the history is worth reading even though the file itself is
+deleted, because the reason it failed is not obvious from the sweep alone.
 
 ---
 
@@ -92,11 +103,28 @@ Three independent modes selected by flag:
 Pure formatting: reads the `--usage-file` JSON from `openrouter_ai.py` and
 appends a `## 🤖 AI Usage & Cost` section to a report file.
 
+## File: `prompts/pr-review-system.md` + `scripts/render_prompt.py`
+
+The review prompt used to be duplicated inline inside
+`reusable_pr-diff-review.yml`'s `actions/github-script` step. Pulled out to a
+template file with one `{{PROJECT_CONTEXT}}` placeholder so the sweep and the
+plain reviewer share the exact same base prompt — most importantly the
+`VERDICT: CLEAN | NEEDS_REVIEW` contract that auto-merge reads. Two
+duplicated copies of that contract would have been one edit away from
+silently disagreeing.
+
+`render_prompt.py` fills the placeholder from two additive, optional
+sources: `--extra` (a caller-specific string, e.g. "this PR is a dependency
+bump") and `--rules-file` (a file in the *consumer* repo,
+`.github/ai-review-rules.md`, if it exists — this is where a project keeps
+its own durable review guidance without forking anything in this repo).
+
 ---
 
 ## File: `.github/workflows/reusable_pr-diff-review.yml`
 
-The core building block. `workflow_call` with:
+The core building block, unchanged in shape since it was first extracted.
+`workflow_call` with:
 
 | Input | Default | Purpose |
 |---|---|---|
@@ -129,10 +157,8 @@ arbitrary/human/fork PRs, including from untrusted contributors.
 2. **Checkout shared scripts** — `lorenzogirardi/ci-shared@v1` (literal, see
    Versioning above) into `.shared/`.
 3. **Read project-specific review rules, if any** — if the *caller* repo has
-   `.github/ai-review-rules.md`, its content becomes a `GITHUB_OUTPUT`
-   multiline value, later appended to the prompt. This is the mechanism for
-   a consumer to keep durable, project-specific review guidance (deprecated
-   patterns, domain gotchas) **in its own repo**, not forked into this one.
+   `.github/ai-review-rules.md`, its content is read and merged into the
+   rendered prompt via `render_prompt.py`.
 4. **Prevent fork secret exfiltration** — if
    `github.event.pull_request.head.repo.fork == true`, blanks
    `OPENROUTER_API_KEY` in `$GITHUB_ENV` for the rest of the job. Untrusted
@@ -140,26 +166,18 @@ arbitrary/human/fork PRs, including from untrusted contributors.
 5. **Build diff** — `git diff base...head`, with a long `:(exclude)` list
    (secrets, binaries, `node_modules`, `dist`, etc.), capped and redirected
    to `.ai/diff.txt`.
-6. **Create review prompts** (`actions/github-script`, not inline shell —
-   PR title/diff content is untrusted, so it's written to files via the JS
-   API rather than interpolated into a shell string). Builds the system
-   prompt: base rules + `system_prompt_extra` + the rules file content +
-   a fixed tail that defines the 8 review sections, the
-   `[Critical]|[Warning]|[Suggestion]` tagging convention, and — since the
-   verdict fix — a hard requirement that the **last line** of the entire
-   response be exactly `VERDICT: CLEAN` or `VERDICT: NEEDS_REVIEW`.
-7. **Append diff to review prompt**.
-8. **Run AI review** — skips (with a `::warning::`) if the key is empty;
+6. **Run AI review** — skips (with a `::warning::`) if the key is empty;
    otherwise calls `openrouter_ai.py`, writes `.ai/review.md`.
    `continue-on-error: true` — a failed model call never fails the job.
-9. **Post or update AI review comment** — finds an existing comment by
+7. **Post or update AI review comment** — finds an existing comment by
    `comment_marker`, updates it, else creates one. Strips the `VERDICT:`
-   line before posting (it's for the merge job, not a human reader). If
-   `.ai/review.md` doesn't exist (skipped or failed), posts a
-   "did not run" placeholder instead of silently doing nothing.
-10. **Compute clean verdict** — `clean=true` only if `.ai/review.md` exists
-    **and** `tail -n 1` of it is exactly the string `VERDICT: CLEAN`. Exact
-    match, not a substring `grep` — see "Why exact-match, not grep" below.
+   line before posting (it's a machine-readable contract, not a human
+   reader's business). If `.ai/review.md` doesn't exist (skipped or
+   failed), posts a "did not run" placeholder instead of silently doing
+   nothing.
+8. **Compute clean verdict** — `clean=true` only if `.ai/review.md` exists
+   **and** `tail -n 1` of it is exactly the string `VERDICT: CLEAN`. Exact
+   match, not a substring `grep` — see "Why exact-match, not grep" below.
 
 ### Why exact-match, not grep
 
@@ -169,76 +187,233 @@ false-positives on any sentence *mentioning* the tag — a model writing
 block a merge for the wrong reason, and conversely a model that forgets the
 exact bracket casing could produce a false clean. Forcing one dedicated,
 mechanically-parsed last line (mirroring the strict-JSON pattern
-`issue-triage.yml` already uses in `flask-test-api` for the same class of
-problem — an automated decision reading model output) removes that
-ambiguity entirely: either the last line is the exact string or it isn't.
+`issue-triage.yml` uses in `flask-test-api` for the same class of problem —
+an automated decision reading model output) removes that ambiguity entirely:
+either the last line is the exact string or it isn't.
 
 ---
 
-## File: `.github/workflows/reusable_pr-diff-review-and-merge.yml`
+## File: `.github/workflows/reusable_pr-review-sweep.yml` + `scripts/pr_review_sweep.py`
 
-Adds exactly one capability on top of the file above: merge the PR when the
-verdict is clean. Kept as a **separate file**, not a boolean input flag on
-the file above, because of a hard GitHub Actions constraint discovered while
-building this: **a reusable workflow's declared job `permissions:` are
-validated against the caller at parse time, for every job in the file,
-regardless of any `if:` condition on that job.** A single file offering both
-"just comment" (`contents: read`) and "comment and merge"
-(`contents: write`) behind an input flag would force every caller —
-including ones that only ever want a comment, like `ai-review.yml` on
-arbitrary PRs — to grant `contents: write` merely because the *file*
-declares it, whether or not that caller ever sets the flag. This actually
-broke `ai-review.yml` in `flask-test-api` for real, with:
+The main event, and the file everything below revolves around. A
+**scheduled** sweep (`workflow_call`, meant to be triggered by a `schedule` +
+`workflow_dispatch` caller — not `pull_request`) that walks open PRs and, for
+each one not yet reviewed at its current head SHA: reviews it, merges it if
+the review **and CI** are both clean, or — opt-in — repairs it if CI is red.
 
+### Inputs
+
+| Input | Default | Purpose |
+|---|---|---|
+| `authors` | `''` (all) | Comma-separated PR author logins to sweep |
+| `max_prs` | `10` | Cap per run (bounds model spend) |
+| `auto_merge` | `false` | Merge PRs whose review is clean **and** whose CI is green |
+| `required_checks` | `''` | Check-run names that must show `conclusion: success` — see "The merge gate" below |
+| `merge_method` | `squash` | |
+| `triage_on_failure` | `false` | On red CI, explain the failure instead of reviewing the diff |
+| `autofix` | `false` | On red CI, push a *verified* fix instead of only explaining. Implies `triage_on_failure`. |
+| `python_version` | `3.12` | Interpreter `verify_command` runs under |
+| `verify_command` | `''` | Shell command that proves an autofix edit works, run before pushing anything |
+| `verify_timeout_seconds` | `180` | |
+| `max_autofix_attempts` | `3` | Propose→verify rounds tried locally, in this job, before giving up on one PR |
+
+Secret: `openrouter_api_key` (required).
+
+Job permissions: `contents: write`, `pull-requests: write` — this file
+*does* need write, unlike the plain reviewer, which is exactly why it is a
+separate file (see below).
+
+### Why a sweep, not another `pull_request` trigger
+
+The event-driven approach was tried first, in three stages, each one
+discovered by a real failure, not anticipated in advance:
+
+1. **`pull_request` + an actor gate on `github.actor`.** Broke immediately:
+   GitHub gives `pull_request`-triggered runs a **read-only `GITHUB_TOKEN`
+   and no repo secrets** when the actor is a bot. This is documented for
+   `dependabot[bot]` specifically — it turned out **not** to be
+   Dependabot-specific. Requesting `contents: write` on a `pull_request` run
+   for `renovate[bot]` (same-repo, not a fork) was rejected identically:
+   `"is only allowed 'contents: read'"`.
+2. **`pull_request_target`**, the usual fix for #1 — it always runs with the
+   base repo's full token/secrets regardless of actor. Fixed the permission
+   problem, introduced a new one: its default checkout is the **base**
+   branch, not the PR at all (the plain reviewer's `head.sha` fix handles
+   this, but it's a sharp edge worth knowing about). Neither #1 nor #2 can
+   retroactively fire for a PR opened before the workflow existed — an
+   event trigger only ever fires on a future event.
+3. **A scheduled sweep** (current). A `schedule` run has no PR actor and no
+   fork to begin with, so problem #1 doesn't exist. It also naturally picks
+   up every PR opened before it existed, on its very first run — no
+   close/reopen trick needed. Confirmed by reading
+   [`openwrt/openwrt`'s real `llm-review.yml`](https://github.com/openwrt/openwrt/blob/master/.github/workflows/llm-review.yml)
+   (a public repo, inspected directly): `cron '0 3,15 * * *'` +
+   `workflow_dispatch`, **no `pull_request` trigger at all**, and its last
+   15 runs were all green.
+
+### Why this replaced `reusable_pr-diff-review-and-merge.yml`
+
+That file (now deleted) was a separate reusable workflow, nesting the plain
+reviewer plus a `merge` job, called from a `pull_request_target`-triggered
+wrapper. It hit the exact same problem #1/#2 above, plus one more specific
+to nested reusable workflows: a job that omits its own `permissions:` block
+inherits from **that file's own top-level `permissions:` block**, not from
+the caller. The wrapper's top-level `permissions: {}` (copied from the plain
+reviewer without accounting for this) silently capped the nested review job
+to `contents: none, pull-requests: none` regardless of what the outer caller
+granted — a second, independent permission bug layered on top of the first.
+The sweep sidesteps both classes of problem by never being triggered by a PR
+event in the first place.
+
+### Dedup
+
+Each PR gets **one** sweep comment (marker `<!-- ai-review-sweep -->`),
+updated in place, carrying two hidden lines: `reviewed-sha: <sha>` and
+`verdict: clean | needs-review | ci-failure`. A PR whose comment already
+names its current head SHA is skipped — re-running the sweep costs nothing
+and never double-posts — **except** two cases where the marker alone would
+be wrong to trust:
+
+- **`verdict: clean` but not yet merged** — the PR was reviewed clean last
+  time but CI had not finished (or auto-merge was off). The sweep retries
+  *only the merge*, without paying for another model call.
+- **`verdict: ci-failure` but CI is green now** — a flaky job re-run turned
+  red into green at the same SHA. The old triage/autofix comment is now
+  stale (it explained a failure that no longer exists), so the sweep treats
+  the PR as unreviewed and reviews it properly instead of leaving a
+  misleading comment in place forever.
+
+### The merge gate: `checks_state()`, and why `required_checks` is not optional in practice
+
+```python
+def checks_state(repo, head_sha, required=()):
+    """('green'|'failing'|'pending'|'none', detail)"""
 ```
-Error calling workflow 'lorenzogirardi/ci-shared/.github/workflows/reusable_pr-diff-review.yml@v1'.
-The nested job 'review' is requesting 'contents: write', but is only allowed 'contents: read'.
-```
 
-### Structure
+Without `required`, the fallback only demands that *some* check succeeded
+and none failed — and that fallback is close to vacuous in exactly the
+situation this whole feature is for. Real incident: a Renovate PR's only
+check run was `ai-review.yml` reporting `skipped` (it deliberately skips bot
+authors). "At least one check exists and nothing failed" read that as green,
+and the sweep merged two PRs with **zero tests having run**. "Nothing
+objected" is not "something verified".
 
-```
-jobs:
-  review:                      # nested workflow_call, SAME file as above
-    uses: ./.github/workflows/reusable_pr-diff-review.yml
-    with:  { ...forwarded inputs... }
-    secrets: { openrouter_api_key: ... }
+With `required_checks` set (e.g. `'checks,workflows'`, the job names from a
+consumer's `pr-checks.yml`), the gate demands each named check be present
+**and** `conclusion == success` specifically — `skipped` does not count,
+even for a check named as required. A required check that hasn't finished
+yet reads as `pending`, not `failing`: a fresh push may simply not have
+registered the run yet, and the next sweep looks again rather than treating
+a race as a failure.
 
-  merge:
-    needs: review
-    if: needs.review.outputs.clean == 'true'
-    permissions:
-      contents: write          # the ONLY job in either file that has this
-      pull-requests: write
-    steps:
-      - run: gh pr merge <number> --<merge_method> --repo <repo>
-```
+The review's own `VERDICT: CLEAN` / `VERDICT: NEEDS_REVIEW` has never been
+the thing that decides whether code merges — CI is. Two dependency bumps
+that a clean AI review waved through broke `flask-test-api`'s `main` in one
+session (a Python 3.14 dependency-resolution conflict, and a runtime 500 on
+every request from an incompatible instrumentation library) — both things a
+command proves in seconds and a diff review can only guess at.
 
-`uses: ./.github/workflows/reusable_pr-diff-review.yml` is a **local**
-reusable-workflow reference (same repo, resolved at the exact same commit as
-the calling file — no separate `.shared` checkout needed for this
-relationship specifically). GitHub allows nesting reusable workflow calls up
-to 4 levels deep; this uses 1.
+### `triage_on_failure`: explain instead of guess, only once CI has already proven the failure
 
-No `auto_merge_if_clean` input exists on this file — calling it at all means
-"merge on a clean verdict." A caller that doesn't want that calls the plain
-`reusable_pr-diff-review.yml` instead. Input `merge_method` (default
-`squash`) is the only addition over the plain file's inputs.
+When a PR's required checks are red, reviewing the diff to *predict* whether
+it will pass is exactly the thing that keeps failing (see above). Instead,
+`triage_one()` reads the failed job's logs (`job_log()` — de-ANSI'd; `gh api`
+silently refuses to emit colored log output at all without
+`--allow-escape-sequences`, which without the flag looks exactly like "this
+check has no log") and asks the model to explain the failure and name the
+minimal fix, given the diff *and* the real error output. This is the one
+place in the whole design where asking a model is clearly right: the
+failure is already a **proven fact**, so the model is explaining, not
+predicting.
 
-**Use this only where merging on a clean AI verdict, unattended, is an
-acceptable outcome** — a dependency bot's manifest/lockfile-only diff, not
-human-authored application code.
+CI state is checked once, before any model call, so triage costs the same
+single call as a normal review — nothing extra on the happy path.
+
+### `autofix`: the same idea, but agentic instead of one-shot
+
+The first version of autofix was one-shot: prompt in, JSON patch out,
+applied blind, pushed, and the *next* CI run was the only way to find out
+whether it worked. That is architecturally the reason it needed more
+iterations to converge than fixing the same bug interactively does — in a
+chat, each guess is checked against a real command's output before the next
+one; the one-shot autofix had no such loop.
+
+`autofix_one()` now loops, up to `max_autofix_attempts`:
+
+1. Propose an edit (see `AUTOFIX_SYSTEM` / `parse_fix()` below for the
+   guardrails).
+2. Apply it to the checked-out PR branch.
+3. Run `verify_command` — **in this job**, before anything is pushed. This
+   is the whole point: the model finds out whether its own fix works
+   *before* committing to it, the same way interactive debugging does.
+4. **Pass** → set a git identity (a fresh checkout has none — `git commit`
+   refuses without one, and an earlier bug reported "the edit produced no
+   change" for *every* commit failure, hiding this real cause behind a
+   confidently wrong diagnosis), commit, push immediately.
+5. **Fail** → `git checkout --` the edited files back to clean, fold the
+   real verification output into the next prompt ("you tried X, it still
+   failed with Y"), and loop.
+6. Exhausted all attempts → post a comment saying so; the PR is left for a
+   human. Nothing was ever pushed.
+
+`verify_command` is consumer-authored and should mirror the real CI gate as
+closely as practical — `flask-test-api`'s wrapper literally copies
+`pr-checks.yml`'s own steps (resolve, install, boot, curl). `python_version`
+must match the real gate's interpreter, or a local pass proves nothing: a
+dependency set can resolve on one Python version and not another, which is
+*exactly* how the incident that motivated all of this happened (Python 3.12
+→ 3.14 broke a pin that had been fine for months).
+
+Verified end-to-end on a deliberately broken PR: one attempt, verified
+locally, pushed — and the real `pr-checks.yml` run on that pushed commit
+came back green, confirming the local verifier and the actual gate agree.
+
+#### Guardrails, enforced in code, not trusted from the prompt
+
+A prompt is a request; the point of `parse_fix()` / `apply_fix()` is that a
+wrong or adversarial reply must not become a commit regardless of what the
+model says:
+
+- `find` must appear **exactly once** in its target file, or nothing is
+  written for that edit — an ambiguous anchor is how a "small" fix silently
+  changes the wrong line.
+- Only files matching `AUTOFIX_ALLOWED` may be touched: dependency
+  manifests (`requirements.txt`, `Dockerfile`, `pyproject.toml`, `go.mod`,
+  `package.json`, ...) — **never** application code, tests, or
+  `.github/workflows/` (which `GITHUB_TOKEN` couldn't push anyway without
+  the `workflows` scope, so an attempted edit there would fail at push time
+  having already burned a model call — excluded up front instead).
+- At most 5 edits per attempt; bounded anchor/replacement size; no path
+  traversal (`..`, absolute paths rejected).
+- A batch is all-or-nothing: if any single edit in a proposed fix is
+  invalid, **none** of them are applied. A half-applied fix is worse than
+  none.
+- Never runs against a fork (`head.repo.full_name != repo` → skip
+  immediately, before any git operation).
+- The commit message and the PR comment both state plainly that a machine
+  wrote it, that no human reviewed it, and that the real required checks —
+  on the pushed commit, not this loop's local verification — decide whether
+  it merges.
+
+**Residual risk, stated plainly rather than hidden**: CI proves a fix
+*works*, not that it is *right*. A model could in principle satisfy the
+checks by loosening a constraint rather than correcting it (e.g. relaxing a
+version pin instead of bumping the actual dependency that needed it). This
+is not fully closed by anything in this design — it is why `autofix` should
+only be enabled for a bot whose diffs are manifest-only, on a repo whose CI
+genuinely exercises the running app, never for human-authored code.
 
 ---
 
 ## File: `.github/workflows/reusable_ci-analysis.yml`
 
-Unrelated to the two files above — this is a **post-pipeline** informative
-report, not a per-PR review. Downloads `ai-context-*` artifacts uploaded by
-earlier jobs in the *same* workflow run (lint/test/trivy/checkov/k8s-probe
-output — produced by jobs the caller defines, this file only consumes them),
-bundles them with the app source via `ai_sanitize.py`, asks the model for a
-security/quality report, writes it to the job summary and as an artifact.
+Unrelated to the review/sweep files above — this is a **post-pipeline**
+informative report, not a per-PR review. Downloads `ai-context-*` artifacts
+uploaded by earlier jobs in the *same* workflow run
+(lint/test/trivy/checkov/k8s-probe output — produced by jobs the caller
+defines, this file only consumes them), bundles them with the app source via
+`ai_sanitize.py`, asks the model for a security/quality report, writes it to
+the job summary and as an artifact.
 
 `continue-on-error: true` is set **inside this reusable workflow's own job**
 — a job that calls a reusable workflow (the caller side) cannot set
@@ -262,8 +437,13 @@ ai-analysis:
 
 ```
 .github/workflows/
-├── ai-review.yml            pull_request        → reusable_pr-diff-review.yml
-├── renovate-ai-review.yml   pull_request_target  → reusable_pr-diff-review-and-merge.yml
+├── pr-checks.yml            pull_request         deterministic gate: resolve deps, lint,
+│                                                  pytest, boot+curl smoke test, actionlint
+├── ai-review.yml            pull_request         → reusable_pr-diff-review.yml
+│                                                  (skips renovate[bot])
+├── ai-review-sweep.yml      schedule+dispatch    → reusable_pr-review-sweep.yml
+│                                                  (renovate[bot] only: review, merge,
+│                                                   triage, autofix)
 ├── pipeline.yml (ai-analysis job) push/dispatch  → reusable_ci-analysis.yml
 ├── release-notes.yml        pull_request(closed) → calls .shared/scripts/openrouter_ai.py directly
 └── issue-triage.yml         issues(opened)       → calls .shared/scripts/openrouter_ai.py directly
@@ -271,57 +451,31 @@ ai-analysis:
 
 `release-notes.yml` and `issue-triage.yml` don't fit either reusable-workflow
 shape (one reacts to a merged PR to write release notes, the other reacts to
-a new issue to triage it) — they just checkout `ci-shared@v1` into `.shared`
-and invoke the script path directly, same dedup benefit without forcing them
-into an unrelated abstraction.
+a new issue to triage it) — they just check out `ci-shared@v1` into
+`.shared` and invoke the script path directly, same dedup benefit without
+forcing them into an unrelated abstraction.
+
+`pr-checks.yml` is not part of `ci-shared` at all — it's plain,
+repo-specific CI (no model call) that exists *because* of what this repo's
+AI features taught it: no PR was ever built or tested before merging until
+this existed, which is how two AI-review-approved dependency bumps broke
+`main`. `ai-review-sweep.yml`'s `required_checks` and `verify_command`
+inputs both point back at this file's own job names and steps — the two are
+designed together, not independently.
 
 ### Why two review workflows, gated by actor
 
 `flask-test-api`'s dependency bot is **Renovate** (`renovate.json`), not
-Dependabot — confirmed the hard way (enabling native Dependabot alongside it
+Dependabot — confirmed the hard way: enabling native Dependabot alongside it
 produced 12 duplicate PRs for updates Renovate already tracked; all closed,
-`.github/dependabot.yml` removed).
+`.github/dependabot.yml` removed.
 
 `ai-review.yml` (`pull_request`, `contents: read`) handles everything
-**except** `renovate[bot]`. `renovate-ai-review.yml`
-(`pull_request_target`, `contents: write`) handles only `renovate[bot]`,
-with a dependency-bump-focused `system_prompt_extra` and the merge
-capability. Each explicitly excludes/includes on `github.actor` so a given
-PR only ever gets **one** comment, not two:
-
-```yaml
-# ai-review.yml
-if: vars.AI_ENABLED == 'true' && github.actor != 'renovate[bot]'
-
-# renovate-ai-review.yml
-if: vars.AI_ENABLED == 'true' && github.actor == 'renovate[bot]'
-```
-
-### Why `pull_request_target`, not `pull_request`, for Renovate
-
-Two different restrictions, discovered in that order:
-
-1. **Secrets/token, generically believed Dependabot-only.** GitHub gives
-   `pull_request`-triggered runs a read-only `GITHUB_TOKEN` and no repo
-   secrets when the PR's actor is `dependabot[bot]` — well documented.
-   Turns out the same restriction is **not actually Dependabot-specific**:
-   requesting `contents: write` on a `pull_request`-triggered run for
-   `renovate[bot]` (also same-repo, also not a fork) was rejected identically:
-   `"is only allowed 'contents: read'"`. `pull_request_target` always runs
-   with the base repo's full token/secrets regardless of actor — that's
-   what actually fixed it.
-2. **Default checkout ref.** `pull_request_target`'s default checkout is the
-   **base branch**, not the PR — see the `head.sha` fix in
-   `reusable_pr-diff-review.yml` above. Without that explicit ref, switching
-   triggers would have silently diffed the wrong thing (base against
-   itself) instead of erroring loudly.
-
-This workflow only ever reads the PR (diff) and merges via the GitHub API —
-it never checks out and *executes* anything from the PR branch beyond
-reading file contents for the diff, so it doesn't reopen the classic
-`pull_request_target` arbitrary-code-execution hole (that hole requires
-running the PR's own code/scripts with the elevated token, which nothing
-here does).
+**except** `renovate[bot]`. `ai-review-sweep.yml` (`schedule` +
+`workflow_dispatch`, `contents: write`) handles only `renovate[bot]`, with a
+dependency-bump-focused prompt and the merge/triage/autofix capability. Each
+gates on `github.actor`/`authors` so a given PR only ever gets **one**
+comment, not two.
 
 ---
 
@@ -332,23 +486,28 @@ here does).
 ```mermaid
 flowchart TB
     subgraph cishared["ci-shared repo (@v1 tag)"]
+        prompt["prompts/pr-review-system.md"]
         script1["scripts/openrouter_ai.py"]
         script2["scripts/ai_sanitize.py"]
         script3["scripts/ai_append_cost.py"]
+        script4["scripts/pr_review_sweep.py"]
         wf1["reusable_pr-diff-review.yml<br/>contents: read"]
-        wf2["reusable_pr-diff-review-and-merge.yml<br/>contents: write (merge job only)"]
+        wf2["reusable_pr-review-sweep.yml<br/>contents: write"]
         wf3["reusable_ci-analysis.yml<br/>continue-on-error"]
-        wf2 -- "nested workflow_call<br/>(uses: ./...)" --> wf1
         wf1 -. "checkout .shared/" .-> script1
-        wf1 -. "checkout .shared/" .-> script2
+        wf1 -. "checkout .shared/" .-> prompt
+        wf2 -. "checkout .shared/" .-> script1
+        wf2 -. "checkout .shared/" .-> script4
+        wf2 -. "checkout .shared/" .-> prompt
         wf3 -. "checkout .shared/" .-> script1
         wf3 -. "checkout .shared/" .-> script2
         wf3 -. "checkout .shared/" .-> script3
     end
 
     subgraph flaskapi["flask-test-api repo"]
+        c0["pr-checks.yml<br/>pull_request<br/>(no model call)"]
         c1["ai-review.yml<br/>pull_request<br/>actor != renovate[bot]"]
-        c2["renovate-ai-review.yml<br/>pull_request_target<br/>actor == renovate[bot]"]
+        c2["ai-review-sweep.yml<br/>schedule + workflow_dispatch<br/>authors: renovate[bot]"]
         c3["pipeline.yml<br/>(ai-analysis job)<br/>push / workflow_dispatch"]
         c4["release-notes.yml<br/>pull_request closed"]
         c5["issue-triage.yml<br/>issues opened"]
@@ -359,135 +518,124 @@ flowchart TB
     c3 -->|"uses: ...@v1"| wf3
     c4 -. "checkout .shared/<br/>then call script directly" .-> script1
     c5 -. "checkout .shared/<br/>then call script directly" .-> script1
+    c2 -. "required_checks / verify_command<br/>reference c0's job names & steps" .-> c0
 ```
 
-### PR review + merge decision flow
+### Sweep decision flow
 
 ```mermaid
 flowchart TD
-    start(["PR opened / synchronized"]) --> actor{"github.actor?"}
-    actor -- "renovate[bot]" --> rtrig["renovate-ai-review.yml<br/>trigger: pull_request_target"]
-    actor -- "anyone else" --> htrig["ai-review.yml<br/>trigger: pull_request"]
+    start(["scheduled sweep run"]) --> list["list open PRs, oldest first<br/>filtered by --authors"]
+    list --> already{"already reviewed<br/>at this head SHA?"}
+    already -- "yes, verdict=clean,<br/>not yet merged" --> retryMerge["retry merge only<br/>(no model call)"]
+    already -- "yes, verdict=ci-failure,<br/>CI now green" --> reReview["treat as unreviewed<br/>(stale triage)"]
+    already -- "yes, otherwise" --> skip(["skip"])
+    already -- "no" --> ciCheck{"autofix or triage_on_failure<br/>enabled? check required_checks"}
 
-    htrig --> reviewOnly["reusable_pr-diff-review.yml<br/>(contents: read)"]
-    rtrig --> reviewMerge["reusable_pr-diff-review-and-merge.yml"]
-    reviewMerge --> nestedReview["job: review<br/>(nests reusable_pr-diff-review.yml)"]
+    ciCheck -- "failing" --> triageOrFix{"autofix enabled?"}
+    ciCheck -- "green / pending / none" --> review["review the diff<br/>(reusable_pr-diff-review.yml logic)"]
+    reReview --> review
 
-    reviewOnly --> steps
-    nestedReview --> steps
+    triageOrFix -- "no" --> triage["triage_one(): explain the<br/>failure from real job logs"]
+    triageOrFix -- "yes" --> autofixLoop
 
-    subgraph steps["shared steps (identical in both paths)"]
+    subgraph autofixLoop["autofix_one() — agentic loop, up to max_autofix_attempts"]
         direction TB
-        s1["checkout PR @ head.sha"] --> s2["checkout ci-shared@v1 → .shared/"]
-        s2 --> s3["read .github/ai-review-rules.md<br/>(if present in caller repo)"]
-        s3 --> s4{"PR from a fork?"}
-        s4 -- yes --> s5a["OPENROUTER_API_KEY = empty"]
-        s4 -- no --> s5b["OPENROUTER_API_KEY = real"]
-        s5a --> s6
-        s5b --> s6["git diff base...head<br/>(secrets/binaries excluded)"]
-        s6 --> s7["build prompt<br/>(base + system_prompt_extra + rules file)"]
-        s7 --> s8{"API key set?"}
-        s8 -- no --> s9skip["skip AI call<br/>::warning::"]
-        s8 -- yes --> s9run["openrouter_ai.py<br/>→ .ai/review.md<br/>(continue-on-error)"]
-        s9skip --> s10
-        s9run --> s10["post/update PR comment<br/>(VERDICT line stripped)"]
-        s10 --> s11{"review.md exists AND<br/>last line == 'VERDICT: CLEAN'?"}
-        s11 -- yes --> outClean["job output: clean = true"]
-        s11 -- no --> outDirty["job output: clean = false"]
+        propose["propose edit (strict JSON)"] --> validate["parse_fix() / apply_fix()<br/>manifest-only, unique anchor,<br/>all-or-nothing"]
+        validate --> verify{"run verify_command<br/>in this job"}
+        verify -- "pass" --> commit["git commit + push<br/>(explicit identity set)"]
+        verify -- "fail" --> revert["git checkout -- <files><br/>feed real error to next attempt"]
+        revert --> propose
     end
+    autofixLoop -- "exhausted" --> humanNeeded(["comment: needs a human"])
 
-    outClean --> pathSplit{"which file called this?"}
-    outDirty --> pathSplit
-    pathSplit -- "reusable_pr-diff-review.yml<br/>(ai-review.yml path)" --> doneComment(["done — comment only,<br/>no merge job exists here"])
-    pathSplit -- "reusable_pr-diff-review-and-merge.yml<br/>(renovate-ai-review.yml path)" --> mergeGate{"clean == true?"}
-    mergeGate -- yes --> doMerge["job: merge<br/>gh pr merge --squash<br/>(contents: write)"]
-    mergeGate -- no --> doneOpen(["done — PR stays open,<br/>only the review comment"])
+    review --> verdict{"VERDICT: CLEAN<br/>(exact last-line match)?"}
+    verdict -- no --> humanNeeded
+    verdict -- yes --> mergeGate{"auto_merge on AND<br/>required_checks all success?"}
+    mergeGate -- yes --> merged(["gh pr merge"])
+    mergeGate -- "no / pending" --> waitNext(["comment posted,<br/>next sweep retries merge only"])
 ```
 
-### Permission model
+### The merge gate specifically
 
 ```mermaid
 flowchart LR
-    subgraph "ai-review.yml"
-        p1["contents: read<br/>pull-requests: write"]
+    subgraph withoutRequired["without required_checks (the bug)"]
+        a1["at least one check exists"] --> a2["none of them failed"]
+        a2 --> a3["→ green"]
+        a4["real incident: only check was<br/>'review: skipped' (bot author)"] -.->|"satisfied both conditions"| a3
     end
-    subgraph "renovate-ai-review.yml"
-        p2["contents: write<br/>pull-requests: write"]
-    end
-    p1 -->|"caps"| j1["reusable_pr-diff-review.yml<br/>job: review<br/>wants contents: read"]
-    p2 -->|"caps"| j2["reusable_pr-diff-review-and-merge.yml<br/>job: review (read) + job: merge (write)"]
-```
-
-GitHub validates every job's declared `permissions:` in a called reusable
-workflow against what the **caller's top-level `permissions:` block**
-grants — statically, at parse time, for every job in the file, independent
-of any runtime `if:`. This is why the merge capability had to live in its
-own file rather than behind an input flag: a flag doesn't change what a
-file *declares*, only what it *does*, and declaration is what gets checked.
-
-### Sequence: a Renovate PR from open to merge
-
-```mermaid
-sequenceDiagram
-    participant R as Renovate
-    participant GH as GitHub
-    participant WF as renovate-ai-review.yml
-    participant RW as reusable_pr-diff-review-and-merge.yml
-    participant M as Model (OpenCode Zen)
-
-    R->>GH: open/push PR (renovate/xyz branch)
-    GH->>WF: pull_request_target: opened/synchronize
-    WF->>WF: if actor == renovate[bot] and AI_ENABLED
-    WF->>RW: uses ...@v1 (with dependency-focused prompt)
-    RW->>RW: job "review" (nested call, contents: read)
-    RW->>GH: checkout PR @ head.sha, checkout ci-shared@v1
-    RW->>RW: git diff base...head
-    RW->>M: POST chat/completions (system+user prompt)
-    M-->>RW: markdown review, last line VERDICT: CLEAN|NEEDS_REVIEW
-    RW->>GH: create/update PR comment (VERDICT line stripped)
-    RW->>RW: verdict = (last line == "VERDICT: CLEAN")
-    RW-->>WF: job output clean = true/false
-    alt clean == true
-        WF->>RW: job "merge" (needs: review, contents: write)
-        RW->>GH: gh pr merge --squash
-        GH-->>R: PR merged
-    else clean == false
-        Note over WF,GH: PR stays open, only the comment was posted
+    subgraph withRequired["with required_checks: 'checks,workflows'"]
+        b1["each named check present"] --> b2["each named check<br/>conclusion == success<br/>(skipped does NOT count)"]
+        b2 --> b3["→ green"]
     end
 ```
+
+## Why the LLM is used where it is, and deliberately isn't elsewhere
+
+The rule that emerged from every incident above: **if a command can prove
+something, ask the command, not the model.** A diff review calling a
+Python-3.14-incompatible dependency bump "clean" is precisely the failure
+mode this whole design routes around — twice, in production, before the
+rule was made explicit.
+
+- **Where a command decides**: whether code installs (`pip install
+  --dry-run`), whether it boots and serves a request (the smoke test),
+  whether the required checks passed (`checks_state`). None of this is ever
+  left to the model's judgment.
+- **Where the model is used, and is the right tool**: reviewing a
+  human-authored diff for logic bugs, race conditions, or design issues no
+  linter expresses (`reusable_pr-diff-review.yml`); explaining a failure
+  that a deterministic gate has *already proven* (`triage_one`); proposing a
+  candidate fix whose correctness is then decided the same way any other
+  commit's is — by CI, not by the model that wrote it (`autofix_one`).
 
 ## Divergence from `openwrt/actions-shared-workflows`
 
 This design was scoped from `openwrt/actions-shared-workflows` (a real,
-public repo — inspected directly, not assumed). It borrows the shape
-(central repo, thin per-consumer wrapper workflows, per-repo prompt
-customization) but diverges in mechanism:
+public repo — inspected directly, not assumed, including the actual
+`llm-review.yml` caller in `openwrt/openwrt`). It borrows the shape (central
+repo, thin per-consumer wrapper workflows, per-repo prompt customization)
+but diverges in mechanism:
 
 | | openwrt/actions-shared-workflows | ci-shared (this repo) |
 |---|---|---|
-| Engine | Claude Code **routine** — a hosted agentic session with an MCP GitHub connector; the model decides which tools to call (`pull_request_read`, `list_commits`, `get_job_logs`, …) and how many steps to take | One fixed script: checkout → diff → single chat-completions HTTP call → text parse → comment. No tool-use, no multi-step reasoning |
+| Engine | Claude Code **routine** — a hosted agentic session with an MCP GitHub connector; the model decides which tools to call (`pull_request_read`, `list_commits`, `get_job_logs`, …) and how many steps to take, for *every* task | A fixed script for review/triage (checkout → diff/logs → one HTTP call → parse). Autofix specifically has a bounded local loop (propose → verify → retry, up to 3 rounds) but no tool-use or free-form multi-step reasoning — the loop shape is hardcoded, not decided by the model |
 | Where the logic lives | Mostly **outside git** — the workflow YAML just `curl`s a `/fire` endpoint; the actual prompt/orchestration lives in the routine, edited via the claude.ai UI | Entirely **in git** — YAML + Python, versioned, diffable, no external UI holds behavior this repo doesn't also have committed |
 | Output format | A native **GitHub PR Review** (`pull_request_review_write`) with inline, line-anchored comments, via a dedicated bot account with the Claude GitHub App installed | A plain PR **comment** via `GITHUB_TOKEN` + `actions/github-script` — no inline line comments |
-| Catch-up / dedup | A second, cron-scheduled **nightly digest** job re-reconciles PRs with new commits since the bot's last review (SHA comparison), so a missed trigger self-heals | Purely event-driven (`opened`/`synchronize`/`reopened`) — no catch-up if a trigger is ever missed |
-| One-time setup | Manual, outside version control: dedicated bot GitHub account, GitHub App install, routine creation via UI, trigger-token generation | Fully declarative: two repo variables + one secret already existed; adding the capability is just a workflow file |
-| **Auto-merge** | **Never merges.** Explicitly human-in-the-loop for the merge decision — the routine only posts findings | **Does merge**, on a clean `VERDICT: CLEAN`, for the Renovate path specifically — an intentional addition beyond what openwrt does, built on request in this project |
+| Catch-up / dedup | A cron-scheduled **nightly digest** job re-reconciles PRs with new commits since the bot's last review (SHA comparison) | The sweep **is** this pattern now, on every run, not a separate nightly job — same idea, reached independently after the event-driven approach's three failed iterations (above), then confirmed by reading openwrt's actual file |
+| One-time setup | Manual, outside version control: dedicated bot GitHub account, GitHub App install, routine creation via UI, trigger-token generation | Fully declarative: two repo variables + one secret already existed; adding a capability is a workflow file |
+| **Auto-merge** | **Never merges.** Explicitly human-in-the-loop for the merge decision — the routine only posts findings | **Does merge**, gated on CI (not the AI verdict), for the dependency-bot path — an intentional addition beyond what openwrt does, built on request in this project |
+| **Self-repair** | Not present | `autofix`: proposes and verifies a fix locally before pushing it, gated the same way merge is (CI decides) — the furthest extension beyond openwrt's design, and the one carrying the residual risk noted above (CI proves a fix works, not that it's right) |
 
-The auto-merge behavior is the one divergence that isn't just "simpler
-implementation of the same idea" — it's additional scope openwrt's own
+Auto-merge and self-repair are the two divergences that aren't just "simpler
+implementation of the same idea" — they're additional scope openwrt's own
 design deliberately does not take on.
 
 ## Known-fragile points / open follow-ups
 
-- **Model availability**: `deepseek-v4-flash-free` on OpenCode Zen has gone
+- **Model availability**: `deepseek-v4-flash-free` on OpenCode Zen went
   fully unavailable (`Error from provider (Console): Upstream request
-  failed: Model is unavailable.`) more than once during development.
-  `flask-test-api` currently pins `OPENROUTER_MODEL=hy3-free` as a working
-  alternative found by testing `curl` against `/v1/models` directly. No
-  automatic fallback/retry-on-different-model exists yet.
-- **No branch protection on `flask-test-api`'s `main`** — the auto-merge
-  path has nothing else gating it (no required status checks, no required
-  review count). The AI verdict is the only gate. Acceptable for a
-  dependency-manifest-only diff; would not be for application code.
+  failed: Model is unavailable.`) during development. `flask-test-api`
+  currently pins `OPENROUTER_MODEL=hy3-free`, found by testing `curl`
+  against `/v1/models` directly. No automatic fallback/retry-on-different-
+  model exists yet.
+- **No branch protection on `flask-test-api`'s `main`** — deliberate (see
+  the project's own `docs/12-ai-pipeline.md` §6), not an oversight: the
+  `modifygit` job pushes directly to `main`, and the merge gate that
+  matters (`required_checks`) already lives in the sweep. If this changes,
+  the branch protection's required-checks list should mirror the sweep's.
+- **`verify_command` is consumer-authored shell**, and its correctness as a
+  proxy for the real gate depends entirely on how faithfully it mirrors
+  `pr-checks.yml` (or equivalent). A `verify_command` that's looser than
+  the real CI would let autofix push commits that pass locally and still
+  fail for real — the design assumes the consumer keeps the two in sync
+  deliberately, as `flask-test-api`'s wrapper does today (literally copied
+  from `pr-checks.yml`'s own steps).
+- **Autofix's residual risk** (stated in its section above): CI proves a
+  fix works, not that it's right. Scoped down by restricting autofix to
+  manifest-only edits on a repo whose CI genuinely exercises the app, never
+  to human-authored code — but not eliminated.
 - **`ai_sanitize.py --check` mode** is implemented but not wired into any
   current workflow step — kept for a future hard-gate use case.
 - **Only `flask-test-api` migrated.** `cloudflare-free-exporter` still has
