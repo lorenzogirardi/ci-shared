@@ -71,7 +71,7 @@ CI actually passed, and — opt-in — repair the broken ones.
 | `merge_poll_seconds` | `90` | After a fresh push, wait up to this long in this job for required checks to settle before deferring the merge to the next sweep. `0` disables polling. |
 | `merge_poll_interval` | `15` | Seconds between polls while waiting on `merge_poll_seconds` |
 | `triage_on_failure` | `false` | On red CI, explain the failure instead of reviewing the diff |
-| `autofix` | `false` | On red CI, push a verified fix instead of only explaining. Implies `triage_on_failure`. No file-type restriction beyond `.github/workflows/**`; a reply may also ask to read a real file before proposing an edit — see architecture.md. |
+| `autofix` | `false` | On red CI, push a verified fix instead of only explaining. Implies `triage_on_failure`. No file-type restriction beyond `.github/workflows/**`; a reply may also list a directory, find a file by name, grep file contents, or read a real file (repo, installed package, or stdlib) before proposing an edit — see architecture.md. |
 | `python_version` | `3.12` | Interpreter `verify_command` runs under — **must match the real CI gate's version** |
 | `verify_command` | `''` | Shell command proving an autofix edit works, run before pushing anything |
 | `verify_timeout_seconds` | `180` | |

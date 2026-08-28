@@ -511,7 +511,7 @@ model says:
   on the pushed commit, not this loop's local verification — decide whether
   it merges.
 
-#### `{"read": "..."}` — the model can look before it writes
+#### `list` / `find` / `grep` / `read` — the model can look before it writes
 
 The first version of code-level autofix (above) had a real, observed failure
 mode: fixing a renamed import (`FastMCP` → `MCPServer`) is easy from the
@@ -521,47 +521,79 @@ kwarg name) and got it wrong. Guessing a second time from the same error
 wouldn't help; the actual signature was sitting right there, installed, on
 the very runner running the loop.
 
-Instead of proposing edits, a reply may ask to see a real file first:
+`{"read": "..."}` (below) closed that gap, but the very next real occurrence
+of the same bump (Renovate reopens an identical PR every time a prior one
+gets reverted — it has no memory of a rejected bump) exposed a second one:
+`read` only works if you already know the exact path, and the model doesn't
+— it guessed a GitHub-runner toolcache path
+(`/opt/hostedtoolcache/Python/.../site-packages/mcp/server/mcpserver.py`)
+that didn't match this runner exactly, then tried the dotted name
+`mcp.server.mcpserver` as if it were a literal path. Both failed, and with
+no way to discover the real path instead of guessing it, all 5 rounds burned
+on repeated `read` attempts of the one file it did know about
+(`app/mcp/tools.py`) without ever proposing an edit. So three more,
+narrowly-scoped verbs exist for the same reason a human would reach for
+`ls`/`find`/`grep` instead of guessing a path:
 
 ```json
+{"list": "app/mcp"}
+{"find": "mcpserver"}
+{"grep": "class MCPServer"}
 {"read": "app/mcp/tools.py"}
 ```
 
-`resolve_readable_path()` allows exactly two roots: this repo's checkout, and
-the interpreter's own installed packages (`sysconfig.get_paths()["purelib"
-/ "platlib"]`) — so `{"read": "..."}` can show the model its own source, or
-the real installed source of whatever library broke, but nothing else on the
-runner. Path resolution goes through `Path.resolve()` before the containment
-check, so a traversal attempt (`../../etc/passwd`) is judged on where it
-actually lands, not on the string — landing outside both roots returns
-`None` regardless of how it got there.
+- **`list`** — `list_directory()`: immediate contents of a directory,
+  subdirectories marked with a trailing `/`.
+- **`find`** — `find_matching_paths()`: filenames containing a substring,
+  searched for real (capped at 20 results) instead of invented.
+- **`grep`** — `grep_matching_lines()`: `path:line: text` for lines matching
+  a pattern (a real regex, falling back to a literal substring if it doesn't
+  compile) across file *contents* — for finding code by what it says, not
+  by a filename guess. Capped at 30 matches and 8000 files scanned so a
+  broad pattern over a large `site-packages` can't hang the job.
+- **`read`** — `resolve_readable_path()`: one file's real, current content.
+  Also accepts a dotted Python import path directly (`mcp.server.mcpserver`)
+  and resolves it via `importlib.util.find_spec()` to that module's real
+  file — the exact case that failed above, closed without asking the model
+  to know a runner-specific absolute path at all.
 
-A read costs one round of `--max-autofix-attempts`, same budget as a
-proposed edit — there is no separate "investigation budget", by design:
+All four share `readable_roots()`: this repo's checkout, the interpreter's
+installed third-party packages, and its standard library
+(`sysconfig.get_paths()["purelib" / "platlib" / "stdlib" / "platstdlib"]`).
+Nothing else on the runner is visible through any of them. Path resolution
+goes through `Path.resolve()` before the containment check, so a traversal
+attempt (`../../etc/passwd`) is judged on where it actually lands, not on
+the string — landing outside every allowed root returns `None`/no matches
+regardless of how it got there.
+
+Each of the four costs one round of `--max-autofix-attempts`, same budget as
+a proposed edit — there is no separate "investigation budget", by design:
 adding one would be a second knob for the same underlying resource (model
-calls in this job), and the model is already told in the prompt to ask for
-only what it needs. A consumer doing code-level migrations, not just pin
-reverts, should raise `max_autofix_attempts` accordingly (a revert alone
-needs one round; a migration that reads a file first needs at least two).
+calls in this job), and the prompt already tells the model not to repeat a
+request it already got an answer to. A consumer doing code-level migrations,
+not just pin reverts, should raise `max_autofix_attempts` accordingly (a
+revert alone needs one round; explore-then-fix needs several more) —
+`flask-test-api` runs `5`, and even that wasn't enough for the run that
+motivated `find`/`grep`/`list` in the first place.
 
 **Made deterministic, not left to model ordering**: `autofix_one()` runs
 `verify_command` once, before the loop starts and before the model sees any
 prompt, discarding the result — it's expected to still fail (that's why
 autofix is running at all). The only thing that matters is the side effect:
 whatever new dependency version the bump wants is now actually installed on
-disk. Without this, `{"read": "..."}` on the very first round would resolve
-against whatever was installed *before* the bump — often the old version, or
+disk. Without this, a `read` on the very first round would resolve against
+whatever was installed *before* the bump — often the old version, or
 nothing — because otherwise nothing installs the new one until an edit's own
 verify pass runs, making a real capability depend on the model happening to
-try an edit before a read. That's not something to build reliability on: the
-loop decides the order that guarantees correctness, not the model.
+try an edit before exploring. That's not something to build reliability on:
+the loop decides the order that guarantees correctness, not the model.
 
 This is deliberately *not* an open "run a shell command" tool: the set of
-things a reply can ask for is exactly one thing (a file's content), and
-`resolve_readable_path()` decides what's readable in code, not the prompt —
-the same posture as `apply_fix()` deciding what's writable. Read access is a
-smaller, easier-to-reason-about grant than execute access, and it was
-enough to fix the actual failure this was built for.
+things a reply can ask for is exactly four fixed shapes, and each of
+`resolve_readable_path()` / `resolve_readable_dir()` decides in code what's
+readable, not the prompt — the same posture as `apply_fix()` deciding what's
+writable. Read/list/search access is a smaller, easier-to-reason-about grant
+than execute access.
 
 **Residual risk, stated plainly rather than hidden**: CI proves a fix
 *works*, not that it is *right*. A model could in principle satisfy the
@@ -714,8 +746,8 @@ flowchart TD
 
     subgraph autofixLoop["autofix_one() — up to max_autofix_attempts rounds"]
         direction TB
-        propose["model replies:<br/>edits, or {read: path}?"]
-        propose -- "read" --> resolve["resolve_readable_path()<br/>repo checkout or installed<br/>package only"]
+        propose["model replies:<br/>edits, or list/find/grep/read?"]
+        propose -- "list/find/grep/read" --> resolve["resolved against repo checkout,<br/>installed packages, or stdlib only"]
         resolve --> propose
         propose -- "edits" --> validate["parse_fix() / apply_fix()<br/>unique anchor, no .github/workflows/,<br/>all-or-nothing"]
         validate --> verify{"run verify_command<br/>in this job"}

@@ -20,6 +20,7 @@ Actions via GH_TOKEN); the model call goes through openrouter_ai.py.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import pathlib
@@ -227,22 +228,37 @@ migration note in the log), fix the actual call site, not just the pin: find
 the smallest code change that makes it work with the NEW version. Only revert
 the version instead when the log gives no concrete migration path.
 
-You do not have to guess a new API from the error message alone. If you need
-to see a real file before you can propose a correct edit — the actual source
-of the library you're migrating to, a file elsewhere in this repo, anything
-readable on disk — ask for it instead of guessing:
+You do not have to guess a new API from the error message alone, and you do
+not have to guess file paths either. Four things are available before you
+have to propose an edit — use them, in this rough order, instead of
+inventing an absolute path or an API shape:
 
 ```json
-{"read": "path/to/file.py"}
+{"list": "app/mcp"}
+{"find": "mcpserver"}
+{"grep": "class MCPServer"}
+{"read": "app/mcp/tools.py"}
 ```
 
-The path can be repo-relative (e.g. "app/mcp/tools.py") or an import path
-resolved to its installed location (e.g. the real file behind
-"mcp.server.mcpserver" once that package is installed) — you will be shown
-its real, current content, then asked again. Use this when a constructor or
-function signature actually matters to the fix, e.g. after a first attempt
-whose edit applied cleanly but the object it constructed rejected the
-arguments — reading the real class beats guessing which argument changed.
+- `list` — the immediate contents of a directory (repo-relative, or inside
+  an installed package), when you're not sure what's there.
+- `find` — filenames containing a substring, searched for real across this
+  repo checkout and the installed Python packages. Use this instead of
+  guessing an absolute path like a toolcache location — those vary by
+  runner and are not something to invent.
+- `grep` — lines matching a pattern (regex or plain text) across file
+  *contents* in the same places, when you know what you're looking for
+  (a class name, a function signature) but not which file has it.
+- `read` — the real, current content of one file, once you know its path.
+  Also accepts a dotted Python import path directly (e.g.
+  "mcp.server.mcpserver") — it resolves to that module's real file for you,
+  so you never need to know where a package is actually installed.
+
+Each of these costs one round, same as proposing an edit — after seeing the
+result you'll be asked again. Use this when a constructor or function
+signature actually matters to the fix, e.g. after a first attempt whose
+edit applied cleanly but the object it constructed rejected the arguments —
+reading the real class beats guessing which argument changed.
 
 Otherwise, reply with ONE fenced json block and nothing else:
 
@@ -265,8 +281,9 @@ Rules, all enforced by the caller — violating them means your fix is discarded
   the error output actually names.
 - If the error does not tell you a concrete fix, reply with
   `{"explanation": "...", "edits": []}` instead of guessing.
-- A `{"read": ...}` reply counts against your attempt budget just like a
-  proposed edit does — ask for what you actually need, not everything.
+- `list`/`find`/`grep`/`read` all count against your attempt budget just
+  like a proposed edit does — ask for what you actually need, not
+  everything, and don't repeat a request you already got an answer to.
 """
 
 # No file-type allowlist: this PR author is a dependency bot and the fix is
@@ -282,49 +299,189 @@ MAX_FIND_CHARS = 2000
 MAX_READ_CHARS = 20_000
 
 
-def parse_read_request(text: str) -> str | None:
-    """The path from a `{"read": "..."}` reply, or None if this isn't one.
+_DOTTED_MODULE_RE = re.compile(r"^[A-Za-z_][\w]*(\.[A-Za-z_][\w]*)+$")
 
-    Checked before parse_fix() -- a read request is not a proposed edit, and
-    forcing it through the edits schema would just make it fail validation.
-    """
+
+def readable_roots() -> list[pathlib.Path]:
+    """Everywhere a read/find/grep/list request may look: this repo's
+    checkout, the interpreter's installed third-party packages, and its
+    standard library -- so a break rooted in stdlib behavior can be read
+    too, not just third-party dependencies."""
+    roots = [pathlib.Path.cwd().resolve()]
+    for key in ("purelib", "platlib", "stdlib", "platstdlib"):
+        try:
+            roots.append(pathlib.Path(sysconfig.get_paths()[key]).resolve())
+        except KeyError:
+            continue
+    return roots
+
+
+def _parse_json_reply(text: str) -> dict | None:
     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     blob = match.group(1) if match else text.strip()
     try:
         data = json.loads(blob)
     except (json.JSONDecodeError, TypeError):
         return None
-    if not isinstance(data, dict):
+    return data if isinstance(data, dict) else None
+
+
+def _parse_single_key_request(text: str, key: str) -> str | None:
+    """The string value of `key` from a single-key JSON reply, or None if
+    this reply isn't that shape. Shared by read/find/grep/list requests --
+    checked before parse_fix() so none of them are forced through the edits
+    schema, where they'd just fail validation.
+    """
+    data = _parse_json_reply(text)
+    if data is None:
         return None
-    path = data.get("read")
-    return path if isinstance(path, str) and path else None
+    value = data.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def parse_read_request(text: str) -> str | None:
+    return _parse_single_key_request(text, "read")
+
+
+def parse_find_request(text: str) -> str | None:
+    return _parse_single_key_request(text, "find")
+
+
+def parse_grep_request(text: str) -> str | None:
+    return _parse_single_key_request(text, "grep")
+
+
+def parse_list_request(text: str) -> str | None:
+    return _parse_single_key_request(text, "list")
+
+
+_SKIP_DIR_NAMES = {"__pycache__", ".git"}
+_BINARY_SUFFIXES = {
+    ".pyc", ".so", ".dylib", ".dll", ".png", ".jpg", ".jpeg", ".gif", ".ico",
+    ".whl", ".zip", ".tar", ".gz", ".woff", ".woff2", ".ttf", ".pdf",
+}
+
+
+def find_matching_paths(pattern: str, max_results: int = 20) -> list[str]:
+    """Filenames containing `pattern`, under the same roots a read may use.
+
+    A real filesystem search, not a guess -- the failure this replaced was
+    the model inventing a plausible-looking absolute path (a GitHub-hosted
+    runner's toolcache layout, close but not exact) instead of being able to
+    find out where a file actually is.
+    """
+    needle = pattern.lower()
+    matches: list[str] = []
+    for root in readable_roots():
+        if not root.is_dir():
+            continue
+        for p in root.rglob("*"):
+            if _SKIP_DIR_NAMES & set(p.parts):
+                continue
+            if p.is_file() and needle in p.name.lower():
+                matches.append(str(p))
+                if len(matches) >= max_results:
+                    return matches
+    return matches
+
+
+def grep_matching_lines(pattern: str, max_matches: int = 30, max_files: int = 8000) -> list[str]:
+    """`path:line: text` for every line matching `pattern` (regex, falling
+    back to a literal substring if it doesn't compile), under the same
+    roots a read may use -- finding code by what it says, not just by a
+    filename guess.
+    """
+    try:
+        rx = re.compile(pattern)
+    except re.error:
+        rx = re.compile(re.escape(pattern))
+    results: list[str] = []
+    scanned = 0
+    for root in readable_roots():
+        if not root.is_dir():
+            continue
+        for p in root.rglob("*"):
+            if _SKIP_DIR_NAMES & set(p.parts) or not p.is_file() or p.suffix in _BINARY_SUFFIXES:
+                continue
+            scanned += 1
+            if scanned > max_files:
+                return results
+            try:
+                text = p.read_text(errors="ignore")
+            except OSError:
+                continue
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                if rx.search(line):
+                    results.append(f"{p}:{lineno}: {line.strip()[:300]}")
+                    if len(results) >= max_matches:
+                        return results
+    return results
+
+
+def resolve_readable_dir(path: str) -> pathlib.Path | None:
+    """Same containment rule as resolve_readable_path, for a directory."""
+    try:
+        target = pathlib.Path(path).resolve()
+    except (OSError, ValueError):
+        return None
+    if not target.is_dir():
+        return None
+    for root in readable_roots():
+        try:
+            target.relative_to(root)
+            return target
+        except ValueError:
+            continue
+    return None
+
+
+def list_directory(path: str, max_entries: int = 200) -> list[str] | None:
+    """Immediate contents of a directory the model may look inside, or None
+    if it doesn't exist or is outside the two allowed roots. Directories get
+    a trailing "/" so a reply can tell them apart from files without a
+    follow-up request."""
+    resolved = resolve_readable_dir(path)
+    if resolved is None:
+        return None
+    entries = sorted(
+        p.name + "/" if p.is_dir() else p.name
+        for p in resolved.iterdir()
+        if p.name not in _SKIP_DIR_NAMES
+    )
+    return entries[:max_entries]
 
 
 def resolve_readable_path(path: str) -> pathlib.Path | None:
     """A path the model may actually read, or None if it doesn't exist or
     resolves outside what's safe to show it.
 
-    Two roots only: this repo checkout (so it can read its own source), and
-    the interpreter's installed packages (so it can read the real source of
-    whatever it's migrating to, instead of guessing an API from an error
-    message alone). Anything else -- absolute paths elsewhere on the runner,
-    traversal out of both roots -- returns None; `.resolve()` collapses `..`
-    before the containment check runs, so a traversal attempt is judged on
-    where it actually lands, not on the string itself.
+    Also accepts a dotted Python module name (e.g. "mcp.server.mcpserver")
+    and resolves it via `importlib` to that module's real file -- without
+    this, the only way to read an installed library is to already know its
+    exact absolute path on this specific runner, which is not something to
+    expect a reply to guess correctly.
+
+    Two roots only for the path form: this repo checkout, and the
+    interpreter's installed packages. Anything else -- absolute paths
+    elsewhere on the runner, traversal out of both roots -- returns None;
+    `.resolve()` collapses `..` before the containment check runs, so a
+    traversal attempt is judged on where it actually lands, not on the
+    string itself.
     """
+    if _DOTTED_MODULE_RE.match(path):
+        try:
+            spec = importlib.util.find_spec(path)
+        except (ImportError, ValueError, ModuleNotFoundError):
+            spec = None
+        if spec is not None and spec.origin and spec.origin not in ("built-in", "frozen"):
+            path = spec.origin
     try:
         target = pathlib.Path(path).resolve()
     except (OSError, ValueError):
         return None
     if not target.is_file():
         return None
-    roots = [pathlib.Path.cwd().resolve()]
-    for key in ("purelib", "platlib"):
-        try:
-            roots.append(pathlib.Path(sysconfig.get_paths()[key]).resolve())
-        except KeyError:
-            continue
-    for root in roots:
+    for root in readable_roots():
         try:
             target.relative_to(root)
             return target
@@ -533,14 +690,16 @@ def autofix_one(pr: dict, args: argparse.Namespace, repo: str,
     """Try to repair a red PR by pushing a VERIFIED fix to its branch.
 
     Loops up to --max-autofix-attempts. On each round the model can either
-    propose an edit, or ask to read one real file first (repo-relative, or
-    an installed package's source) when it needs to see an actual API rather
-    than guess it from an error message -- a read costs one round and
-    doesn't touch the working tree. A proposed edit gets applied and run
-    through --verify-command-file; a pass pushes immediately, a failure
-    reverts the edit and feeds the real verification output back into the
-    next round as "here's what happened". Nothing is pushed until one round
-    verifies, or every round is exhausted.
+    propose an edit, or explore first -- list a directory, find a file by
+    name, grep file contents, or read one real file (repo-relative, an
+    installed package's source, or a dotted import path resolved for it) --
+    instead of guessing an API or a runner-specific absolute path from an
+    error message alone. Each of those costs one round and doesn't touch
+    the working tree. A proposed edit gets applied and run through
+    --verify-command-file; a pass pushes immediately, a failure reverts the
+    edit and feeds the real verification output back into the next round as
+    "here's what happened". Nothing is pushed until one round verifies, or
+    every round is exhausted.
 
     Returns (outcome, detail). Even a verified push is never merged here: CI
     re-runs on the new commit, and a later sweep merges only if the required
@@ -609,15 +768,55 @@ def autofix_one(pr: dict, args: argparse.Namespace, repo: str,
             resolved = resolve_readable_path(read_path)
             if resolved is None:
                 feedback = (
-                    f"You asked to read {read_path!r}, but it doesn't exist or isn't "
+                    f"You asked to read {read_path!r}, but it doesn't exist, isn't "
                     "somewhere readable (this repo checkout, or an installed Python "
-                    "package). Ask for a real path, or propose edits with what you know."
+                    "package), or isn't a resolvable module name. Use {\"find\": "
+                    "\"name\"} to search for the real path instead of guessing one."
                 )
             else:
                 content = resolved.read_text(errors="replace")[:MAX_READ_CHARS]
                 feedback = f"You asked to read {read_path} ({resolved}):\n{content}"
             print(f"autofix attempt {attempt}/{args.max_autofix_attempts}: read {read_path!r} "
                   f"({'found' if resolved else 'not found'})")
+            continue
+
+        find_pattern = parse_find_request(reply)
+        if find_pattern is not None:
+            matches = find_matching_paths(find_pattern)
+            feedback = (
+                f"You searched for {find_pattern!r}. Matches:\n" + "\n".join(matches)
+                if matches else
+                f"You searched for {find_pattern!r}. No matches in this repo checkout "
+                "or the installed Python packages."
+            )
+            print(f"autofix attempt {attempt}/{args.max_autofix_attempts}: find {find_pattern!r} "
+                  f"({len(matches)} match(es))")
+            continue
+
+        grep_pattern = parse_grep_request(reply)
+        if grep_pattern is not None:
+            hits = grep_matching_lines(grep_pattern)
+            feedback = (
+                f"You searched file contents for {grep_pattern!r}. Matches:\n" + "\n".join(hits)
+                if hits else
+                f"You searched file contents for {grep_pattern!r}. No matches in this repo "
+                "checkout or the installed Python packages."
+            )
+            print(f"autofix attempt {attempt}/{args.max_autofix_attempts}: grep {grep_pattern!r} "
+                  f"({len(hits)} match(es))")
+            continue
+
+        list_path = parse_list_request(reply)
+        if list_path is not None:
+            entries = list_directory(list_path)
+            feedback = (
+                f"You asked to list {list_path!r}, but it doesn't exist or isn't somewhere "
+                "listable (this repo checkout, or an installed Python package)."
+                if entries is None else
+                f"Contents of {list_path}:\n" + ("\n".join(entries) if entries else "(empty)")
+            )
+            print(f"autofix attempt {attempt}/{args.max_autofix_attempts}: list {list_path!r} "
+                  f"({'found' if entries is not None else 'not found'})")
             continue
 
         parsed = parse_fix(reply)

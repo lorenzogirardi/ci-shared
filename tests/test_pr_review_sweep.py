@@ -21,8 +21,15 @@ from pr_review_sweep import (  # noqa: E402
     checks_state,
     comment_body,
     error_region,
+    find_matching_paths,
+    grep_matching_lines,
+    list_directory,
+    parse_find_request,
     parse_fix,
+    parse_grep_request,
+    parse_list_request,
     parse_read_request,
+    resolve_readable_dir,
     resolve_readable_path,
     split_verdict,
     touches_workflow_files,
@@ -474,3 +481,111 @@ class TestAutofixRead:
         monkeypatch.chdir(tmp_path)
         resolved = resolve_readable_path(pytest.__file__)
         assert resolved is not None
+
+    def test_resolves_a_dotted_module_name_to_its_real_file(self, tmp_path, monkeypatch):
+        """Real incident: the model correctly guessed the module name
+        (mcp.server.mcpserver) but had no way to turn that into a real path
+        on this specific runner, and its absolute-path guess missed."""
+        monkeypatch.chdir(tmp_path)
+        resolved = resolve_readable_path("json.decoder")
+        assert resolved is not None
+        assert resolved.name == "decoder.py"
+
+    def test_an_unresolvable_module_name_is_not_a_path(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        assert resolve_readable_path("this.does.not.exist.anywhere") is None
+
+
+class TestAutofixExplore:
+    """find/grep/list -- so a reply can locate something real instead of
+    inventing an absolute path or guessing which file holds what it needs.
+    Real incident: a migration attempt guessed a GitHub-runner toolcache
+    path for an installed library and it didn't exist on that runner."""
+
+    def _reply(self, obj):
+        import json as _json
+        return "```json\n" + _json.dumps(obj) + "\n```"
+
+    def test_parses_each_request_kind(self):
+        assert parse_find_request(self._reply({"find": "mcpserver"})) == "mcpserver"
+        assert parse_grep_request(self._reply({"grep": "class MCPServer"})) == "class MCPServer"
+        assert parse_list_request(self._reply({"list": "app/mcp"})) == "app/mcp"
+        # Each parser only recognizes its own key.
+        assert parse_find_request(self._reply({"grep": "x"})) is None
+        assert parse_grep_request(self._reply({"read": "x"})) is None
+        assert parse_list_request(self._reply({"find": "x"})) is None
+
+    def _isolate_roots(self, monkeypatch, tmp_path):
+        """Scope find/grep to just tmp_path -- otherwise they also scan this
+        machine's real site-packages/stdlib, which is real and correct
+        behavior but makes a substring test non-deterministic across
+        environments."""
+        monkeypatch.setattr(pr_review_sweep, "readable_roots", lambda: [tmp_path.resolve()])
+
+    def test_find_matches_by_filename_under_the_repo_checkout(self, tmp_path, monkeypatch):
+        self._isolate_roots(monkeypatch, tmp_path)
+        (tmp_path / "app").mkdir()
+        (tmp_path / "app" / "mcpserver.py").write_text("x = 1\n")
+        (tmp_path / "app" / "unrelated.py").write_text("y = 2\n")
+        matches = find_matching_paths("mcpserver")
+        assert len(matches) == 1
+        assert matches[0].endswith("mcpserver.py")
+
+    def test_find_skips_pycache(self, tmp_path, monkeypatch):
+        self._isolate_roots(monkeypatch, tmp_path)
+        cache = tmp_path / "__pycache__"
+        cache.mkdir()
+        (cache / "mcpserver.cpython-314.pyc").write_text("junk")
+        assert find_matching_paths("mcpserver") == []
+
+    def test_grep_finds_a_real_line_with_file_and_line_number(self, tmp_path, monkeypatch):
+        self._isolate_roots(monkeypatch, tmp_path)
+        target = tmp_path / "tools.py"
+        target.write_text("first line\nclass MCPServer:\n    pass\n")
+        hits = grep_matching_lines("class MCPServer")
+        assert len(hits) == 1
+        assert hits[0].startswith(f"{target}:2:")
+        assert "class MCPServer" in hits[0]
+
+    def test_grep_falls_back_to_literal_text_on_a_bad_regex(self, tmp_path, monkeypatch):
+        self._isolate_roots(monkeypatch, tmp_path)
+        (tmp_path / "a.py").write_text("weird(name\n")
+        # "(" alone is an invalid regex; must not raise, must still match literally.
+        hits = grep_matching_lines("(name")
+        assert len(hits) == 1
+
+    def test_resolve_readable_dir_accepts_the_repo_root(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "app").mkdir()
+        assert resolve_readable_dir("app") == (tmp_path / "app").resolve()
+
+    def test_resolve_readable_dir_refuses_outside_both_roots(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (tmp_path / "outside").mkdir()
+        monkeypatch.chdir(repo)
+        assert resolve_readable_dir("../outside") is None
+
+    def test_resolve_readable_dir_refuses_a_file(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "a_file.py").write_text("x = 1\n")
+        assert resolve_readable_dir("a_file.py") is None
+
+    def test_list_directory_marks_subdirectories(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "app").mkdir()
+        (tmp_path / "app" / "sub").mkdir()
+        (tmp_path / "app" / "tools.py").write_text("x = 1\n")
+        entries = list_directory("app")
+        assert entries == ["sub/", "tools.py"]
+
+    def test_list_directory_excludes_pycache(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "app").mkdir()
+        (tmp_path / "app" / "__pycache__").mkdir()
+        (tmp_path / "app" / "tools.py").write_text("x = 1\n")
+        assert list_directory("app") == ["tools.py"]
+
+    def test_list_directory_of_a_nonexistent_path_is_none(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        assert list_directory("does/not/exist") is None
