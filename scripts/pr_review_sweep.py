@@ -515,6 +515,7 @@ def autofix_one(pr: dict, args: argparse.Namespace, repo: str,
             if attempt > 1:
                 detail += f" after {attempt - 1} verified-failing attempt(s)"
             return "skipped", detail
+        print(f"autofix attempt {attempt}/{args.max_autofix_attempts}: {reply[:1000]}")
 
         parsed = parse_fix(reply)
         if parsed is None:
@@ -529,6 +530,8 @@ def autofix_one(pr: dict, args: argparse.Namespace, repo: str,
             return "rejected", error
 
         ok, verify_output = run_verify(verify_command, args.verify_timeout)
+        print(f"autofix attempt {attempt}/{args.max_autofix_attempts}: verify "
+              f"{'passed' if ok else 'failed'} on {', '.join(changed)}")
         if ok:
             run(["git", "config", "user.name", "ci-shared autofix"], check=False)
             run(["git", "config", "user.email", "actions@github.com"], check=False)
