@@ -18,6 +18,7 @@ from pr_review_sweep import (  # noqa: E402
     MAX_FIX_EDITS,
     _autofix_report,
     apply_fix,
+    build_context,
     checks_state,
     comment_body,
     error_region,
@@ -589,3 +590,40 @@ class TestAutofixExplore:
     def test_list_directory_of_a_nonexistent_path_is_none(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         assert list_directory("does/not/exist") is None
+
+
+class TestBuildContext:
+    """Real incident: keeping only the last round's result meant a model
+    that read file A, then file B, then needed A again had no way to know
+    it had already seen it -- it just re-read A a third time and burned
+    the whole attempt budget without ever proposing an edit."""
+
+    def test_all_rounds_appear_when_they_fit(self):
+        history = ["Round 1: saw A", "Round 2: saw B", "Round 3: saw C"]
+        context = build_context(history, budget=1000)
+        assert "Round 1: saw A" in context
+        assert "Round 2: saw B" in context
+        assert "Round 3: saw C" in context
+
+    def test_rounds_stay_in_original_order(self):
+        history = ["Round 1: saw A", "Round 2: saw B"]
+        context = build_context(history, budget=1000)
+        assert context.index("Round 1") < context.index("Round 2")
+
+    def test_drops_the_oldest_whole_entry_when_over_budget(self):
+        history = ["Round 1: " + "x" * 50, "Round 2: " + "y" * 50, "Round 3: " + "z" * 50]
+        # Each entry is 59 chars; 120 fits the last two but not all three.
+        context = build_context(history, budget=120)
+        assert "Round 1" not in context
+        assert "Round 2" in context
+        assert "Round 3" in context
+
+    def test_never_truncates_a_single_entry_mid_content(self):
+        """A half-shown file reads as a shorter, wrong file -- worse than
+        not showing it at all."""
+        history = ["Round 1: " + "x" * 500]
+        context = build_context(history, budget=50)
+        assert context == history[0]  # kept whole, even though it's over budget alone
+
+    def test_empty_history_is_empty_context(self):
+        assert build_context([]) == ""

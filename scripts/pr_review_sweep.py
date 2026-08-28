@@ -297,6 +297,30 @@ AUTOFIX_BLOCKED_PREFIX = ".github/workflows/"
 MAX_FIX_EDITS = 5
 MAX_FIND_CHARS = 2000
 MAX_READ_CHARS = 20_000
+MAX_CONTEXT_CHARS = 100_000
+
+
+def build_context(history: list[str], budget: int = MAX_CONTEXT_CHARS) -> str:
+    """All prior rounds' results, most recent kept when it doesn't all fit.
+
+    Real incident this replaced: keeping only the LAST round's result meant
+    a model that read file A, then file B, then needed A again had no way
+    to know it had already seen it -- A's content was gone the moment B's
+    overwrote it, so it just re-read A a third time and burned the whole
+    attempt budget on repeated reads without ever proposing an edit. Trims
+    whole entries from the OLDEST end, never mid-entry -- a half-shown file
+    would read as a shorter, wrong file, which is worse than not showing it
+    at all.
+    """
+    kept: list[str] = []
+    used = 0
+    for entry in reversed(history):
+        if used + len(entry) > budget and kept:
+            break
+        kept.append(entry)
+        used += len(entry)
+    kept.reverse()
+    return "\n\n---\n\n".join(kept)
 
 
 _DOTTED_MODULE_RE = re.compile(r"^[A-Za-z_][\w]*(\.[A-Za-z_][\w]*)+$")
@@ -743,17 +767,18 @@ def autofix_one(pr: dict, args: argparse.Namespace, repo: str,
     # not a thing to rely on.
     run_verify(verify_command, args.verify_timeout)
 
-    feedback = ""  # context from the previous step -- a failed verify, or a file just read
+    history: list[str] = []  # every prior round's result, oldest first -- see build_context()
     last_verify_output = ""
     for attempt in range(1, args.max_autofix_attempts + 1):
         system_path = pathlib.Path(".ai/autofix-system.txt")
         system_path.write_text(AUTOFIX_SYSTEM)
         user_path = pathlib.Path(".ai/autofix-user.txt")
+        context = build_context(history)
         user_path.write_text(
             f"PR #{number} title: {pr['title']}\n\n"
             f"## Failing CI output\n{logs}\n\n"
             f"## Diff\n{diff[: args.max_chars // 2]}\n"
-            + (f"\n## Context from your previous step\n{feedback}\n" if feedback else "")
+            + (f"\n## What you already know from previous rounds\n{context}\n" if context else "")
         )
         reply = _call_model(args, system_path, user_path, number)
         if reply is None:
@@ -767,15 +792,15 @@ def autofix_one(pr: dict, args: argparse.Namespace, repo: str,
         if read_path is not None:
             resolved = resolve_readable_path(read_path)
             if resolved is None:
-                feedback = (
-                    f"You asked to read {read_path!r}, but it doesn't exist, isn't "
-                    "somewhere readable (this repo checkout, or an installed Python "
-                    "package), or isn't a resolvable module name. Use {\"find\": "
-                    "\"name\"} to search for the real path instead of guessing one."
+                history.append(
+                    f"Round {attempt}: you asked to read {read_path!r}, but it doesn't exist, "
+                    "isn't somewhere readable (this repo checkout, or an installed Python "
+                    "package), or isn't a resolvable module name. Use {\"find\": \"name\"} to "
+                    "search for the real path instead of guessing one."
                 )
             else:
                 content = resolved.read_text(errors="replace")[:MAX_READ_CHARS]
-                feedback = f"You asked to read {read_path} ({resolved}):\n{content}"
+                history.append(f"Round {attempt}: you read {read_path} ({resolved}):\n{content}")
             print(f"autofix attempt {attempt}/{args.max_autofix_attempts}: read {read_path!r} "
                   f"({'found' if resolved else 'not found'})")
             continue
@@ -783,11 +808,12 @@ def autofix_one(pr: dict, args: argparse.Namespace, repo: str,
         find_pattern = parse_find_request(reply)
         if find_pattern is not None:
             matches = find_matching_paths(find_pattern)
-            feedback = (
-                f"You searched for {find_pattern!r}. Matches:\n" + "\n".join(matches)
+            history.append(
+                f"Round {attempt}: you searched for {find_pattern!r}. Matches:\n"
+                + "\n".join(matches)
                 if matches else
-                f"You searched for {find_pattern!r}. No matches in this repo checkout "
-                "or the installed Python packages."
+                f"Round {attempt}: you searched for {find_pattern!r}. No matches in this repo "
+                "checkout or the installed Python packages."
             )
             print(f"autofix attempt {attempt}/{args.max_autofix_attempts}: find {find_pattern!r} "
                   f"({len(matches)} match(es))")
@@ -796,11 +822,12 @@ def autofix_one(pr: dict, args: argparse.Namespace, repo: str,
         grep_pattern = parse_grep_request(reply)
         if grep_pattern is not None:
             hits = grep_matching_lines(grep_pattern)
-            feedback = (
-                f"You searched file contents for {grep_pattern!r}. Matches:\n" + "\n".join(hits)
+            history.append(
+                f"Round {attempt}: you searched file contents for {grep_pattern!r}. Matches:\n"
+                + "\n".join(hits)
                 if hits else
-                f"You searched file contents for {grep_pattern!r}. No matches in this repo "
-                "checkout or the installed Python packages."
+                f"Round {attempt}: you searched file contents for {grep_pattern!r}. No matches "
+                "in this repo checkout or the installed Python packages."
             )
             print(f"autofix attempt {attempt}/{args.max_autofix_attempts}: grep {grep_pattern!r} "
                   f"({len(hits)} match(es))")
@@ -809,11 +836,12 @@ def autofix_one(pr: dict, args: argparse.Namespace, repo: str,
         list_path = parse_list_request(reply)
         if list_path is not None:
             entries = list_directory(list_path)
-            feedback = (
-                f"You asked to list {list_path!r}, but it doesn't exist or isn't somewhere "
-                "listable (this repo checkout, or an installed Python package)."
+            history.append(
+                f"Round {attempt}: you asked to list {list_path!r}, but it doesn't exist or "
+                "isn't somewhere listable (this repo checkout, or an installed Python package)."
                 if entries is None else
-                f"Contents of {list_path}:\n" + ("\n".join(entries) if entries else "(empty)")
+                f"Round {attempt}: contents of {list_path}:\n"
+                + ("\n".join(entries) if entries else "(empty)")
             )
             print(f"autofix attempt {attempt}/{args.max_autofix_attempts}: list {list_path!r} "
                   f"({'found' if entries is not None else 'not found'})")
@@ -859,7 +887,10 @@ def autofix_one(pr: dict, args: argparse.Namespace, repo: str,
         # Verification failed: undo this attempt before proposing the next one.
         run(["git", "checkout", "--", *changed], check=False)
         last_verify_output = verify_output
-        feedback = f"Tried:\n{explanation}\n\nBut local verification then failed:\n{verify_output}"
+        history.append(
+            f"Round {attempt}: you tried:\n{explanation}\n\n"
+            f"But local verification then failed:\n{verify_output}"
+        )
 
     return "exhausted", (
         f"used all {args.max_autofix_attempts} attempt(s) (proposed fixes and file reads "

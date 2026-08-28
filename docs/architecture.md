@@ -576,6 +576,22 @@ revert alone needs one round; explore-then-fix needs several more) —
 `flask-test-api` runs `5`, and even that wasn't enough for the run that
 motivated `find`/`grep`/`list` in the first place.
 
+**`build_context()`: an accumulating history, not a one-step memory.** The
+very first live run with `find`/`grep`/`list` available exposed exactly the
+failure "don't repeat a request" was meant to prevent: the loop kept only
+the LAST round's result in a single `feedback` string, overwritten every
+round. A reply that read `app/mcp/tools.py`, then `mcp.server.mcpserver`,
+then needed `app/mcp/tools.py` again had no way to know it had already seen
+it — that content was gone the moment the second read overwrote it. All 5
+rounds burned on reads (two of them literal repeats) and not one edit was
+ever proposed. `history` is now a list, one entry per round, and
+`build_context()` joins as many of the most recent entries as fit in
+`MAX_CONTEXT_CHARS` (100,000) — trimming whole entries from the *oldest*
+end when it doesn't all fit, never truncating one mid-content (a half-shown
+file reads as a shorter, wrong file, which is worse than not showing it at
+all). The instruction not to repeat a request only means something once the
+model can actually see what it already asked.
+
 **Made deterministic, not left to model ordering**: `autofix_one()` runs
 `verify_command` once, before the loop starts and before the model sees any
 prompt, discarding the result — it's expected to still fail (that's why
