@@ -571,6 +571,19 @@ def autofix_one(pr: dict, args: argparse.Namespace, repo: str,
         if vf.is_file():
             verify_command = vf.read_text()
 
+    # Prime the environment before the model ever sees a prompt: run
+    # verify_command once, on the PR's diff exactly as Renovate left it, and
+    # discard the result -- it is expected to still fail, that's the whole
+    # reason autofix is running. The only thing that matters is the side
+    # effect: whatever new dependency version the bump wants is now actually
+    # installed. Without this, a {"read": ...} reply on the very first
+    # attempt would resolve against whatever was there before (often the OLD
+    # version, or nothing), because otherwise nothing installs anything
+    # until an edit's own verify pass runs -- making a real capability
+    # depend on the model happening to try an edit before a read, which is
+    # not a thing to rely on.
+    run_verify(verify_command, args.verify_timeout)
+
     feedback = ""  # context from the previous step -- a failed verify, or a file just read
     last_verify_output = ""
     for attempt in range(1, args.max_autofix_attempts + 1):

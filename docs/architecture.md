@@ -525,6 +525,18 @@ only what it needs. A consumer doing code-level migrations, not just pin
 reverts, should raise `max_autofix_attempts` accordingly (a revert alone
 needs one round; a migration that reads a file first needs at least two).
 
+**Made deterministic, not left to model ordering**: `autofix_one()` runs
+`verify_command` once, before the loop starts and before the model sees any
+prompt, discarding the result — it's expected to still fail (that's why
+autofix is running at all). The only thing that matters is the side effect:
+whatever new dependency version the bump wants is now actually installed on
+disk. Without this, `{"read": "..."}` on the very first round would resolve
+against whatever was installed *before* the bump — often the old version, or
+nothing — because otherwise nothing installs the new one until an edit's own
+verify pass runs, making a real capability depend on the model happening to
+try an edit before a read. That's not something to build reliability on: the
+loop decides the order that guarantees correctness, not the model.
+
 This is deliberately *not* an open "run a shell command" tool: the set of
 things a reply can ask for is exactly one thing (a file's content), and
 `resolve_readable_path()` decides what's readable in code, not the prompt —
