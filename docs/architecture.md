@@ -471,12 +471,15 @@ model says:
 - `find` must appear **exactly once** in its target file, or nothing is
   written for that edit — an ambiguous anchor is how a "small" fix silently
   changes the wrong line.
-- Only files matching `AUTOFIX_ALLOWED` may be touched: dependency
-  manifests (`requirements.txt`, `Dockerfile`, `pyproject.toml`, `go.mod`,
-  `package.json`, ...) — **never** application code, tests, or
-  `.github/workflows/` (which `GITHUB_TOKEN` couldn't push anyway without
-  the `workflows` scope, so an attempted edit there would fail at push time
-  having already burned a model call — excluded up front instead).
+- No file-type allowlist: a dependency major bump can break at the API level
+  (real incident: mcp 2.x renamed `FastMCP` to `MCPServer`, breaking
+  `app/mcp/tools.py`), and a pin revert can't fix that — only a code change
+  can. What gates a wrong fix is `required_checks` running the real test
+  suite, not which file the model touched. The one hard exclusion is
+  `.github/workflows/**` — not a scope choice but a fact about every
+  credential this loop has: GitHub rejects that write without the separate
+  `workflow` scope regardless, so an edit there would fail at push time
+  having already burned a model call — excluded up front instead.
 - At most 5 edits per attempt; bounded anchor/replacement size; no path
   traversal (`..`, absolute paths rejected).
 - A batch is all-or-nothing: if any single edit in a proposed fix is
@@ -492,10 +495,14 @@ model says:
 **Residual risk, stated plainly rather than hidden**: CI proves a fix
 *works*, not that it is *right*. A model could in principle satisfy the
 checks by loosening a constraint rather than correcting it (e.g. relaxing a
-version pin instead of bumping the actual dependency that needed it). This
-is not fully closed by anything in this design — it is why `autofix` should
-only be enabled for a bot whose diffs are manifest-only, on a repo whose CI
-genuinely exercises the running app, never for human-authored code.
+version pin instead of bumping the actual dependency that needed it), or by
+writing a code change that passes the existing tests while being wrong in a
+case they don't cover — a strictly bigger risk now that edits aren't limited
+to manifests. This is not fully closed by anything in this design: it is a
+deliberate, explicit choice to trust `required_checks` (auto-merge included)
+over a human reviewing every diff, made because this bot only ever touches
+dependency-bot PRs, on a repo where that trade-off is acceptable — never for
+human-authored code, and never without a real test suite behind the gate.
 
 ---
 

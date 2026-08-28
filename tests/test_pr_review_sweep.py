@@ -94,16 +94,30 @@ class TestAutofixGuardrails:
         assert parsed == ([], "x")
 
     @pytest.mark.parametrize("path", [
-        "app/main.py",            # application code
-        "tests/test_storage.py",  # tests
-        ".github/workflows/pipeline.yml",  # CI definition
-        "setup.py",
-        "../../etc/passwd",       # traversal
-        "/etc/passwd",            # absolute
+        ".github/workflows/pipeline.yml",       # push would be rejected regardless
+        ".github/workflows/nested/reused.yml",  # same, one level deeper
+        "../../etc/passwd",                     # traversal
+        "/etc/passwd",                          # absolute
     ])
-    def test_rejects_files_outside_the_manifest_allowlist(self, path):
+    def test_rejects_workflow_files_and_path_games(self, path):
         assert parse_fix(self._reply(
             [{"file": path, "find": "a", "replace": "b"}])) is None
+
+    @pytest.mark.parametrize("path", [
+        "requirements.txt",       # still fine, unrestricted now covers it too
+        "app/main.py",            # application code -- allowed since the real
+        "app/mcp/tools.py",       # test suite gates correctness, not file type
+        "tests/test_storage.py",  # a fix can legitimately touch its own test
+        "setup.py",
+    ])
+    def test_accepts_any_file_outside_workflows(self, path):
+        """A dependency major bump can break at the API level, not just at
+        install time (real incident: mcp 2.x renamed FastMCP to MCPServer,
+        breaking app/mcp/tools.py) -- a pin revert alone can't fix that, so
+        autofix is not restricted to manifests. What gates a wrong fix is the
+        real test suite in required_checks, not a file-type allowlist."""
+        assert parse_fix(self._reply(
+            [{"file": path, "find": "a", "replace": "b"}])) is not None
 
     def test_rejects_malformed_or_oversized_replies(self):
         assert parse_fix("not json at all") is None
