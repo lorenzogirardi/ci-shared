@@ -26,6 +26,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import sysconfig
 import time
 
 MARKER = "<!-- ai-review-sweep -->"
@@ -226,7 +227,24 @@ migration note in the log), fix the actual call site, not just the pin: find
 the smallest code change that makes it work with the NEW version. Only revert
 the version instead when the log gives no concrete migration path.
 
-Reply with ONE fenced json block and nothing else:
+You do not have to guess a new API from the error message alone. If you need
+to see a real file before you can propose a correct edit — the actual source
+of the library you're migrating to, a file elsewhere in this repo, anything
+readable on disk — ask for it instead of guessing:
+
+```json
+{"read": "path/to/file.py"}
+```
+
+The path can be repo-relative (e.g. "app/mcp/tools.py") or an import path
+resolved to its installed location (e.g. the real file behind
+"mcp.server.mcpserver" once that package is installed) — you will be shown
+its real, current content, then asked again. Use this when a constructor or
+function signature actually matters to the fix, e.g. after a first attempt
+whose edit applied cleanly but the object it constructed rejected the
+arguments — reading the real class beats guessing which argument changed.
+
+Otherwise, reply with ONE fenced json block and nothing else:
 
 ```json
 {
@@ -247,6 +265,8 @@ Rules, all enforced by the caller — violating them means your fix is discarded
   the error output actually names.
 - If the error does not tell you a concrete fix, reply with
   `{"explanation": "...", "edits": []}` instead of guessing.
+- A `{"read": ...}` reply counts against your attempt budget just like a
+  proposed edit does — ask for what you actually need, not everything.
 """
 
 # No file-type allowlist: this PR author is a dependency bot and the fix is
@@ -259,6 +279,58 @@ AUTOFIX_BLOCKED_PREFIX = ".github/workflows/"
 
 MAX_FIX_EDITS = 5
 MAX_FIND_CHARS = 2000
+MAX_READ_CHARS = 20_000
+
+
+def parse_read_request(text: str) -> str | None:
+    """The path from a `{"read": "..."}` reply, or None if this isn't one.
+
+    Checked before parse_fix() -- a read request is not a proposed edit, and
+    forcing it through the edits schema would just make it fail validation.
+    """
+    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    blob = match.group(1) if match else text.strip()
+    try:
+        data = json.loads(blob)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    path = data.get("read")
+    return path if isinstance(path, str) and path else None
+
+
+def resolve_readable_path(path: str) -> pathlib.Path | None:
+    """A path the model may actually read, or None if it doesn't exist or
+    resolves outside what's safe to show it.
+
+    Two roots only: this repo checkout (so it can read its own source), and
+    the interpreter's installed packages (so it can read the real source of
+    whatever it's migrating to, instead of guessing an API from an error
+    message alone). Anything else -- absolute paths elsewhere on the runner,
+    traversal out of both roots -- returns None; `.resolve()` collapses `..`
+    before the containment check runs, so a traversal attempt is judged on
+    where it actually lands, not on the string itself.
+    """
+    try:
+        target = pathlib.Path(path).resolve()
+    except (OSError, ValueError):
+        return None
+    if not target.is_file():
+        return None
+    roots = [pathlib.Path.cwd().resolve()]
+    for key in ("purelib", "platlib"):
+        try:
+            roots.append(pathlib.Path(sysconfig.get_paths()[key]).resolve())
+        except KeyError:
+            continue
+    for root in roots:
+        try:
+            target.relative_to(root)
+            return target
+        except ValueError:
+            continue
+    return None
 
 
 TRIAGE_SYSTEM = """\
@@ -460,12 +532,15 @@ def autofix_one(pr: dict, args: argparse.Namespace, repo: str,
                 head_sha: str) -> tuple[str, str]:
     """Try to repair a red PR by pushing a VERIFIED fix to its branch.
 
-    Loops up to --max-autofix-attempts: propose an edit, apply it, run
-    --verify-command-file against the result. A pass pushes immediately. A
-    failure feeds the real verification output back to the model as "your
-    previous attempt didn't work, here's why" and tries again, with the
-    failed edit reverted first. Nothing is pushed until one attempt verifies,
-    or every attempt is exhausted.
+    Loops up to --max-autofix-attempts. On each round the model can either
+    propose an edit, or ask to read one real file first (repo-relative, or
+    an installed package's source) when it needs to see an actual API rather
+    than guess it from an error message -- a read costs one round and
+    doesn't touch the working tree. A proposed edit gets applied and run
+    through --verify-command-file; a pass pushes immediately, a failure
+    reverts the edit and feeds the real verification output back into the
+    next round as "here's what happened". Nothing is pushed until one round
+    verifies, or every round is exhausted.
 
     Returns (outcome, detail). Even a verified push is never merged here: CI
     re-runs on the new commit, and a later sweep merges only if the required
@@ -496,7 +571,7 @@ def autofix_one(pr: dict, args: argparse.Namespace, repo: str,
         if vf.is_file():
             verify_command = vf.read_text()
 
-    feedback = ""  # what went wrong last attempt, fed back into the next prompt
+    feedback = ""  # context from the previous step -- a failed verify, or a file just read
     last_verify_output = ""
     for attempt in range(1, args.max_autofix_attempts + 1):
         system_path = pathlib.Path(".ai/autofix-system.txt")
@@ -506,8 +581,7 @@ def autofix_one(pr: dict, args: argparse.Namespace, repo: str,
             f"PR #{number} title: {pr['title']}\n\n"
             f"## Failing CI output\n{logs}\n\n"
             f"## Diff\n{diff[: args.max_chars // 2]}\n"
-            + (f"\n## Your previous attempt (#{attempt - 1}) did not work\n{feedback}\n"
-               if feedback else "")
+            + (f"\n## Context from your previous step\n{feedback}\n" if feedback else "")
         )
         reply = _call_model(args, system_path, user_path, number)
         if reply is None:
@@ -516,6 +590,22 @@ def autofix_one(pr: dict, args: argparse.Namespace, repo: str,
                 detail += f" after {attempt - 1} verified-failing attempt(s)"
             return "skipped", detail
         print(f"autofix attempt {attempt}/{args.max_autofix_attempts}: {reply[:1000]}")
+
+        read_path = parse_read_request(reply)
+        if read_path is not None:
+            resolved = resolve_readable_path(read_path)
+            if resolved is None:
+                feedback = (
+                    f"You asked to read {read_path!r}, but it doesn't exist or isn't "
+                    "somewhere readable (this repo checkout, or an installed Python "
+                    "package). Ask for a real path, or propose edits with what you know."
+                )
+            else:
+                content = resolved.read_text(errors="replace")[:MAX_READ_CHARS]
+                feedback = f"You asked to read {read_path} ({resolved}):\n{content}"
+            print(f"autofix attempt {attempt}/{args.max_autofix_attempts}: read {read_path!r} "
+                  f"({'found' if resolved else 'not found'})")
+            continue
 
         parsed = parse_fix(reply)
         if parsed is None:
@@ -560,8 +650,8 @@ def autofix_one(pr: dict, args: argparse.Namespace, repo: str,
         feedback = f"Tried:\n{explanation}\n\nBut local verification then failed:\n{verify_output}"
 
     return "exhausted", (
-        f"tried {args.max_autofix_attempts} fix(es) locally, none passed verification. "
-        f"Last failure:\n{last_verify_output[-1500:]}"
+        f"used all {args.max_autofix_attempts} attempt(s) (proposed fixes and file reads "
+        f"combined), none passed verification. Last failure:\n{last_verify_output[-1500:]}"
     )
 
 

@@ -22,6 +22,8 @@ from pr_review_sweep import (  # noqa: E402
     comment_body,
     error_region,
     parse_fix,
+    parse_read_request,
+    resolve_readable_path,
     split_verdict,
     touches_workflow_files,
     try_merge,
@@ -417,3 +419,58 @@ class TestWorkflowFileMerge:
         # Still marked clean, so a later sweep retries the merge (cheaply, no
         # model call) instead of treating a workflow-only bump as a finding.
         assert "<!-- verdict: clean -->" in body
+
+
+class TestAutofixRead:
+    """The model can ask to see a real file instead of guessing an API from
+    an error message alone -- real incident: a migration guessed a renamed
+    class's constructor kwarg wrong, because nothing showed it the class's
+    actual signature."""
+
+    def test_parses_a_read_request(self):
+        assert parse_read_request('```json\n{"read": "app/mcp/tools.py"}\n```') == "app/mcp/tools.py"
+
+    def test_bare_json_without_a_fence(self):
+        assert parse_read_request('{"read": "setup.py"}') == "setup.py"
+
+    @pytest.mark.parametrize("text", [
+        "not json at all",
+        '{"edits": []}',          # a real edit reply, not a read request
+        '{"read": ""}',           # empty path
+        '{"read": 3}',            # wrong type
+    ])
+    def test_non_read_replies_return_none(self, text):
+        assert parse_read_request(text) is None
+
+    def test_resolves_a_file_inside_the_repo_checkout(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        target = tmp_path / "app" / "main.py"
+        target.parent.mkdir()
+        target.write_text("x = 1\n")
+        resolved = resolve_readable_path("app/main.py")
+        assert resolved == target.resolve()
+
+    def test_refuses_a_path_outside_the_repo_and_site_packages(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        outside = tmp_path.parent / "secret.txt"
+        outside.write_text("nope\n")
+        assert resolve_readable_path(str(outside)) is None
+
+    def test_refuses_traversal_that_escapes_the_repo_root(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (tmp_path / "outside.txt").write_text("nope\n")
+        monkeypatch.chdir(repo)
+        assert resolve_readable_path("../outside.txt") is None
+
+    def test_refuses_a_nonexistent_path(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        assert resolve_readable_path("does/not/exist.py") is None
+
+    def test_resolves_an_installed_package_file(self, tmp_path, monkeypatch):
+        """The whole point: reading the real, installed library source, not
+        just files inside the repo checkout -- resolved from a cwd that
+        has nothing to do with where the package actually lives."""
+        monkeypatch.chdir(tmp_path)
+        resolved = resolve_readable_path(pytest.__file__)
+        assert resolved is not None

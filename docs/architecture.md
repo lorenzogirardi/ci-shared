@@ -492,6 +492,46 @@ model says:
   on the pushed commit, not this loop's local verification — decide whether
   it merges.
 
+#### `{"read": "..."}` — the model can look before it writes
+
+The first version of code-level autofix (above) had a real, observed failure
+mode: fixing a renamed import (`FastMCP` → `MCPServer`) is easy from the
+error message alone, but the constructor's new keyword arguments are not in
+that message — the model guessed one (`streamable_http_path`, the *old*
+kwarg name) and got it wrong. Guessing a second time from the same error
+wouldn't help; the actual signature was sitting right there, installed, on
+the very runner running the loop.
+
+Instead of proposing edits, a reply may ask to see a real file first:
+
+```json
+{"read": "app/mcp/tools.py"}
+```
+
+`resolve_readable_path()` allows exactly two roots: this repo's checkout, and
+the interpreter's own installed packages (`sysconfig.get_paths()["purelib"
+/ "platlib"]`) — so `{"read": "..."}` can show the model its own source, or
+the real installed source of whatever library broke, but nothing else on the
+runner. Path resolution goes through `Path.resolve()` before the containment
+check, so a traversal attempt (`../../etc/passwd`) is judged on where it
+actually lands, not on the string — landing outside both roots returns
+`None` regardless of how it got there.
+
+A read costs one round of `--max-autofix-attempts`, same budget as a
+proposed edit — there is no separate "investigation budget", by design:
+adding one would be a second knob for the same underlying resource (model
+calls in this job), and the model is already told in the prompt to ask for
+only what it needs. A consumer doing code-level migrations, not just pin
+reverts, should raise `max_autofix_attempts` accordingly (a revert alone
+needs one round; a migration that reads a file first needs at least two).
+
+This is deliberately *not* an open "run a shell command" tool: the set of
+things a reply can ask for is exactly one thing (a file's content), and
+`resolve_readable_path()` decides what's readable in code, not the prompt —
+the same posture as `apply_fix()` deciding what's writable. Read access is a
+smaller, easier-to-reason-about grant than execute access, and it was
+enough to fix the actual failure this was built for.
+
 **Residual risk, stated plainly rather than hidden**: CI proves a fix
 *works*, not that it is *right*. A model could in principle satisfy the
 checks by loosening a constraint rather than correcting it (e.g. relaxing a
