@@ -441,6 +441,27 @@ Verified end-to-end on a deliberately broken PR: one attempt, verified
 locally, pushed — and the real `pr-checks.yml` run on that pushed commit
 came back green, confirming the local verifier and the actual gate agree.
 
+#### `autofix_push_token`: the push itself needs a real credential
+
+Verified locally is not the end of the story: the pushed commit still has to
+run through the *real* `pr-checks.yml` for `required_checks` to ever see it
+as green. Real incident: with no `autofix_push_token` secret set, the
+checkout step's git credential defaults to `GITHUB_TOKEN`, and GitHub's own
+recursive-workflow guard ("events triggered by GITHUB_TOKEN will not create
+a new workflow run") suppresses the run entirely — it shows up as a
+completed run with conclusion `action_required` and zero jobs, forever.
+Confirmed on two live PRs, both stuck permanently: autofix pushed a real,
+locally-verified fix, and CI simply never ran on it.
+
+The `secrets.autofix_push_token` input, when set, is passed only to the
+"Checkout caller repo" step's `token:` — the one thing it changes is which
+identity `git push` authenticates as. It's an optional fine-grained PAT,
+scoped to the one consumer repo, with **Contents: Read and write only** —
+never `workflow` scope, so it still can't touch anything `touches_workflow_files()`
+already refuses to merge. Everything else (`gh api`, `gh pr merge`, posting
+comments) keeps using `GITHUB_TOKEN`, unaffected. Unset, behavior is exactly
+what it was before this existed — the checkout falls back to `github.token`.
+
 #### Guardrails, enforced in code, not trusted from the prompt
 
 A prompt is a request; the point of `parse_fix()` / `apply_fix()` is that a

@@ -106,6 +106,19 @@ on:
     secrets:
       openrouter_api_key:
         required: true
+      autofix_push_token:
+        description: >
+          Optional PAT (fine-grained, Contents: Read and write, scoped to
+          this repo only) used ONLY for the checkout step's git credential.
+          Without it, autofix's `git push` authenticates as GITHUB_TOKEN --
+          and GitHub deliberately suppresses the `pull_request` run that
+          push would otherwise trigger (its own recursive-workflow guard),
+          so CI never actually re-runs on the fix commit and it can never
+          merge. A PAT sidesteps that guard because the push is no longer
+          attributed to Actions itself. Everything else (gh api calls,
+          merging) still uses GITHUB_TOKEN -- this token never needs
+          `workflow` scope and can't touch .github/workflows/ merges.
+        required: false
 
 jobs:
   sweep:
@@ -125,6 +138,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # Falls back to GITHUB_TOKEN when the secret isn't set -- same
+          # behaviour as before this existed, just autofix's push then hits
+          # GitHub's recursive-workflow guard again (see secrets.autofix_push_token above).
+          token: ${{ secrets.autofix_push_token || github.token }}
 
       - name: Checkout shared prompts and scripts
         uses: actions/checkout@v4
