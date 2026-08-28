@@ -356,6 +356,52 @@ one; the one-shot autofix had no such loop.
 6. Exhausted all attempts → post a comment saying so; the PR is left for a
    human. Nothing was ever pushed.
 
+#### The actual code change
+
+One-shot (`0981fea`) — call the model once, apply, push, no verification of
+any kind in between:
+
+```python
+reply = _call_model(args, system_path, user_path, number)
+parsed = parse_fix(reply)
+edits, explanation = parsed
+changed, error = apply_fix(edits)
+run(["git", "add", *changed])
+run(["git", "commit", "--quiet", "-m", message])
+run(["git", "push", "origin", f"HEAD:refs/heads/{branch}"])
+return "pushed", explanation
+```
+
+Agentic (`e4b3fc2`) — the loop, and the one line that makes it a loop:
+
+```python
+feedback = ""
+for attempt in range(1, args.max_autofix_attempts + 1):
+    user_path.write_text(
+        f"...\n" + (f"## Your previous attempt did not work\n{feedback}\n" if feedback else "")
+    )
+    reply = _call_model(args, system_path, user_path, number)
+    parsed = parse_fix(reply)
+    edits, explanation = parsed
+    changed, error = apply_fix(edits)
+
+    ok, verify_output = run_verify(verify_command, args.verify_timeout)   # <- the new line
+    if ok:
+        run(["git", "commit", "--quiet", "-m", message])
+        run(["git", "push", "origin", f"HEAD:refs/heads/{branch}"])
+        return "pushed", f"{explanation} (verified locally in {attempt} attempt(s))"
+
+    run(["git", "checkout", "--", *changed])       # undo the failed attempt
+    feedback = f"Tried:\n{explanation}\n\nBut local verification then failed:\n{verify_output}"
+
+return "exhausted", f"tried {args.max_autofix_attempts} fix(es), none passed verification"
+```
+
+`run_verify()` itself is small — `subprocess.run(["bash", "-c", command], ...)`,
+pass/fail plus the real stdout+stderr tail — but it's the only thing standing
+between "the model says it fixed it" and "it actually did, checked the same
+way a human checks a fix before pushing it."
+
 `verify_command` is consumer-authored and should mirror the real CI gate as
 closely as practical — `flask-test-api`'s wrapper literally copies
 `pr-checks.yml`'s own steps (resolve, install, boot, curl). `python_version`
