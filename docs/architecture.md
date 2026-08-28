@@ -340,6 +340,25 @@ can push CI-definition changes unattended — trades a solved annoyance for a
 larger blast radius than any dependency-manifest edit `autofix` is allowed to
 make, so it's deliberately not done here.
 
+### `merge_poll_seconds`: don't always defer to the next sweep
+
+A single sweep pass used to always defer a just-finished (or just-pushed)
+commit's merge to the next scheduled run, even when its checks would settle
+within seconds — real cost: a fix verified locally, pushed, and confirmed
+green by the real gate still sat merged only after the *next* cron tick,
+often hours later. `try_merge()` now calls `wait_for_settled_checks()`,
+which polls `checks_state()` every `merge_poll_interval` seconds (default
+15) until it leaves `none`/`pending`, bounded by `merge_poll_seconds`
+(default 90, `0` disables polling and restores the old defer-always
+behavior) — so one sweep run can actually close the loop: push, wait, merge,
+without a second invocation.
+
+This also applies after an autofix push: `autofix_one()` returns the SHA it
+started from, which is stale the moment it pushes a new commit, so the
+retry loop re-fetches the PR's real current head via `pr_head_sha()` before
+polling or merging against it — polling the old SHA would wait on a commit
+that's no longer the PR's head and never resolve.
+
 ### `triage_on_failure`: explain instead of guess, only once CI has already proven the failure
 
 When a PR's required checks are red, reviewing the diff to *predict* whether
@@ -690,23 +709,33 @@ flowchart TD
     reReview --> review
 
     triageOrFix -- "no" --> triage["triage_one(): explain the<br/>failure from real job logs"]
-    triageOrFix -- "yes" --> autofixLoop
+    triageOrFix -- "yes" --> prime["run verify_command ONCE,<br/>discard result — installs the<br/>bump's real new dependency<br/>before the model sees a prompt"]
+    prime --> autofixLoop
 
-    subgraph autofixLoop["autofix_one() — agentic loop, up to max_autofix_attempts"]
+    subgraph autofixLoop["autofix_one() — up to max_autofix_attempts rounds"]
         direction TB
-        propose["propose edit (strict JSON)"] --> validate["parse_fix() / apply_fix()<br/>manifest-only, unique anchor,<br/>all-or-nothing"]
+        propose["model replies:<br/>edits, or {read: path}?"]
+        propose -- "read" --> resolve["resolve_readable_path()<br/>repo checkout or installed<br/>package only"]
+        resolve --> propose
+        propose -- "edits" --> validate["parse_fix() / apply_fix()<br/>unique anchor, no .github/workflows/,<br/>all-or-nothing"]
         validate --> verify{"run verify_command<br/>in this job"}
-        verify -- "pass" --> commit["git commit + push<br/>(explicit identity set)"]
-        verify -- "fail" --> revert["git checkout -- <files><br/>feed real error to next attempt"]
+        verify -- "fail" --> revert["git checkout -- <files><br/>feed real error to next round"]
         revert --> propose
     end
+    verify -- "pass" --> commit["git commit + push<br/>(via autofix_push_token if set)"]
+    commit --> autofixMerge{"auto_merge on?"}
     autofixLoop -- "exhausted" --> humanNeeded(["comment: needs a human"])
+
+    autofixMerge -- yes --> mergeGate
+    autofixMerge -- no --> pushedOnly(["comment: pushed,<br/>next sweep decides merge"])
 
     review --> verdict{"VERDICT: CLEAN<br/>(exact last-line match)?"}
     verdict -- no --> humanNeeded
-    verdict -- yes --> mergeGate{"auto_merge on AND<br/>required_checks all success?"}
-    mergeGate -- yes --> merged(["gh pr merge"])
-    mergeGate -- "no / pending" --> waitNext(["comment posted,<br/>next sweep retries merge only"])
+    verdict -- yes --> mergeGate{"touches .github/workflows/?"}
+    mergeGate -- yes --> workflowFile(["left for manual merge —<br/>or Renovate's own automerge"])
+    mergeGate -- no --> pollGate["poll checks_state() up to<br/>merge_poll_seconds (default 90s)"]
+    pollGate -- "checks + workflows<br/>both success" --> merged(["gh pr merge"])
+    pollGate -- "still pending / red" --> waitNext(["comment posted,<br/>next sweep retries merge only"])
 ```
 
 ### The merge gate specifically
@@ -786,9 +815,23 @@ design deliberately does not take on.
   deliberately, as `flask-test-api`'s wrapper does today (literally copied
   from `pr-checks.yml`'s own steps).
 - **Autofix's residual risk** (stated in its section above): CI proves a
-  fix works, not that it's right. Scoped down by restricting autofix to
-  manifest-only edits on a repo whose CI genuinely exercises the app, never
-  to human-authored code — but not eliminated.
+  fix works, not that it's right — a strictly bigger risk now that edits
+  aren't limited to manifests. Scoped down by restricting autofix to
+  dependency-bot PRs on a repo whose CI genuinely exercises the app via a
+  real test suite, never to human-authored code — but not eliminated.
+- **Priming the environment costs a `verify_command` run on every autofix
+  invocation**, not just code-level ones — a manifest-only revert now pays
+  for one discarded install+lint+pytest+boot cycle before its first real
+  attempt, purely so `{"read": ...}` resolves correctly regardless of
+  whether the model asks to read before or after proposing an edit. Real
+  wall-clock cost, accepted deliberately for determinism over speed.
+- **Renovate's automerge and this sweep don't coordinate beyond
+  `touches_workflow_files()` stepping aside.** A PR bumping a GitHub Action
+  version merges via Renovate's own credentials, entirely outside this
+  script; if that config drifts or breaks, those PRs simply sit open
+  forever — the sweep has no fallback for them by design (see
+  `flask-test-api/docs/12-ai-pipeline.md`, "Why GitHub Actions version
+  bumps don't merge through the sweep at all").
 - **`ai_sanitize.py --check` mode** is implemented but not wired into any
   current workflow step — kept for a future hard-gate use case.
 - **Only `flask-test-api` migrated.** `cloudflare-free-exporter` still has

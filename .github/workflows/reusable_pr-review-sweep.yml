@@ -36,13 +36,23 @@ on:
         required: false
         type: string
         default: 'squash'
+      merge_poll_seconds:
+        description: 'After a fresh push (autofix, or a just-reviewed clean PR), wait up to this long IN THIS JOB for the required checks to settle before deferring the merge to the next sweep. Without this, a commit that would go green ten seconds later always waits for the next scheduled run instead. 0 disables polling.'
+        required: false
+        type: number
+        default: 90
+      merge_poll_interval:
+        description: 'Seconds between checks_state() polls while waiting on merge_poll_seconds.'
+        required: false
+        type: number
+        default: 15
       required_checks:
         description: 'Comma-separated check-run names that must have SUCCEEDED before a merge (e.g. "checks,workflows"). Strongly recommended with auto_merge: without it the gate only asks that nothing failed, which a single skipped check satisfies — that is how PRs got merged here with nothing tested.'
         required: false
         type: string
         default: ''
       autofix:
-        description: 'When CI is failing, push a model-written fix to the PR branch instead of only explaining the failure. It is NEVER merged on the strength of the model: the required checks re-run on the new commit and decide. Edits are restricted in code to dependency manifests — never application code, tests, or CI workflows — and the anchor must be unique in its file. Enable only for a dependency bot on a repo whose CI actually exercises the app.'
+        description: 'When CI is failing, push a model-written fix to the PR branch instead of only explaining the failure. It is NEVER merged on the strength of the model: the required checks re-run on the new commit and decide. No file-type restriction beyond .github/workflows/** (that push would be rejected regardless) — a reply may also ask to read one real file (this repo, or an installed package) before proposing an edit, which costs a round like an edit does; raise max_autofix_attempts for code-level migrations, not just manifest edits. The anchor must be unique in its file. Enable only for a dependency bot on a repo whose CI actually exercises the app.'
         required: false
         type: boolean
         default: false
@@ -190,6 +200,8 @@ jobs:
             --timeout ${{ inputs.timeout_seconds }} \
             --heading "${{ inputs.comment_heading }}" \
             --merge-method "${{ inputs.merge_method }}" \
+            --merge-poll-seconds ${{ inputs.merge_poll_seconds }} \
+            --merge-poll-interval ${{ inputs.merge_poll_interval }} \
             --required-checks "${{ inputs.required_checks }}" \
             --verify-command-file .ai/verify-command.sh \
             --verify-timeout ${{ inputs.verify_timeout_seconds }} \

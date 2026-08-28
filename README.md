@@ -68,14 +68,16 @@ CI actually passed, and — opt-in — repair the broken ones.
 | `auto_merge` | `false` | Merge PRs whose review + CI are both clean |
 | `required_checks` | `''` | Check-run names that must have **succeeded** before merge — see below, this is not optional in practice |
 | `merge_method` | `squash` | |
+| `merge_poll_seconds` | `90` | After a fresh push, wait up to this long in this job for required checks to settle before deferring the merge to the next sweep. `0` disables polling. |
+| `merge_poll_interval` | `15` | Seconds between polls while waiting on `merge_poll_seconds` |
 | `triage_on_failure` | `false` | On red CI, explain the failure instead of reviewing the diff |
-| `autofix` | `false` | On red CI, push a verified fix instead of only explaining. Implies `triage_on_failure`. |
+| `autofix` | `false` | On red CI, push a verified fix instead of only explaining. Implies `triage_on_failure`. No file-type restriction beyond `.github/workflows/**`; a reply may also ask to read a real file before proposing an edit — see architecture.md. |
 | `python_version` | `3.12` | Interpreter `verify_command` runs under — **must match the real CI gate's version** |
 | `verify_command` | `''` | Shell command proving an autofix edit works, run before pushing anything |
 | `verify_timeout_seconds` | `180` | |
-| `max_autofix_attempts` | `3` | Propose→verify rounds tried locally before giving up on one PR |
+| `max_autofix_attempts` | `3` | Propose→verify rounds tried locally before giving up on one PR — a `{"read": ...}` reply costs a round too, so code-level migrations need more than a manifest revert does |
 
-Secret: `openrouter_api_key` (required).
+Secrets: `openrouter_api_key` (required), `autofix_push_token` (optional — see architecture.md; without it, autofix's push authenticates as `GITHUB_TOKEN` and GitHub silently suppresses the resulting CI run).
 
 **The merge gate is CI, not the review verdict.** `required_checks` names
 checks that must show `conclusion: success` — not merely "didn't fail".
