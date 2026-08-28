@@ -5,6 +5,7 @@ a PR the model flagged, or blocks one it cleared. No network, no `gh`.
 """
 
 import pathlib
+import subprocess
 import sys
 
 import pytest
@@ -22,6 +23,8 @@ from pr_review_sweep import (  # noqa: E402
     error_region,
     parse_fix,
     split_verdict,
+    touches_workflow_files,
+    try_merge,
 )
 
 
@@ -353,3 +356,50 @@ def test_verdict_marker_lets_the_next_sweep_retry_a_pending_merge():
     pending = comment_body("h", "x", sha, is_clean=True, merge_outcome="checks pending")
     assert "<!-- verdict: clean -->" in pending
     assert "<!-- verdict: clean -->" not in comment_body("h", "x", sha, is_clean=False)
+
+
+class TestWorkflowFileMerge:
+    """GITHUB_TOKEN can never merge a change to .github/workflows/ -- GitHub
+    requires the `workflow` OAuth scope for that regardless of any
+    `permissions:` block. Real incident: Renovate's own action-version bumps
+    (actions/upload-artifact, step-security/harden-runner) reviewed clean and
+    green, then GitHub refused the merge outright."""
+
+    def _fake_diff(self, monkeypatch, files, returncode=0):
+        result = subprocess.CompletedProcess(
+            args=["gh"], returncode=returncode, stdout="\n".join(files), stderr="",
+        )
+        monkeypatch.setattr(pr_review_sweep, "run", lambda *a, **k: result)
+
+    def test_detects_a_workflow_file_in_the_diff(self, monkeypatch):
+        self._fake_diff(monkeypatch, ["requirements.txt", ".github/workflows/pipeline.yml"])
+        assert touches_workflow_files("o/r", 1) is True
+
+    def test_manifest_only_diff_is_not_flagged(self, monkeypatch):
+        self._fake_diff(monkeypatch, ["requirements.txt", "pyproject.toml"])
+        assert touches_workflow_files("o/r", 1) is False
+
+    def test_a_failed_diff_call_does_not_block_the_merge_path(self, monkeypatch):
+        """If we can't tell, don't invent a reason to skip -- fail open to the
+        normal CI-gated path rather than stalling every PR on a `gh` hiccup."""
+        self._fake_diff(monkeypatch, [], returncode=1)
+        assert touches_workflow_files("o/r", 1) is False
+
+    def test_try_merge_skips_workflow_file_prs_without_checking_ci(self, monkeypatch):
+        monkeypatch.setattr(pr_review_sweep, "touches_workflow_files", lambda repo, number: True)
+
+        def fail_if_called(*a, **k):
+            raise AssertionError("must not check CI or attempt a merge for a workflow-file PR")
+
+        monkeypatch.setattr(pr_review_sweep, "checks_state", fail_if_called)
+        monkeypatch.setattr(pr_review_sweep, "run", fail_if_called)
+
+        outcome = try_merge("o/r", 1, "sha", "squash")
+        assert outcome == "workflow-file"
+
+    def test_workflow_file_outcome_reads_as_clean_but_unmerged(self):
+        body = comment_body("h", "x", "c" * 40, is_clean=True, merge_outcome="workflow-file")
+        assert "needs a human to merge" in body
+        # Still marked clean, so a later sweep retries the merge (cheaply, no
+        # model call) instead of treating a workflow-only bump as a finding.
+        assert "<!-- verdict: clean -->" in body

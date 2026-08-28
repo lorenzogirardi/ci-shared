@@ -26,6 +26,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import time
 
 MARKER = "<!-- ai-review-sweep -->"
 CLEAN_VERDICT = "VERDICT: CLEAN"
@@ -629,7 +630,19 @@ def comment_body(
             "checks failing": "clean, but CI is failing — not merging",
             "checks pending": "clean, but CI has not finished — will retry next sweep",
             "no checks": "clean, but no CI checks reported — not merging unattended",
+            "workflow-file": "clean, but touches .github/workflows/ — needs a human to merge",
         }[merge_outcome]
+    elif merge_outcome == "merged":
+        # autofix pushed a fix and this same run polled until the real
+        # required checks passed on it, then merged — no next sweep needed.
+        verdict = "an automated fix was pushed, and the required checks then passed for real — merged"
+    elif merge_outcome in ("checks pending", "no checks"):
+        verdict = "an automated fix was pushed; CI has not finished yet — the next sweep will check again"
+    elif merge_outcome == "workflow-file":
+        verdict = ("an automated fix was pushed and CI passed, but this PR touches "
+                   ".github/workflows/ — needs a human to merge")
+    elif merge_outcome == "failed":
+        verdict = "an automated fix was pushed and CI passed, but the merge itself was refused — see the run log"
     elif merge_outcome == "checks failing":
         # Triage path: the finding is CI's, not the model's — the model only
         # explained it. Saying "needs a human" would misattribute the call.
@@ -653,15 +666,70 @@ def comment_body(
     )
 
 
+def touches_workflow_files(repo: str, number: int) -> bool:
+    """True if the PR changes anything under .github/workflows/.
+
+    The default GITHUB_TOKEN can never merge a change to a workflow file --
+    GitHub requires the `workflow` OAuth scope for that, and no `permissions:`
+    block grants it. Renovate's own action-version bumps (actions/checkout,
+    step-security/harden-runner, ...) hit this at the merge API after a clean
+    review and green CI: "refusing to allow a GitHub App to create or update
+    workflow ... without `workflows` permission". Checking first avoids
+    spending a merge attempt (and a confusing "refused" outcome) on a PR that
+    was never going to merge unattended -- CI changes get a human's eyes on
+    purpose, not as a workaround.
+    """
+    result = run(["gh", "pr", "diff", str(number), "--repo", repo, "--name-only"], check=False)
+    if result.returncode != 0:
+        return False
+    return any(f.startswith(".github/workflows/") for f in result.stdout.splitlines())
+
+
+def pr_head_sha(repo: str, number: int) -> str:
+    """The PR's *current* head SHA, re-fetched fresh.
+
+    Needed after autofix pushes a new commit: the SHA captured at the top of
+    the sweep loop is now stale, and polling or merging against it would
+    watch the wrong commit's checks forever.
+    """
+    data = gh_json([f"repos/{repo}/pulls/{number}"]) or {}
+    return (data.get("head") or {}).get("sha", "")
+
+
+def wait_for_settled_checks(repo: str, head_sha: str, required: tuple[str, ...],
+                             poll_seconds: int, poll_interval: int) -> tuple[str, str]:
+    """Poll checks_state until it leaves 'none'/'pending', bounded by poll_seconds.
+
+    Without this, a single sweep pass always defers a commit whose checks
+    haven't registered or finished yet to the next scheduled run -- even one
+    that would go green thirty seconds later, well within this job's own
+    lifetime. Bounded so one slow PR can't hang the whole sweep.
+    """
+    deadline = time.monotonic() + poll_seconds
+    state, detail = checks_state(repo, head_sha, required)
+    while state in ("none", "pending") and time.monotonic() < deadline:
+        time.sleep(poll_interval)
+        state, detail = checks_state(repo, head_sha, required)
+    return state, detail
+
+
 def try_merge(repo: str, number: int, head_sha: str, method: str,
-              required: tuple[str, ...] = ()) -> str:
+              required: tuple[str, ...] = (), *,
+              poll_seconds: int = 0, poll_interval: int = 15) -> str:
     """Attempt the merge, gated on CI. Returns a merge_outcome string.
 
     CI is the gate, not the review verdict: a model reading a diff cannot know
     whether the code still installs and serves requests, and two bumps it
     waved through as clean broke main precisely there.
     """
-    state, detail = checks_state(repo, head_sha, required)
+    if touches_workflow_files(repo, number):
+        print(f"Not merging PR #{number}: touches .github/workflows/ — left for manual merge.")
+        return "workflow-file"
+
+    if poll_seconds:
+        state, detail = wait_for_settled_checks(repo, head_sha, required, poll_seconds, poll_interval)
+    else:
+        state, detail = checks_state(repo, head_sha, required)
     if state != "green":
         print(f"Not merging PR #{number}: {detail}.")
         return {"failing": "checks failing",
@@ -737,6 +805,15 @@ def main() -> int:
              "failure is a proven fact rather than something to predict.",
     )
     parser.add_argument("--merge-method", default="squash", choices=["merge", "squash", "rebase"])
+    parser.add_argument(
+        "--merge-poll-seconds",
+        type=int,
+        default=90,
+        help="After a fresh push (autofix, or a just-reviewed clean PR), wait up to this "
+             "long in this same run for the required checks to settle before deferring "
+             "the merge to the next sweep. 0 disables polling.",
+    )
+    parser.add_argument("--merge-poll-interval", type=int, default=15)
     args = parser.parse_args()
 
     pathlib.Path(".ai").mkdir(exist_ok=True)
@@ -765,7 +842,9 @@ def main() -> int:
             # PR is still open, CI was probably not finished last time -- retry
             # just the merge, without paying for the review again.
             if args.auto_merge and "<!-- verdict: clean -->" in existing_body:
-                outcome = try_merge(args.repo, number, head_sha, args.merge_method, required)
+                outcome = try_merge(args.repo, number, head_sha, args.merge_method, required,
+                                     poll_seconds=args.merge_poll_seconds,
+                                     poll_interval=args.merge_poll_interval)
                 if outcome == "merged":
                     merged += 1
                 else:
@@ -801,17 +880,29 @@ def main() -> int:
                 print(f"::group::Autofixing failed CI on PR #{number} ({author}): {pr['title']}")
                 outcome, detail = autofix_one(pr, args, args.repo, head_sha)
                 print(f"autofix {outcome}: {detail}")
+                if outcome == "pushed":
+                    autofixed += 1
+                    merge_outcome = "checks failing"
+                    if args.auto_merge:
+                        # autofix_one just advanced this PR's head; head_sha
+                        # above is the pre-fix commit, so re-fetch before
+                        # polling or we'd be watching the wrong commit's CI.
+                        new_sha = pr_head_sha(args.repo, number) or head_sha
+                        merge_outcome = try_merge(args.repo, number, new_sha, args.merge_method, required,
+                                                   poll_seconds=args.merge_poll_seconds,
+                                                   poll_interval=args.merge_poll_interval)
+                        if merge_outcome == "merged":
+                            merged += 1
+                else:
+                    triaged += 1
+                    merge_outcome = "checks failing"
                 post_comment(
                     args.repo, number,
                     comment_body(f"{args.heading} — CI failure",
                                  _autofix_report(outcome, detail), head_sha,
-                                 is_clean=False, merge_outcome="checks failing"),
+                                 is_clean=False, merge_outcome=merge_outcome),
                     existing,
                 )
-                if outcome == "pushed":
-                    autofixed += 1
-                else:
-                    triaged += 1
                 print("::endgroup::")
                 continue
 
@@ -842,7 +933,9 @@ def main() -> int:
         # happened rather than what was about to be attempted.
         merge_outcome = "not attempted"
         if is_clean and args.auto_merge:
-            merge_outcome = try_merge(args.repo, number, head_sha, args.merge_method, required)
+            merge_outcome = try_merge(args.repo, number, head_sha, args.merge_method, required,
+                                       poll_seconds=args.merge_poll_seconds,
+                                       poll_interval=args.merge_poll_interval)
             if merge_outcome == "merged":
                 merged += 1
 

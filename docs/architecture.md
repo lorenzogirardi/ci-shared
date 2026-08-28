@@ -313,6 +313,33 @@ session (a Python 3.14 dependency-resolution conflict, and a runtime 500 on
 every request from an incompatible instrumentation library) — both things a
 command proves in seconds and a diff review can only guess at.
 
+### `touches_workflow_files()`: a gate the API enforces, not one we chose
+
+Even a clean review and a green `required_checks` gate is not sufficient
+for one category of PR: GitHub's default `GITHUB_TOKEN` can never merge a
+change to `.github/workflows/**`, in any repo, regardless of what
+`permissions:` a job declares — that write requires the `workflow` OAuth
+scope, which only a PAT or a GitHub App explicitly granted "Workflows"
+permission can hold. Real incident: Renovate's own action-version bumps
+(`actions/upload-artifact`, `step-security/harden-runner`, ...) reviewed
+clean and passed `required_checks`, and the merge call itself came back:
+
+```
+refusing to allow a GitHub App to create or update workflow
+`.github/workflows/pipeline.yml` without `workflows` permission (mergePullRequest)
+```
+
+`try_merge()` now checks `touches_workflow_files()` first and skips the
+merge attempt entirely for those PRs — `merge_outcome = "workflow-file"`,
+surfaced in the comment as "clean, but touches .github/workflows/ — needs a
+human to merge". The PR stays open, still marked clean, so the next sweep
+retries the (cheap, no-model-call) merge check rather than re-reviewing; a
+human merges the CI-definition change deliberately once they've looked at
+it. The alternative — a PAT with `workflow` scope handed to the sweep so it
+can push CI-definition changes unattended — trades a solved annoyance for a
+larger blast radius than any dependency-manifest edit `autofix` is allowed to
+make, so it's deliberately not done here.
+
 ### `triage_on_failure`: explain instead of guess, only once CI has already proven the failure
 
 When a PR's required checks are red, reviewing the diff to *predict* whether
