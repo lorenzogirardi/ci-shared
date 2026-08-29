@@ -600,23 +600,39 @@ def parse_fix(text: str) -> tuple[list[dict], str] | None:
 
 
 def apply_fix(edits: list[dict]) -> tuple[list[str], str | None]:
-    """(files changed, error). Applies nothing at all if any edit is invalid."""
-    staged: list[tuple[pathlib.Path, str]] = []
+    """(files changed, error). Applies nothing at all if any edit is invalid.
+
+    Edits to the same file compose, in order -- each is checked and applied
+    against the result of the previous edit to that file, not against the
+    file's original on-disk content independently. Real bug this fixes:
+    reading fresh-per-edit meant two edits to the same file (e.g. a renamed
+    import plus the renamed constructor call it enables) each computed their
+    replacement from the ORIGINAL content, so writing them in edit order let
+    the second write silently overwrite the first edit instead of layering
+    on top of it -- an import fix and a call-site fix in the same round,
+    exactly what a rename-propagation fix needs, would arrive as a diff with
+    only the LAST edit surviving.
+    """
+    order: list[pathlib.Path] = []
+    contents: dict[pathlib.Path, str] = {}
     for edit in edits:
         path = pathlib.Path(edit["file"])
-        if not path.is_file():
-            return [], f"{edit['file']} does not exist"
-        content = path.read_text()
+        if path not in contents:
+            if not path.is_file():
+                return [], f"{edit['file']} does not exist"
+            contents[path] = path.read_text()
+            order.append(path)
+        content = contents[path]
         occurrences = content.count(edit["find"])
         if occurrences != 1:
             # Ambiguous anchors are how a "small" edit silently changes the
             # wrong line; require the model to be exact instead.
             return [], f"{edit['file']}: anchor appears {occurrences} times, expected exactly 1"
-        staged.append((path, content.replace(edit["find"], edit["replace"], 1)))
+        contents[path] = content.replace(edit["find"], edit["replace"], 1)
 
-    for path, content in staged:
-        path.write_text(content)
-    return [str(p) for p, _ in staged], None
+    for path in order:
+        path.write_text(contents[path])
+    return [str(p) for p in order], None
 
 
 def _call_model(args: argparse.Namespace, system_file: pathlib.Path,
