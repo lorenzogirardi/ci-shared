@@ -214,7 +214,20 @@ def apply_and_verify(state: AutofixState) -> dict:
     attempt, edits, explanation = state["attempt"], state["edits"], state["explanation"]
     changed, error = apply_fix(edits)
     if error:
-        return {"route": "give_up", "outcome": "rejected", "detail": error}
+        # Recoverable, same as a failed verify: a missing file or an
+        # ambiguous anchor is something the model can see and correct on the
+        # next round (e.g. by reading the real file first), not a reason to
+        # give up on the whole PR after a single bad edit. Real incident this
+        # fixes: the model wrote a malformed first JSON block, caught its own
+        # mistake mid-reply ("wait, that's wrong"), and issued a corrected
+        # second block -- but the first block still parsed as a syntactically
+        # valid (if nonsensical) edit and burned the entire attempt budget in
+        # round one instead of ever reaching the model's own correction.
+        history = state["history"] + [
+            f"Round {attempt}: you proposed editing {edits[0]['file']!r}, "
+            f"but that failed: {error}"
+        ]
+        return {"route": "retry", "history": history}
 
     ok, verify_output = run_verify(state["verify_command"], state["verify_timeout"])
     print(
