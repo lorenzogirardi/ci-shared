@@ -1,0 +1,138 @@
+name: Reusable Main-Branch Autofix
+
+# Repairs a broken push straight to a protected branch (no PR involved) by
+# opening a NEW PR with a verified fix, instead of pushing to the protected
+# branch directly. All the actual logic lives in scripts/main_autofix.py,
+# which reuses the same langgraph propose/explore/verify loop
+# (scripts/autofix_core.py) that pr_review_sweep.py's autofix_one uses for
+# PRs -- the only difference is how a verified fix gets landed.
+#
+# Call this ONLY from a job with `if: failure()` on the same push's own
+# pipeline (see README.md), so scripts/main_autofix.py can read this exact
+# run's own failed check-runs by SHA -- there is no PR to look failures up
+# through here.
+
+on:
+  workflow_call:
+    inputs:
+      base_branch:
+        description: 'The protected branch that broke (the fix PR targets this).'
+        required: false
+        type: string
+        default: 'main'
+      python_version:
+        description: 'Interpreter verify_command runs under -- must match the real CI gate''s version, same reasoning as reusable_pr-review-sweep.yml.'
+        required: false
+        type: string
+        default: '3.12'
+      verify_command:
+        required: false
+        type: string
+        default: ''
+      verify_timeout_seconds:
+        required: false
+        type: number
+        default: 180
+      max_autofix_attempts:
+        required: false
+        type: number
+        default: 10
+      max_chars:
+        required: false
+        type: number
+        default: 140000
+      timeout_seconds:
+        required: false
+        type: number
+        default: 120
+      openrouter_model:
+        required: false
+        type: string
+        default: ''
+      openrouter_endpoint:
+        required: false
+        type: string
+        default: ''
+      openrouter_site_url:
+        required: false
+        type: string
+        default: ''
+      openrouter_app_name:
+        required: false
+        type: string
+        default: ''
+    secrets:
+      openrouter_api_key:
+        required: true
+      autofix_push_token:
+        description: >
+          Strongly recommended (fine-grained PAT, Contents: Read/write +
+          Pull requests: Read/write, scoped to this repo only). Without it
+          both the branch push AND `gh pr create` authenticate as
+          GITHUB_TOKEN, and GitHub's recursive-workflow guard silently
+          suppresses the `pull_request: opened` event that would otherwise
+          fire for the new PR -- the caller's own pr-checks-equivalent gate
+          then never runs on it. Same secret already used for
+          reusable_pr-review-sweep.yml's autofix push.
+        required: false
+
+jobs:
+  autofix:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.openrouter_api_key }}
+      OPENROUTER_MODEL: ${{ inputs.openrouter_model }}
+      OPENROUTER_ENDPOINT: ${{ inputs.openrouter_endpoint }}
+      OPENROUTER_SITE_URL: ${{ inputs.openrouter_site_url }}
+      OPENROUTER_APP_NAME: ${{ inputs.openrouter_app_name }}
+      # See the autofix_push_token secret description above for why this
+      # must be the PAT, not github.token, whenever one is configured.
+      GH_TOKEN: ${{ secrets.autofix_push_token || github.token }}
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0  # main_autofix.py diffs HEAD~1...HEAD locally
+          token: ${{ secrets.autofix_push_token || github.token }}
+
+      - name: Checkout shared scripts
+        uses: actions/checkout@v4
+        with:
+          repository: lorenzogirardi/ci-shared
+          ref: v1
+          path: .shared
+
+      - name: Set up Python for verify_command
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Install autofix graph dependencies
+        run: pip install -q -r .shared/scripts/requirements-autofix.txt
+
+      - name: Write verify_command to a file
+        env:
+          VERIFY_COMMAND: ${{ inputs.verify_command }}
+        run: |
+          mkdir -p .ai
+          printf '%s\n' "$VERIFY_COMMAND" > .ai/verify-command.sh
+
+      - name: Attempt an automated fix and open a PR
+        run: |
+          set -euo pipefail
+          python3 .shared/scripts/main_autofix.py \
+            --repo "${{ github.repository }}" \
+            --head-sha "${{ github.sha }}" \
+            --base-sha "HEAD~1" \
+            --base-branch "${{ inputs.base_branch }}" \
+            --run-number "${{ github.run_number }}" \
+            --ai-script .shared/scripts/openrouter_ai.py \
+            --max-chars ${{ inputs.max_chars }} \
+            --timeout ${{ inputs.timeout_seconds }} \
+            --verify-command-file .ai/verify-command.sh \
+            --verify-timeout ${{ inputs.verify_timeout_seconds }} \
+            --max-autofix-attempts ${{ inputs.max_autofix_attempts }}

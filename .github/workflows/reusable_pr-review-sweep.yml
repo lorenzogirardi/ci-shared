@@ -32,6 +32,11 @@ on:
         required: false
         type: boolean
         default: false
+      auto_merge_authors:
+        description: 'Comma-separated author logins allowed to be auto-merged when auto_merge is on. Empty (default) = no restriction beyond auto_merge itself, matching pre-existing behavior. Lets `authors` be wider than this -- e.g. review/autofix a human''s PRs too, without ever merging them unattended.'
+        required: false
+        type: string
+        default: ''
       merge_method:
         required: false
         type: string
@@ -187,6 +192,13 @@ jobs:
           mkdir -p .ai
           printf '%s\n' "$VERIFY_COMMAND" > .ai/verify-command.sh
 
+      - name: Install autofix graph dependencies
+        # Only autofix_core.py needs this (langgraph); every other path in
+        # pr_review_sweep.py stays stdlib-only, so skip the install entirely
+        # when autofix is off.
+        if: inputs.autofix
+        run: pip install -q -r .shared/scripts/requirements-autofix.txt
+
       - name: Sweep open PRs
         run: |
           set -euo pipefail
@@ -206,6 +218,7 @@ jobs:
             --verify-command-file .ai/verify-command.sh \
             --verify-timeout ${{ inputs.verify_timeout_seconds }} \
             --max-autofix-attempts ${{ inputs.max_autofix_attempts }} \
+            --auto-merge-authors "${{ inputs.auto_merge_authors }}" \
             ${{ inputs.auto_merge && '--auto-merge' || '' }} \
             ${{ inputs.triage_on_failure && '--triage-on-failure' || '' }} \
             ${{ inputs.autofix && '--autofix' || '' }}

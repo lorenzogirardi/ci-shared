@@ -36,6 +36,7 @@ ci-shared/
 ├── .github/workflows/
 │   ├── reusable_pr-diff-review.yml    review + comment only, contents: read
 │   ├── reusable_pr-review-sweep.yml   scheduled sweep: review, merge, self-repair
+│   ├── reusable_main-autofix.yml      no-PR case: broken push to main -> a new fix PR
 │   ├── reusable_ci-analysis.yml       post-pipeline informative report
 │   └── test.yml                       CI for this repo's own scripts
 ├── prompts/
@@ -45,10 +46,15 @@ ci-shared/
 │   ├── ai_sanitize.py      redact secrets / cap size before sending to the model
 │   ├── ai_append_cost.py   append a token-usage/cost footer to a report
 │   ├── render_prompt.py    fills the shared template with per-caller context
-│   └── pr_review_sweep.py  the sweep's own logic — review, merge gate, triage, autofix
+│   ├── pr_review_sweep.py  the sweep's own logic — review, merge gate, triage, autofix
+│   ├── autofix_core.py     the propose/explore/verify langgraph graph, shared by both autofix callers
+│   ├── main_autofix.py     no-PR autofix entrypoint: broken commit -> new branch -> new PR
+│   └── requirements-autofix.txt   the one non-stdlib dependency (langgraph), autofix-only
 ├── tests/
 │   ├── test_openrouter_ai.py     13 tests, mocked HTTP server, no network calls
-│   └── test_pr_review_sweep.py   50 tests — verdict parsing, checks_state, autofix guardrails
+│   ├── test_pr_review_sweep.py   91 tests — verdict parsing, checks_state, autofix guardrails, auto_merge_authors
+│   ├── test_autofix_core.py      8 tests — the langgraph graph's control flow
+│   └── test_main_autofix.py      6 tests — the no-PR path's own plumbing
 ├── README.md               quick-start / inputs reference
 └── docs/architecture.md    this file
 ```
@@ -208,6 +214,7 @@ the review **and CI** are both clean, or — opt-in — repairs it if CI is red.
 | `authors` | `''` (all) | Comma-separated PR author logins to sweep |
 | `max_prs` | `10` | Cap per run (bounds model spend) |
 | `auto_merge` | `false` | Merge PRs whose review is clean **and** whose CI is green |
+| `auto_merge_authors` | `''` (no extra restriction) | Comma-separated logins allowed to actually be merged when `auto_merge` is on. Decouples "who gets reviewed/autofixed" (`authors`, can be wide) from "who gets merged unattended" (this, kept narrow — e.g. a dependency bot only). |
 | `required_checks` | `''` | Check-run names that must show `conclusion: success` — see "The merge gate" below |
 | `merge_method` | `squash` | |
 | `triage_on_failure` | `false` | On red CI, explain the failure instead of reviewing the diff |
@@ -618,10 +625,100 @@ version pin instead of bumping the actual dependency that needed it), or by
 writing a code change that passes the existing tests while being wrong in a
 case they don't cover — a strictly bigger risk now that edits aren't limited
 to manifests. This is not fully closed by anything in this design: it is a
-deliberate, explicit choice to trust `required_checks` (auto-merge included)
-over a human reviewing every diff, made because this bot only ever touches
-dependency-bot PRs, on a repo where that trade-off is acceptable — never for
-human-authored code, and never without a real test suite behind the gate.
+deliberate, explicit choice to trust `required_checks` over a human
+reviewing every diff.
+
+That trade-off used to be scoped to dependency-bot PRs only. It now also
+covers the repo owner's own PRs (via `authors`, see the Inputs table above),
+on the reasoning that CI proving the fix works is the same guarantee
+regardless of who opened the PR. What's still scoped tightly is *merging*
+unattended: `auto_merge_authors` keeps that to the dependency bot, so a
+human's PR gets autofixed on red CI but always waits for that human to
+merge it — the trust extended to `required_checks` covers "propose and push
+a candidate fix", never "land it without anyone looking."
+
+#### The propose/explore/verify loop is a langgraph graph (`scripts/autofix_core.py`)
+
+The loop described above — propose, optionally explore first, apply, verify,
+retry with the real failure fed back — used to be a single
+`for attempt in range(...)` inside `autofix_one`, with `continue` standing in
+for "explore, then loop" and early `return`s standing in for every terminal
+outcome. It is now a `langgraph.graph.StateGraph` with four nodes
+(`propose`, `explore`, `apply_and_verify`, `give_up`) and conditional edges
+keyed off what `propose` just parsed and whether the attempt budget is
+spent. Behavior is unchanged — every parsing/validation/git function it
+calls (`parse_fix`, `apply_fix`, `run_verify`, `resolve_readable_path`, …) is
+the same code, imported unchanged from `pr_review_sweep.py` — this was a
+control-flow extraction, not a rewrite of the guardrails.
+
+Two reasons to do this now rather than leave the loop as it was:
+
+1. **One core, two callers.** `main_autofix.py` (below) needed the same
+   propose/explore/verify/retry machinery for a commit that has no PR at
+   all. Extracting it into `run_autofix_graph(header, logs, diff, ...) ->
+   AutofixResult` — a function with no idea what a PR or a branch is — let
+   both callers share it instead of copying the loop.
+2. **The topology is now explicit.** "What happens after a failed verify,
+   with 2 attempts left" used to be answerable only by reading the loop
+   body in order; it is now one line in `_route_after_apply`.
+
+Deliberately **not** using native tool-calling (`bind_tools`/`ToolNode`):
+the model actually in use, `hy3-free` on the OpenCode Zen gateway, has
+unverified function-calling support, and the prompt-driven JSON-fence
+protocol above is already proven in production. Nodes still call
+`_call_model` (the same stdlib-only subprocess wrapper around
+`openrouter_ai.py`) and parse a fenced JSON block out of prose — langgraph
+is used here purely for the state machine, not for its tool-calling
+integration. `langgraph` (`scripts/requirements-autofix.txt`) is the one
+non-stdlib dependency in this repo, installed only in the job step that
+enables `autofix` (or always, for `reusable_main-autofix.yml`, which has no
+non-autofix path to skip it for).
+
+---
+
+## File: `.github/workflows/reusable_main-autofix.yml` + `scripts/main_autofix.py`
+
+The autofix loop above only ever runs inside the PR sweep — it has no
+opinion on a push straight to a protected branch (typically `main`) that
+breaks CI, because there is no PR to look failures up through or push a fix
+to. `main_autofix.py` is the same idea adapted to that case: given
+`--head-sha` (the broken commit) and `--repo`, it reads that exact run's own
+failed check-runs via `collect_failure_logs()` — no PR number needed, since
+check-runs are keyed by commit SHA, not by PR — diffs the broken commit
+against its parent (`build_diff()`, called with `HEAD~1` rather than
+`github.event.before`, which is empty on a `workflow_dispatch` run and can
+be the all-zero SHA on a branch's first-ever push), and runs the exact same
+`run_autofix_graph()` used by `autofix_one`.
+
+The one real difference is how a verified fix lands. `autofix_one` pushes to
+the PR's own existing branch; there is no existing branch here, so
+`main_autofix.py` checks out a **new** branch from the broken commit and, on
+`outcome == "ready"`, commits, pushes that new branch, and opens a **new
+PR** with `gh pr create` — it never pushes to the protected branch directly.
+This is a deliberate, load-bearing choice: it means the automated fix goes
+through exactly the same per-PR gate (e.g. `pr-checks.yml`) that any other
+change does, rather than trusting this job's own local `verify_command` as
+the final word on something landing on `main` unattended.
+
+That last point has a sharp edge: `gh pr create`, authenticated as
+`GITHUB_TOKEN`, is subject to the same recursive-workflow guard documented
+under `autofix_push_token` above — GitHub will open the PR, but the
+`pull_request: opened` event that should trigger the caller's `pr-checks.yml`
+is silently suppressed. Unlike the PR-sweep path (where `autofix_push_token`
+is merely *recommended*, because a triage comment or a merge still happens
+either way), it is effectively **required** here: without it, the new PR sits
+open with no checks ever having run on it, and nothing in this design
+notices. The reusable workflow's secret description says so; there is no
+code-level fallback because there isn't a good one — the whole point of this
+file is "open a PR that gets gated like any other," and a suppressed event
+defeats that silently rather than loudly.
+
+Consumer wiring is a job with `if: failure() && vars.AI_ENABLED == 'true'`
+and the same `needs: [...]` list as an `always()`-gated reporting job in the
+same pipeline (see `flask-test-api/.github/workflows/pipeline.yml`'s
+`ai-autofix-main`) — `failure()` resolves against the whole dependency DAG
+the same way `always()` does, so it still runs when an earlier required job
+failed and everything after it was skipped as a result.
 
 ---
 
@@ -864,9 +961,25 @@ design deliberately does not take on.
   from `pr-checks.yml`'s own steps).
 - **Autofix's residual risk** (stated in its section above): CI proves a
   fix works, not that it's right — a strictly bigger risk now that edits
-  aren't limited to manifests. Scoped down by restricting autofix to
-  dependency-bot PRs on a repo whose CI genuinely exercises the app via a
-  real test suite, never to human-authored code — but not eliminated.
+  aren't limited to manifests, and now that autofix also covers the repo
+  owner's own PRs (not just a dependency bot's) and pushes to main. Scoped
+  down by requiring a real test suite behind `verify_command`/
+  `required_checks`, and by keeping `auto_merge_authors` narrow so an
+  unattended commit still only ever lands via a dependency bot's
+  already-established trust level — but not eliminated for the rest.
+- **The autofix graph's tool-calling is prompt-parsed, not native** (see
+  `autofix_core.py`'s section above): `hy3-free`'s function-calling support
+  on the OpenCode Zen gateway has not been verified. The graph is structured
+  so switching to native `bind_tools`/`ToolNode` later is a node-body change,
+  not a topology change — but that switch hasn't been made, and there's no
+  signal in this repo that would tell you if the model's tool-calling
+  silently didn't work, since the JSON-fence path never needed it to.
+- **`main_autofix.py`'s diff base is `HEAD~1`, not "the last commit CI
+  proved green."** For a single-commit push these are the same thing; for a
+  multi-commit push they aren't, and the diff shown to the model is only an
+  approximation of what actually broke. `github.event.before` would be more
+  precise but is empty on a `workflow_dispatch` run and can be the all-zero
+  SHA on a branch's first-ever push, both of which `HEAD~1` sidesteps.
 - **Priming the environment costs a `verify_command` run on every autofix
   invocation**, not just code-level ones — a manifest-only revert now pays
   for one discarded install+lint+pytest+boot cycle before its first real
@@ -880,6 +993,12 @@ design deliberately does not take on.
   forever — the sweep has no fallback for them by design (see
   `flask-test-api/docs/12-ai-pipeline.md`, "Why GitHub Actions version
   bumps don't merge through the sweep at all").
+- **A main-branch autofix PR opened without `autofix_push_token` gets no
+  checks and nothing notices.** `gh pr create` under plain `GITHUB_TOKEN`
+  still succeeds and the PR appears — GitHub just never fires the
+  `pull_request: opened` event for it, so `pr-checks.yml` (or equivalent)
+  silently never runs. There's no code-level detection of this state; it
+  reads as "a PR is open and idle," which also happens for mundane reasons.
 - **`ai_sanitize.py --check` mode** is implemented but not wired into any
   current workflow step — kept for a future hard-gate use case.
 - **Only `flask-test-api` migrated.** `cloudflare-free-exporter` still has
