@@ -674,6 +674,28 @@ non-stdlib dependency in this repo, installed only in the job step that
 enables `autofix` (or always, for `reusable_main-autofix.yml`, which has no
 non-autofix path to skip it for).
 
+**Two things found running this against a real PR** (flask-test-api #118 —
+see its case study), fixed after shipping the graph rather than before:
+
+- **A repeated identical edit no longer re-runs `verify_command`.** Real
+  incident: a migration proposed the exact same (correct-looking, but
+  failing for an unrelated reason) 3-edit fix four separate times across
+  rounds 14–20, paying for a full install+lint+pytest+boot cycle each time
+  to rediscover a failure it already knew about. `propose` now tracks the
+  signature of every edit set that has already failed verify
+  (`tried_edits`); a repeat routes straight back to another round with a
+  pointed note in `history`, never touching `run_verify` again for it.
+- **A cached `ci-failure` verdict can now go stale because the harness
+  changed, not just because CI turned green.** Every reusable workflow
+  resolves `git -C .shared rev-parse HEAD` and passes it as
+  `--harness-version`; `comment_body()` embeds it, and
+  `harness_version_changed()` treats a mismatch the same way the existing
+  "CI is no longer failing" check already does — as a reason to re-review
+  even though the PR's SHA never changed. Before this, shipping a fix to
+  `ci-shared` did nothing for an already-cached "exhausted" PR until
+  someone deleted its sweep comment by hand; that happened three times in
+  one session while iterating against #118.
+
 ---
 
 ## File: `.github/workflows/reusable_main-autofix.yml` + `scripts/main_autofix.py`

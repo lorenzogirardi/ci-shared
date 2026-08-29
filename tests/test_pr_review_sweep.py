@@ -17,6 +17,7 @@ from pr_review_sweep import (  # noqa: E402
     MAX_FIND_CHARS,
     MAX_FIX_EDITS,
     _autofix_report,
+    _comment_marker,
     apply_fix,
     build_context,
     checks_state,
@@ -24,6 +25,7 @@ from pr_review_sweep import (  # noqa: E402
     error_region,
     find_matching_paths,
     grep_matching_lines,
+    harness_version_changed,
     list_directory,
     may_auto_merge,
     parse_find_request,
@@ -443,6 +445,56 @@ class TestAutoMergeAuthors:
     def test_unlisted_author_is_blocked(self):
         """The whole point: a human's PR can be reviewed/autofixed but never merged."""
         assert may_auto_merge(True, {"renovate[bot]"}, "lorenzogirardi") is False
+
+
+class TestHarnessVersionMarker:
+    """Real gap this closes: PR #118's stale "ci-failure" verdict needed its
+    comment deleted by hand three separate times in one session before a
+    harness bugfix in ci-shared got a fresh autofix attempt -- the dedup
+    cache had no notion of "the harness itself changed since this was
+    cached". embedding the harness's own commit SHA in the comment lets the
+    next sweep detect that automatically."""
+
+    def test_marker_present_when_a_version_is_given(self):
+        body = comment_body("h", "x", "a" * 40, is_clean=False,
+                             merge_outcome="checks failing", harness_version="abc123")
+        assert "<!-- harness-version: abc123 -->" in body
+
+    def test_marker_absent_when_no_version_is_given(self):
+        """Default behavior, unchanged for callers that don't pass one."""
+        body = comment_body("h", "x", "a" * 40, is_clean=False, merge_outcome="checks failing")
+        assert "harness-version" not in body
+
+    def test_extracts_a_present_marker(self):
+        body = comment_body("h", "x", "a" * 40, is_clean=False,
+                             merge_outcome="checks failing", harness_version="eb19afb")
+        assert _comment_marker(body, "harness-version") == "eb19afb"
+
+    def test_extracting_an_absent_marker_is_none_not_empty_string(self):
+        body = comment_body("h", "x", "a" * 40, is_clean=False, merge_outcome="checks failing")
+        assert _comment_marker(body, "harness-version") is None
+
+    def test_never_stale_on_this_basis_when_the_caller_opts_out(self):
+        """Empty current_version = unchanged prior behavior."""
+        body = comment_body("h", "x", "a" * 40, is_clean=False,
+                             merge_outcome="checks failing", harness_version="old-sha")
+        assert harness_version_changed(body, "") is False
+
+    def test_same_version_is_not_stale(self):
+        body = comment_body("h", "x", "a" * 40, is_clean=False,
+                             merge_outcome="checks failing", harness_version="eb19afb")
+        assert harness_version_changed(body, "eb19afb") is False
+
+    def test_different_version_is_stale(self):
+        body = comment_body("h", "x", "a" * 40, is_clean=False,
+                             merge_outcome="checks failing", harness_version="f8e0868")
+        assert harness_version_changed(body, "eb19afb") is True
+
+    def test_a_comment_predating_this_feature_is_stale_too(self):
+        """An accumulated backlog of old ci-failure comments gets one fresh
+        re-review the first time this ships, not just PRs going forward."""
+        body = comment_body("h", "x", "a" * 40, is_clean=False, merge_outcome="checks failing")
+        assert harness_version_changed(body, "eb19afb") is True
 
 
 class TestWorkflowFileMerge:

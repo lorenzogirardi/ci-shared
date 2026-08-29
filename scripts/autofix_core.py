@@ -76,6 +76,8 @@ class AutofixState(TypedDict, total=False):
     changed: list[str]
     outcome: str | None
     detail: str
+    pending_signature: tuple  # the edit set just proposed, pending verify
+    tried_edits: tuple  # signatures of every edit set already verified-and-failed
 
 
 def _model_args(state: AutofixState) -> argparse.Namespace:
@@ -153,7 +155,29 @@ def propose(state: AutofixState) -> dict:
             "outcome": "declined",
             "detail": explanation or "the model found no concrete fix",
         }
-    return {"attempt": attempt, "route": "apply", "edits": edits, "explanation": explanation}
+
+    signature = tuple(sorted((e["file"], e["find"], e["replace"]) for e in edits))
+    if signature in state.get("tried_edits", ()):
+        # Real waste this closes: PR #118's second iteration proposed this
+        # exact edit set four separate times (rounds 14, 18, 19, 20),
+        # re-running the full verify_command each time to rediscover the
+        # same failure it already knew about. Skip straight to the next
+        # round instead of paying for another identical verify.
+        history = state["history"] + [
+            f"Round {attempt}: you proposed the exact same edit(s) as a previous "
+            "round that already failed verification. That will fail the same way "
+            "again -- propose something different, or explore further first."
+        ]
+        return {
+            "attempt": attempt,
+            "route": "give_up" if attempt >= state["max_attempts"] else "propose",
+            "history": history,
+        }
+
+    return {
+        "attempt": attempt, "route": "apply", "edits": edits, "explanation": explanation,
+        "pending_signature": signature,
+    }
 
 
 def explore(state: AutofixState) -> dict:
@@ -250,7 +274,8 @@ def apply_and_verify(state: AutofixState) -> dict:
     history = state["history"] + [
         f"Round {attempt}: you tried:\n{explanation}\n\nBut local verification then failed:\n{verify_output}"
     ]
-    return {"route": "retry", "history": history, "last_verify_output": verify_output}
+    tried_edits = state.get("tried_edits", ()) + (state["pending_signature"],)
+    return {"route": "retry", "history": history, "last_verify_output": verify_output, "tried_edits": tried_edits}
 
 
 def give_up(state: AutofixState) -> dict:
@@ -294,7 +319,10 @@ def build_graph():
     graph.set_entry_point("propose")
     graph.add_conditional_edges(
         "propose", _route_from_propose,
-        {"explore": "explore", "apply": "apply_and_verify", "give_up": "give_up"},
+        # "propose" is a self-loop: a duplicate-edit detection short-circuits
+        # straight back to another round without paying for a redundant
+        # verify_command run against an edit already known to fail.
+        {"explore": "explore", "apply": "apply_and_verify", "give_up": "give_up", "propose": "propose"},
     )
     graph.add_conditional_edges("explore", _route_after_explore, {"propose": "propose", "give_up": "give_up"})
     graph.add_conditional_edges(
@@ -348,6 +376,7 @@ def run_autofix_graph(
         "history": [],
         "attempt": 0,
         "last_verify_output": "",
+        "tried_edits": (),
     }
     # Each round costs at most 2 supersteps (propose -> explore|apply); pad generously
     # so a large --max-autofix-attempts never trips langgraph's own recursion guard.
