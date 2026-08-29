@@ -155,6 +155,47 @@ class TestAutofixGuardrails:
         assert error is None and changed == ["requirements.txt"]
         assert (tmp_path / "requirements.txt").read_text() == "fastapi==1\npydantic==2.13.4\n"
 
+    def test_two_edits_to_the_same_file_both_survive(self, tmp_path, monkeypatch):
+        """Real incident, found running against flask-test-api PR #118: a
+        renamed import plus the renamed constructor call it enables, both in
+        the same file, in the same round -- exactly what a rename-propagation
+        fix needs (see AUTOFIX_SYSTEM's grep-after-rename guidance). Before
+        this fix, each edit's replacement was computed from the file's
+        ORIGINAL content independently, so writing them in order let the
+        second edit silently overwrite the first instead of composing with
+        it -- the import reverted to the old name while only the constructor
+        call changed, leaving an undefined-name error identical to not
+        having fixed the import at all."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "tools.py").write_text(
+            "from mcp.server.fastmcp import FastMCP\n\nmcp = FastMCP(\"pytbak\")\n"
+        )
+        changed, error = apply_fix([
+            {"file": "tools.py", "find": "from mcp.server.fastmcp import FastMCP",
+             "replace": "from mcp.server.mcpserver import MCPServer"},
+            {"file": "tools.py", "find": 'mcp = FastMCP("pytbak")',
+             "replace": 'mcp = MCPServer("pytbak")'},
+        ])
+        assert error is None
+        assert changed == ["tools.py"]  # one file touched, not one entry per edit
+        assert (tmp_path / "tools.py").read_text() == (
+            "from mcp.server.mcpserver import MCPServer\n\nmcp = MCPServer(\"pytbak\")\n"
+        )
+
+    def test_second_edit_to_a_file_is_checked_against_the_first_edits_result(self, tmp_path, monkeypatch):
+        """An anchor that only becomes ambiguous (or only becomes valid)
+        after an earlier edit in the same batch must be judged against the
+        file as it stands mid-batch, not the original content."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "a.py").write_text("x = 1\n")
+        changed, error = apply_fix([
+            {"file": "a.py", "find": "x = 1", "replace": "x = 1\nx = 1"},
+            {"file": "a.py", "find": "x = 1", "replace": "y = 2"},
+        ])
+        assert changed == []
+        assert "appears 2 times" in error
+        assert (tmp_path / "a.py").read_text() == "x = 1\n"  # nothing written on error
+
     def test_refuses_an_ambiguous_anchor(self, tmp_path, monkeypatch):
         """An anchor matching twice is how a 'small' edit hits the wrong line."""
         monkeypatch.chdir(tmp_path)
