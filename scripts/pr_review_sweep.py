@@ -887,6 +887,14 @@ def _verdict_marker(is_clean: bool, merge_outcome: str) -> str:
     return "needs-review"
 
 
+def _comment_marker(body: str, name: str) -> str | None:
+    """The value of an `<!-- {name}: ... -->` marker embedded in a sweep
+    comment, or None if it isn't there (an older comment, predating this
+    marker, must not be misread as matching)."""
+    match = re.search(rf"<!-- {re.escape(name)}: (.*?) -->", body)
+    return match.group(1) if match else None
+
+
 def comment_body(
     heading: str,
     review: str,
@@ -894,6 +902,7 @@ def comment_body(
     is_clean: bool,
     *,
     merge_outcome: str = "not attempted",
+    harness_version: str = "",
 ) -> str:
     """Render the sweep comment.
 
@@ -940,7 +949,18 @@ def comment_body(
         # verdict on a commit and becomes stale the moment CI turns green
         # (a re-run of a flaky job), so the next sweep re-reviews instead of
         # skipping the PR forever at an unchanged SHA.
-        f"<!-- verdict: {_verdict_marker(is_clean, merge_outcome)} -->\n\n"
+        f"<!-- verdict: {_verdict_marker(is_clean, merge_outcome)} -->\n"
+        # Also read back by the next sweep: a ci-failure verdict is cached
+        # against what THIS harness could do at the time -- if ci-shared has
+        # since shipped a fix (a real incident: PR #118 needed its stale
+        # comment deleted by hand three times in one session before a
+        # harness improvement got a fresh attempt), it deserves a real
+        # re-review even though the SHA and CI state never changed. Empty
+        # when the caller doesn't pass one, so an older comment format still
+        # parses (no marker found = None = never treated as a mismatch that
+        # blocks re-review, see the staleness check in main()).
+        + (f"<!-- harness-version: {harness_version} -->\n" if harness_version else "")
+        + "\n"
         f"## {heading}\n\n"
         f"{review}\n\n"
         f"_Verdict: {verdict}. Reviewed commit `{head_sha[:7]}`._\n"
@@ -992,6 +1012,22 @@ def wait_for_settled_checks(repo: str, head_sha: str, required: tuple[str, ...],
         time.sleep(poll_interval)
         state, detail = checks_state(repo, head_sha, required)
     return state, detail
+
+
+def harness_version_changed(existing_body: str, current_version: str) -> bool:
+    """Whether a cached comment's harness-version marker differs from the
+    one running right now -- and thus whether a cached ci-failure verdict
+    should be treated as stale even though the SHA and CI state haven't
+    changed. Empty `current_version` means the caller never opted in
+    (matches prior behavior: never stale on this basis). A comment with no
+    marker at all (predates this feature) counts as different from any real
+    version, so an old accumulated backlog of ci-failure comments also gets
+    one fresh re-review the first time this ships, not just PRs going
+    forward.
+    """
+    if not current_version:
+        return False
+    return _comment_marker(existing_body, "harness-version") != current_version
 
 
 def may_auto_merge(auto_merge: bool, auto_merge_authors: set[str] | frozenset[str], author: str) -> bool:
@@ -1060,6 +1096,16 @@ def main() -> int:
     parser.add_argument("--max-chars", type=int, default=140_000)
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--heading", default="AI Review (sweep)")
+    parser.add_argument(
+        "--harness-version",
+        default="",
+        help="Identifies this run of ci-shared (e.g. its checked-out commit SHA), embedded "
+             "in the sweep comment. Empty = the staleness check below never fires, matching "
+             "today's behavior for callers that don't set it. A cached ci-failure verdict "
+             "whose harness-version differs from this run's gets a fresh re-review even "
+             "when the SHA and CI state are unchanged -- otherwise a harness bugfix never "
+             "gets a real second attempt without someone deleting the stale comment by hand.",
+    )
     parser.add_argument("--auto-merge", action="store_true")
     parser.add_argument(
         "--required-checks",
@@ -1155,13 +1201,22 @@ def main() -> int:
             # A CI-failure triage is a verdict on a CI run, not on the commit:
             # once CI goes green (a re-run of a flaky job), it is stale and the
             # PR deserves a real review even though the SHA never changed.
+            # It is ALSO stale once the harness itself has changed since it
+            # was cached -- real incident: PR #118's "exhausted" verdict at an
+            # unchanged, still-failing SHA needed its comment deleted by hand
+            # three times in one session before a harness bugfix got a fresh
+            # attempt. args.harness_version (the checked-out ci-shared commit)
+            # makes that automatic instead of a manual workaround.
+            harness_changed = harness_version_changed(existing_body, args.harness_version)
             stale_triage = ("<!-- verdict: ci-failure -->" in existing_body
-                            and checks_state(args.repo, head_sha, required)[0] != "failing")
+                            and (checks_state(args.repo, head_sha, required)[0] != "failing"
+                                 or harness_changed))
             if not stale_triage:
                 print(f"PR #{number} already reviewed at {head_sha[:7]} — skipping.")
                 skipped += 1
                 continue
-            print(f"PR #{number}: CI no longer failing at {head_sha[:7]} — re-reviewing.")
+            reason = "the harness changed since" if harness_changed else "CI no longer failing"
+            print(f"PR #{number}: {reason} at {head_sha[:7]} — re-reviewing.")
 
         # Check CI before spending a model call: on a red PR, explaining the
         # failure is worth more than reviewing the diff, and it costs the same
@@ -1201,7 +1256,8 @@ def main() -> int:
                     args.repo, number,
                     comment_body(f"{args.heading} — CI failure",
                                  _autofix_report(outcome, detail), head_sha,
-                                 is_clean=False, merge_outcome=merge_outcome),
+                                 is_clean=False, merge_outcome=merge_outcome,
+                                 harness_version=args.harness_version),
                     existing,
                 )
                 print("::endgroup::")
@@ -1215,7 +1271,8 @@ def main() -> int:
             post_comment(
                 args.repo, number,
                 comment_body(f"{args.heading} — CI failure", triage, head_sha,
-                             is_clean=False, merge_outcome="checks failing"),
+                             is_clean=False, merge_outcome="checks failing",
+                             harness_version=args.harness_version),
                 existing,
             )
             triaged += 1
@@ -1243,7 +1300,7 @@ def main() -> int:
         post_comment(
             args.repo, number,
             comment_body(args.heading, body_text, head_sha, is_clean,
-                         merge_outcome=merge_outcome),
+                         merge_outcome=merge_outcome, harness_version=args.harness_version),
             existing,
         )
         reviewed += 1

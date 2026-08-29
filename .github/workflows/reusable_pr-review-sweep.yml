@@ -165,6 +165,14 @@ jobs:
           ref: v1
           path: .shared
 
+      - name: Resolve harness version
+        # Lets the sweep detect "this ci-failure verdict was cached against
+        # an older harness" and re-review automatically instead of a stale
+        # comment needing to be deleted by hand every time ci-shared ships
+        # a fix -- see harness_version_changed() in pr_review_sweep.py.
+        id: harness
+        run: echo "sha=$(git -C .shared rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Set up Python for verify_command
         # Matches the interpreter pr-checks.yml verifies against — see the
         # python_version input description for why that match matters.
@@ -211,6 +219,7 @@ jobs:
             --max-chars ${{ inputs.max_chars }} \
             --timeout ${{ inputs.timeout_seconds }} \
             --heading "${{ inputs.comment_heading }}" \
+            --harness-version "${{ steps.harness.outputs.sha }}" \
             --merge-method "${{ inputs.merge_method }}" \
             --merge-poll-seconds ${{ inputs.merge_poll_seconds }} \
             --merge-poll-interval ${{ inputs.merge_poll_interval }} \

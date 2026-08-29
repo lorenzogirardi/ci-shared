@@ -146,6 +146,35 @@ class TestRetryOnFailedVerify:
         # The second prompt must carry the first attempt's real failure output.
         assert "ResolutionImpossible: pydantic conflict" in seen_prompts[1]
 
+    def test_a_repeated_identical_edit_skips_verify_instead_of_re_running_it(self, tmp_path, monkeypatch):
+        """Real waste this closes: PR #118's second iteration proposed the
+        exact same edit set four separate times (rounds 14, 18, 19, 20),
+        paying for a full verify_command run each time to rediscover a
+        failure it already knew about."""
+        monkeypatch.chdir(tmp_path)
+        import subprocess
+        (tmp_path / "requirements.txt").write_text("pydantic==2.11.7\n")
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "add", "requirements.txt"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=tmp_path, check=True)
+
+        same_edit = [{"file": "requirements.txt", "find": "2.11.7", "replace": "2.13.4"}]
+        _scripted_model(monkeypatch, [_fix_reply(same_edit), _fix_reply(same_edit)])
+        verify_calls = {"n": 0}
+
+        def fake_verify(command, timeout):
+            verify_calls["n"] += 1
+            return False, "still broken"
+
+        monkeypatch.setattr(autofix_core, "run_verify", fake_verify)
+        result = run_autofix_graph(**_common_kwargs(max_attempts=2, verify_command="whatever"))
+
+        assert verify_calls["n"] == 1  # round 2's identical proposal never re-ran verify
+        assert result["outcome"] == "exhausted"
+        assert "exact same edit" in result["detail"] or "still broken" in result["detail"]
+
     def test_exhausts_after_max_attempts_and_reports_the_last_failure(self, tmp_path, monkeypatch):
         # A real git repo, not a mocked `run`: the graph's own revert-on-failed-verify
         # step (`git checkout -- <changed>`) must actually restore the anchor text
