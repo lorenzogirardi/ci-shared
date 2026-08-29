@@ -228,6 +228,16 @@ migration note in the log), fix the actual call site, not just the pin: find
 the smallest code change that makes it work with the NEW version. Only revert
 the version instead when the log gives no concrete migration path.
 
+A renamed or removed symbol is often used in more than one place, and the
+error output only ever names the FIRST call site that broke — the traceback
+stops there, it does not know about the others. Before you consider a
+rename-style fix finished, `grep` for the OLD symbol name across the repo
+once: if other call sites use it too, fix them in the SAME round (multiple
+edits are allowed, see the schema below) rather than discovering them
+one at a time across several rounds after each one fails verification in
+turn — that costs rounds you don't get back, and running out mid-migration
+leaves the PR half-fixed instead of not-fixed.
+
 You do not have to guess a new API from the error message alone, and you do
 not have to guess file paths either. Four things are available before you
 have to propose an edit — use them, in this rough order, instead of
@@ -277,8 +287,10 @@ Rules, all enforced by the caller — violating them means your fix is discarded
 - Never edit anything under `.github/workflows/` — the push will be rejected
   regardless of what this fixed (GitHub requires the separate `workflow`
   scope no credential here has), so it would only burn the attempt.
-- Keep it minimal: normally one edit, at most a few, touching only the files
-  the error output actually names.
+- Keep it minimal, but "minimal" means the smallest fix for the ROOT CAUSE,
+  not the smallest diff against the error text: a rename that touches N call
+  sites needs N edits (still ≤5), not just the one the traceback happened to
+  reach first.
 - If the error does not tell you a concrete fix, reply with
   `{"explanation": "...", "edits": []}` instead of guessing.
 - `list`/`find`/`grep`/`read` all count against your attempt budget just
@@ -767,135 +779,44 @@ def autofix_one(pr: dict, args: argparse.Namespace, repo: str,
     # not a thing to rely on.
     run_verify(verify_command, args.verify_timeout)
 
-    history: list[str] = []  # every prior round's result, oldest first -- see build_context()
-    last_verify_output = ""
-    for attempt in range(1, args.max_autofix_attempts + 1):
-        system_path = pathlib.Path(".ai/autofix-system.txt")
-        system_path.write_text(AUTOFIX_SYSTEM)
-        user_path = pathlib.Path(".ai/autofix-user.txt")
-        context = build_context(history)
-        user_path.write_text(
-            f"PR #{number} title: {pr['title']}\n\n"
-            f"## Failing CI output\n{logs}\n\n"
-            f"## Diff\n{diff[: args.max_chars // 2]}\n"
-            + (f"\n## What you already know from previous rounds\n{context}\n" if context else "")
-        )
-        reply = _call_model(args, system_path, user_path, number)
-        if reply is None:
-            detail = "model call failed"
-            if attempt > 1:
-                detail += f" after {attempt - 1} verified-failing attempt(s)"
-            return "skipped", detail
-        print(f"autofix attempt {attempt}/{args.max_autofix_attempts}: {reply[:1000]}")
+    # The propose/explore/verify/retry loop itself lives in a langgraph graph
+    # (autofix_core.py) shared with main_autofix.py's no-PR path -- deferred
+    # import so importing pr_review_sweep never requires langgraph unless a
+    # caller actually autofixes something.
+    from autofix_core import run_autofix_graph
 
-        read_path = parse_read_request(reply)
-        if read_path is not None:
-            resolved = resolve_readable_path(read_path)
-            if resolved is None:
-                history.append(
-                    f"Round {attempt}: you asked to read {read_path!r}, but it doesn't exist, "
-                    "isn't somewhere readable (this repo checkout, or an installed Python "
-                    "package), or isn't a resolvable module name. Use {\"find\": \"name\"} to "
-                    "search for the real path instead of guessing one."
-                )
-            else:
-                content = resolved.read_text(errors="replace")[:MAX_READ_CHARS]
-                history.append(f"Round {attempt}: you read {read_path} ({resolved}):\n{content}")
-            print(f"autofix attempt {attempt}/{args.max_autofix_attempts}: read {read_path!r} "
-                  f"({'found' if resolved else 'not found'})")
-            continue
-
-        find_pattern = parse_find_request(reply)
-        if find_pattern is not None:
-            matches = find_matching_paths(find_pattern)
-            history.append(
-                f"Round {attempt}: you searched for {find_pattern!r}. Matches:\n"
-                + "\n".join(matches)
-                if matches else
-                f"Round {attempt}: you searched for {find_pattern!r}. No matches in this repo "
-                "checkout or the installed Python packages."
-            )
-            print(f"autofix attempt {attempt}/{args.max_autofix_attempts}: find {find_pattern!r} "
-                  f"({len(matches)} match(es))")
-            continue
-
-        grep_pattern = parse_grep_request(reply)
-        if grep_pattern is not None:
-            hits = grep_matching_lines(grep_pattern)
-            history.append(
-                f"Round {attempt}: you searched file contents for {grep_pattern!r}. Matches:\n"
-                + "\n".join(hits)
-                if hits else
-                f"Round {attempt}: you searched file contents for {grep_pattern!r}. No matches "
-                "in this repo checkout or the installed Python packages."
-            )
-            print(f"autofix attempt {attempt}/{args.max_autofix_attempts}: grep {grep_pattern!r} "
-                  f"({len(hits)} match(es))")
-            continue
-
-        list_path = parse_list_request(reply)
-        if list_path is not None:
-            entries = list_directory(list_path)
-            history.append(
-                f"Round {attempt}: you asked to list {list_path!r}, but it doesn't exist or "
-                "isn't somewhere listable (this repo checkout, or an installed Python package)."
-                if entries is None else
-                f"Round {attempt}: contents of {list_path}:\n"
-                + ("\n".join(entries) if entries else "(empty)")
-            )
-            print(f"autofix attempt {attempt}/{args.max_autofix_attempts}: list {list_path!r} "
-                  f"({'found' if entries is not None else 'not found'})")
-            continue
-
-        parsed = parse_fix(reply)
-        if parsed is None:
-            return "rejected", "model reply was malformed or outside the allowed scope"
-        edits, explanation = parsed
-        if not edits:
-            # A refusal is a valid answer, and better than a guessed edit.
-            return "declined", explanation or "the model found no concrete fix"
-
-        changed, error = apply_fix(edits)
-        if error:
-            return "rejected", error
-
-        ok, verify_output = run_verify(verify_command, args.verify_timeout)
-        print(f"autofix attempt {attempt}/{args.max_autofix_attempts}: verify "
-              f"{'passed' if ok else 'failed'} on {', '.join(changed)}")
-        if ok:
-            run(["git", "config", "user.name", "ci-shared autofix"], check=False)
-            run(["git", "config", "user.email", "actions@github.com"], check=False)
-            run(["git", "add", *changed])
-            message = (
-                f"fix(deps): repair CI on this PR\n\n{explanation}\n\n"
-                f"Written by the ci-shared CI autofix and pushed unreviewed "
-                f"(verified locally in {attempt} attempt(s)). The required "
-                "checks re-run on this commit and decide whether it merges."
-            )
-            committed = run(["git", "commit", "--quiet", "-m", message], check=False)
-            if committed.returncode != 0:
-                reason = (committed.stderr or committed.stdout or "").strip()[:200]
-                return "skipped", f"commit failed: {reason or 'no output from git'}"
-            pushed = run(["git", "push", "origin", f"HEAD:refs/heads/{branch}"], check=False)
-            if pushed.returncode != 0:
-                return "failed", f"push rejected: {pushed.stderr.strip()[:200]}"
-            return "pushed", (
-                f"{explanation} (edited {', '.join(changed)}, "
-                f"verified locally in {attempt} attempt(s))"
-            )
-
-        # Verification failed: undo this attempt before proposing the next one.
-        run(["git", "checkout", "--", *changed], check=False)
-        last_verify_output = verify_output
-        history.append(
-            f"Round {attempt}: you tried:\n{explanation}\n\n"
-            f"But local verification then failed:\n{verify_output}"
-        )
-
-    return "exhausted", (
-        f"used all {args.max_autofix_attempts} attempt(s) (proposed fixes and file reads "
-        f"combined), none passed verification. Last failure:\n{last_verify_output[-1500:]}"
+    result = run_autofix_graph(
+        header=f"PR #{number} title: {pr['title']}",
+        logs=logs,
+        diff=diff,
+        verify_command=verify_command,
+        verify_timeout=args.verify_timeout,
+        max_attempts=args.max_autofix_attempts,
+        ai_script=args.ai_script,
+        max_chars=args.max_chars,
+        timeout=args.timeout,
+        identifier=number,
     )
+    if result["outcome"] != "ready":
+        return result["outcome"], result["detail"]
+
+    run(["git", "config", "user.name", "ci-shared autofix"], check=False)
+    run(["git", "config", "user.email", "actions@github.com"], check=False)
+    run(["git", "add", *result["changed"]])
+    message = (
+        f"fix(deps): repair CI on this PR\n\n{result['explanation']}\n\n"
+        f"Written by the ci-shared CI autofix and pushed unreviewed "
+        f"(verified locally). The required checks re-run on this commit and "
+        "decide whether it merges."
+    )
+    committed = run(["git", "commit", "--quiet", "-m", message], check=False)
+    if committed.returncode != 0:
+        reason = (committed.stderr or committed.stdout or "").strip()[:200]
+        return "skipped", f"commit failed: {reason or 'no output from git'}"
+    pushed = run(["git", "push", "origin", f"HEAD:refs/heads/{branch}"], check=False)
+    if pushed.returncode != 0:
+        return "failed", f"push rejected: {pushed.stderr.strip()[:200]}"
+    return "pushed", result["detail"]
 
 
 def _autofix_report(outcome: str, detail: str) -> str:
@@ -1052,6 +973,17 @@ def wait_for_settled_checks(repo: str, head_sha: str, required: tuple[str, ...],
     return state, detail
 
 
+def may_auto_merge(auto_merge: bool, auto_merge_authors: set[str] | frozenset[str], author: str) -> bool:
+    """Whether a PR by `author` is eligible for try_merge().
+
+    Empty `auto_merge_authors` imposes no extra restriction -- unchanged
+    behavior for callers that never set --auto-merge-authors. Lets --authors
+    be wider than this: e.g. autofix/review a human's PRs too, but only ever
+    merge the ones from an author explicitly listed here.
+    """
+    return auto_merge and (not auto_merge_authors or author in auto_merge_authors)
+
+
 def try_merge(repo: str, number: int, head_sha: str, method: str,
               required: tuple[str, ...] = (), *,
               poll_seconds: int = 0, poll_interval: int = 15) -> str:
@@ -1153,11 +1085,20 @@ def main() -> int:
              "the merge to the next sweep. 0 disables polling.",
     )
     parser.add_argument("--merge-poll-interval", type=int, default=15)
+    parser.add_argument(
+        "--auto-merge-authors",
+        default="",
+        help="Comma-separated author logins allowed to be auto-merged when --auto-merge is "
+             "set. Empty = no restriction beyond --auto-merge itself (today's behavior). "
+             "Lets --authors be wider than this -- e.g. autofix a human's PRs too, without "
+             "ever merging them unattended.",
+    )
     args = parser.parse_args()
 
     pathlib.Path(".ai").mkdir(exist_ok=True)
     system_file = pathlib.Path(args.system_file)
     authors = {a.strip() for a in args.authors.split(",") if a.strip()}
+    auto_merge_authors = {a.strip() for a in args.auto_merge_authors.split(",") if a.strip()}
     required = tuple(c.strip() for c in args.required_checks.split(",") if c.strip())
     if args.auto_merge and not required:
         print("::warning::--auto-merge without --required-checks: the gate only "
@@ -1180,7 +1121,7 @@ def main() -> int:
             # Already reviewed at this commit. If that review was clean and the
             # PR is still open, CI was probably not finished last time -- retry
             # just the merge, without paying for the review again.
-            if args.auto_merge and "<!-- verdict: clean -->" in existing_body:
+            if may_auto_merge(args.auto_merge, auto_merge_authors, author) and "<!-- verdict: clean -->" in existing_body:
                 outcome = try_merge(args.repo, number, head_sha, args.merge_method, required,
                                      poll_seconds=args.merge_poll_seconds,
                                      poll_interval=args.merge_poll_interval)
@@ -1222,7 +1163,7 @@ def main() -> int:
                 if outcome == "pushed":
                     autofixed += 1
                     merge_outcome = "checks failing"
-                    if args.auto_merge:
+                    if may_auto_merge(args.auto_merge, auto_merge_authors, author):
                         # autofix_one just advanced this PR's head; head_sha
                         # above is the pre-fix commit, so re-fetch before
                         # polling or we'd be watching the wrong commit's CI.
@@ -1271,7 +1212,7 @@ def main() -> int:
         # Merge first, comment second, so the comment can state what actually
         # happened rather than what was about to be attempted.
         merge_outcome = "not attempted"
-        if is_clean and args.auto_merge:
+        if is_clean and may_auto_merge(args.auto_merge, auto_merge_authors, author):
             merge_outcome = try_merge(args.repo, number, head_sha, args.merge_method, required,
                                        poll_seconds=args.merge_poll_seconds,
                                        poll_interval=args.merge_poll_interval)

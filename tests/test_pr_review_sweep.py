@@ -25,6 +25,7 @@ from pr_review_sweep import (  # noqa: E402
     find_matching_paths,
     grep_matching_lines,
     list_directory,
+    may_auto_merge,
     parse_find_request,
     parse_fix,
     parse_grep_request,
@@ -380,6 +381,27 @@ def test_verdict_marker_lets_the_next_sweep_retry_a_pending_merge():
     pending = comment_body("h", "x", sha, is_clean=True, merge_outcome="checks pending")
     assert "<!-- verdict: clean -->" in pending
     assert "<!-- verdict: clean -->" not in comment_body("h", "x", sha, is_clean=False)
+
+
+class TestAutoMergeAuthors:
+    """Lets --authors sweep (review/autofix) a wider set of PRs than
+    --auto-merge is allowed to touch -- e.g. the repo owner's own PRs get
+    autofixed on red CI but are never merged unattended, only Renovate's are."""
+
+    def test_no_restriction_when_auto_merge_authors_is_empty(self):
+        """Unchanged behavior for callers that never set --auto-merge-authors."""
+        assert may_auto_merge(True, set(), "anyone-at-all") is True
+
+    def test_auto_merge_off_blocks_regardless_of_author(self):
+        assert may_auto_merge(False, set(), "renovate[bot]") is False
+        assert may_auto_merge(False, {"renovate[bot]"}, "renovate[bot]") is False
+
+    def test_listed_author_is_allowed(self):
+        assert may_auto_merge(True, {"renovate[bot]"}, "renovate[bot]") is True
+
+    def test_unlisted_author_is_blocked(self):
+        """The whole point: a human's PR can be reviewed/autofixed but never merged."""
+        assert may_auto_merge(True, {"renovate[bot]"}, "lorenzogirardi") is False
 
 
 class TestWorkflowFileMerge:

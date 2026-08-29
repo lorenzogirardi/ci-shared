@@ -9,6 +9,10 @@ Uses the same OpenAI-compatible client (`scripts/openrouter_ai.py`, default
 endpoint OpenCode Zen, works with any `OPENROUTER_ENDPOINT`/`OPENROUTER_MODEL`
 including OpenRouter) that consumer repos already had. No Claude API, no
 Claude Code routines — plain HTTP call from a stdlib-only Python script.
+The one exception is the autofix propose/explore/verify loop
+(`scripts/autofix_core.py`), which is a small langgraph `StateGraph` —
+see `requirements-autofix.txt`, installed only when a caller enables
+`autofix`.
 
 Full design rationale, diagrams, and the story behind each non-obvious
 decision live in [`docs/architecture.md`](docs/architecture.md). This file is
@@ -66,6 +70,7 @@ CI actually passed, and — opt-in — repair the broken ones.
 | `authors` | `''` (all) | Comma-separated PR author logins to sweep |
 | `max_prs` | `10` | Cap per run |
 | `auto_merge` | `false` | Merge PRs whose review + CI are both clean |
+| `auto_merge_authors` | `''` (no restriction beyond `auto_merge`) | Comma-separated logins allowed to actually be merged. Lets `authors` be wider than this — e.g. autofix/review a human's PRs too, but only ever auto-merge a dependency bot's. |
 | `required_checks` | `''` | Check-run names that must have **succeeded** before merge — see below, this is not optional in practice |
 | `merge_method` | `squash` | |
 | `merge_poll_seconds` | `90` | After a fresh push, wait up to this long in this job for required checks to settle before deferring the merge to the next sweep. `0` disables polling. |
@@ -98,6 +103,32 @@ back into the next prompt, and retries. Nothing reaches the PR branch until
 one attempt verifies or every attempt is exhausted. The commit and PR
 comment both say plainly that a machine wrote it, unreviewed, and that the
 real CI on the pushed commit — not this loop — decides whether it merges.
+The propose/explore/verify/retry loop itself is a `scripts/autofix_core.py`
+langgraph graph shared with `reusable_main-autofix.yml` below — see
+architecture.md for the node/edge layout and why it still parses a JSON
+fence out of prose instead of native tool-calling.
+
+### `reusable_main-autofix.yml`
+
+Companion to the sweep's autofix, for the case that has no PR at all: a push
+straight to a protected branch (typically `main`) broke CI. Call it from a
+job in your own pipeline with `needs: [<your gate jobs>]` and
+`if: failure() && vars.AI_ENABLED == 'true'` — same needs-list pattern as an
+`always()`-gated reporting job, just triggered on failure instead. It never
+pushes to the protected branch directly: it checks out a new branch from the
+broken commit, runs the same autofix graph, and on success opens a **new
+PR** with the fix (`gh pr create`) so the change goes through the same
+per-PR gate (e.g. `pr-checks.yml`) as anything else. Nothing here merges
+anything.
+
+Key inputs: `base_branch` (default `main`), `python_version`/`verify_command`
+(same meaning as the sweep's), `max_autofix_attempts`.
+
+Secrets: `openrouter_api_key` (required), `autofix_push_token` (**needed**
+here, not just recommended — without it `gh pr create` authenticates as
+`GITHUB_TOKEN` and GitHub's recursive-workflow guard silently suppresses the
+`pull_request: opened` event for the new PR, so the caller's own PR gate
+never runs on it).
 
 ### `reusable_ci-analysis.yml`
 
@@ -205,7 +236,9 @@ Nothing needs to be configured in this repo per consumer — it's stateless.
 pytest tests/ -v
 ```
 
-63 tests, no network, no `gh` calls — `checks_state`, verdict parsing,
-autofix guardrails (`parse_fix`/`apply_fix`), and `run_verify` are all
-exercised against fakes. `.github/workflows/test.yml` runs them on every
-push/PR to this repo.
+118 tests, no network, no real `gh` calls — `checks_state`, verdict parsing,
+autofix guardrails (`parse_fix`/`apply_fix`), `run_verify`, the
+`autofix_core.py` langgraph graph, `main_autofix.py`'s PR-opening plumbing,
+and `auto_merge_authors` gating are all exercised against fakes.
+`.github/workflows/test.yml` runs them on every push/PR to this repo
+(installing `scripts/requirements-autofix.txt` first, for the graph tests).
