@@ -191,14 +191,72 @@ class TestTerminalNonFixOutcomes:
         assert result["outcome"] == "skipped"
         assert "model call failed" in result["detail"]
 
-    def test_invalid_edit_target_is_rejected_without_burning_a_verify(self, tmp_path, monkeypatch):
+    def test_invalid_edit_target_does_not_burn_a_verify_but_does_retry(self, tmp_path, monkeypatch):
+        """apply_fix errors are recoverable, same as a failed verify -- the
+        model can see and correct a bad file path on the next round, so this
+        must not be treated as terminal after a single bad edit."""
         monkeypatch.chdir(tmp_path)
         calls = {"verify": 0}
         monkeypatch.setattr(autofix_core, "run_verify", lambda c, t: calls.__setitem__("verify", calls["verify"] + 1) or (True, ""))
-        _scripted_model(monkeypatch, [
-            _fix_reply([{"file": "does-not-exist.txt", "find": "a", "replace": "b"}]),
-        ])
+        seen_prompts = []
+
+        def fake(args, system_file, user_path, number):
+            seen_prompts.append(pathlib.Path(user_path).read_text())
+            return None if len(seen_prompts) > 1 else _fix_reply(
+                [{"file": "does-not-exist.txt", "find": "a", "replace": "b"}]
+            )
+
+        monkeypatch.setattr(autofix_core, "_call_model", fake)
         result = run_autofix_graph(**_common_kwargs())
-        assert result["outcome"] == "rejected"
-        assert "does not exist" in result["detail"]
-        assert calls["verify"] == 0
+
+        assert calls["verify"] == 0  # the bad edit never reached run_verify
+        assert result["outcome"] == "skipped"  # round 2's model call returned None
+        assert "does-not-exist.txt" in seen_prompts[1]  # round 2 saw round 1's real error
+        assert "does not exist" in seen_prompts[1]
+
+    def test_recovers_from_a_bad_edit_and_still_reaches_ready(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "requirements.txt").write_text("pydantic==2.11.7\n")
+        replies = [
+            _fix_reply([{"file": "does-not-exist.txt", "find": "a", "replace": "b"}]),
+            _fix_reply([{"file": "requirements.txt", "find": "2.11.7", "replace": "2.13.4"}]),
+        ]
+        _scripted_model(monkeypatch, replies)
+        result = run_autofix_graph(**_common_kwargs(verify_command="exit 0"))
+        assert result["outcome"] == "ready"
+        assert "verified locally in 2 attempt(s)" in result["detail"]
+
+
+class TestSelfCorrectingReply:
+    """Real incident, verified end-to-end against flask-test-api PR #118: the
+    model wrote a malformed first JSON block, caught its own mistake mid-reply
+    ("Wait, that's wrong -- let me issue it correctly"), and wrote a second,
+    correct block. The old first-match parser grabbed the abandoned attempt
+    (an edit to a file literally named "repo") and burned the whole budget on
+    it in round one -- the model's own correction never got a chance."""
+
+    def test_grep_request_after_a_self_correction_is_recognized(self, monkeypatch):
+        reply = (
+            '```json\n{"explanation": "wrong tool", "edits": '
+            '[{"file": "repo", "find": "FastMCP", "replace": "__GREP_ONLY__"}]}\n```\n\n'
+            "Wait, that's wrong -- grep is a separate tool, not an edit. "
+            "Let me issue it correctly:\n\n"
+            '```json\n{"grep": "FastMCP"}\n```'
+        )
+        assert autofix_core.parse_grep_request(reply) == "FastMCP"
+        assert autofix_core.parse_fix(reply) is None  # the edits shape is not what wins
+
+    def test_full_graph_follows_the_corrected_request_not_the_abandoned_one(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "app.py").write_text("class FastMCP:\n    pass\n")
+        reply = (
+            '```json\n{"explanation": "wrong tool", "edits": '
+            '[{"file": "repo", "find": "FastMCP", "replace": "__GREP_ONLY__"}]}\n```\n\n'
+            "Wait, that's wrong. Let me issue it correctly:\n\n"
+            '```json\n{"grep": "FastMCP"}\n```'
+        )
+        _scripted_model(monkeypatch, [reply])
+        result = run_autofix_graph(**_common_kwargs(max_attempts=1))
+        # Must explore (the corrected request), never try to apply an edit to "repo".
+        assert result["outcome"] == "exhausted"
+        assert "repo" not in (result.get("changed") or [])

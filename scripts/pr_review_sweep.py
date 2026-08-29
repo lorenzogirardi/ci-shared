@@ -353,8 +353,18 @@ def readable_roots() -> list[pathlib.Path]:
 
 
 def _parse_json_reply(text: str) -> dict | None:
-    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    blob = match.group(1) if match else text.strip()
+    """The model's own final answer, tolerant of it thinking out loud first.
+
+    Real incident: a reply wrote one malformed JSON block, caught its own
+    mistake mid-message ("Wait, that's wrong -- let me issue it correctly"),
+    and then wrote a second, correct block. Taking the FIRST fenced block
+    would parse the abandoned attempt instead of the correction. A model
+    emitting more than one fenced block is almost always superseding an
+    earlier mistake, not leaving a stray example after the real answer, so
+    the LAST one wins.
+    """
+    matches = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    blob = matches[-1] if matches else text.strip()
     try:
         data = json.loads(blob)
     except (json.JSONDecodeError, TypeError):
@@ -558,13 +568,8 @@ def parse_fix(text: str) -> tuple[list[dict], str] | None:
     malformed, out of scope, or oversized is discarded rather than
     interpreted generously.
     """
-    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    blob = match.group(1) if match else text.strip()
-    try:
-        data = json.loads(blob)
-    except (json.JSONDecodeError, TypeError):
-        return None
-    if not isinstance(data, dict):
+    data = _parse_json_reply(text)
+    if data is None:
         return None
 
     raw_edits = data.get("edits")
