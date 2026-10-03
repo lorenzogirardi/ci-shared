@@ -684,6 +684,9 @@ def structured_verdict(args: argparse.Namespace, pr: dict, diff: str) -> str | N
 
     guidance_file = pathlib.Path(args.review_guidance_file) if args.review_guidance_file else None
     guidance = guidance_file.read_text() if guidance_file and guidance_file.is_file() else ""
+    head_sha = (pr.get("head") or {}).get("sha", "")
+    if head_sha:
+        guidance += "\n\n## Deterministic check results\n" + ci_evidence(args.repo, head_sha)
     caller = agent_lib.ModelCaller(args.ai_script, max_chars=args.max_chars, timeout=args.timeout,
                                    work_dir=f".ai/agents/pr-{pr['number']}")
     result = structured_review(caller, diff, pr["title"], pr.get("body") or "", guidance)
@@ -1127,6 +1130,7 @@ def post_comment(repo: str, number: int, body: str, existing: dict | None) -> No
 
 
 AUTOFIX_AUTHOR = "ci-shared autofix"
+AUTOFIX_AUTHORS = frozenset({AUTOFIX_AUTHOR, "ci-shared agents"})   # the autofix loop and the agent engine
 ABANDONED_LABEL = "agent-abandoned"
 
 
@@ -1152,7 +1156,7 @@ def autofix_streak(commits: list[dict]) -> int:
     not turn CI green is another attempt, so this is the count to cap."""
     streak = 0
     for c in reversed(commits):
-        if ((c.get("commit") or {}).get("author") or {}).get("name") != AUTOFIX_AUTHOR:
+        if ((c.get("commit") or {}).get("author") or {}).get("name") not in AUTOFIX_AUTHORS:
             break
         streak += 1
     return streak
@@ -1164,6 +1168,51 @@ def abandon_pr(repo: str, number: int, reason: str) -> None:
     run(["gh", "pr", "close", str(number), "--repo", repo, "--comment",
          f"The automatic repair gave up on this pull request: {reason}. Nothing was merged and the base branch is untouched."],
         check=False)
+
+
+def ci_evidence(repo: str, head_sha: str) -> str:
+    """What the deterministic checks said about this exact commit, in words a reviewer can use.
+    A reviewer reads a diff and cannot run anything; without this it can only doubt ("I cannot
+    verify the dependencies still resolve"). With it, that doubt is answered by the checks."""
+    runs = (gh_json([f"repos/{repo}/commits/{head_sha}/check-runs"]) or {}).get("check_runs", [])
+    if not runs:
+        return "No check results are available for this commit."
+    lines = [f"- {c.get('name')}: {c.get('conclusion') or c.get('status')}" for c in sorted(runs, key=lambda c: c.get("name", ""))]
+    return ("Results of the deterministic checks (tests, integration against real PostgreSQL and Redis, and the image built "
+            "from this pull request) on this exact commit:\n" + "\n".join(lines))
+
+
+def fix_findings_one(pr: dict, args: argparse.Namespace, repo: str, head_sha: str, findings: str) -> tuple[str, str]:
+    """A blocking review finding is not a stop sign: hand it to the same writer / checks / reviewers
+    loop the other pull requests use. Returns ("pushed", detail) when the loop converged and its
+    commits were pushed to the PR branch, otherwise ("abandoned", why)."""
+    import agent_lib
+    import agent_pipeline as ap
+
+    head = pr.get("head") or {}
+    if (head.get("repo") or {}).get("full_name") != repo:
+        return "abandoned", "the PR head is on a fork"
+    branch = head.get("ref")
+    if not branch or run(["git", "checkout", "--quiet", "-B", branch, head_sha], check=False).returncode != 0:
+        return "abandoned", f"could not check out {branch}"
+    vf = pathlib.Path(args.verify_command_file) if args.verify_command_file else None
+    caller = agent_lib.ModelCaller(args.ai_script, max_chars=args.max_chars, timeout=args.timeout,
+                                   work_dir=f".ai/agents/fix-pr-{pr['number']}")
+    plan = ap.derived_plan(pr["title"], agent_lib.sanitize_untrusted(pr.get("body") or "", 4000))
+    rt = ap.Runtime(caller, pr["base"]["sha"], vf.read_text() if vf and vf.is_file() else "", args.verify_timeout,
+                    3, 2, 8, "", "", 0, start="write", fix_kind="fix", write_tests=False)
+    final = ap.invoke_with_retry(
+        lambda attempt, previous: ap.boosted(rt, attempt, previous),
+        {"plan": plan, "iteration": 1, "verify_attempts": 0, "notes": [], "rounds": [],
+         "feedback": "REVIEW FINDINGS to fix (each is blocking; fix exactly these, minimally):\n" + findings})
+    if ap.settle(final.get("outcome")) != "converged":
+        return "abandoned", "; ".join(final.get("notes", [])[-3:]) or "the writer could not fix it"
+    if run(["git", "rev-list", "--count", f"{head_sha}..HEAD"], check=False).stdout.strip() in ("", "0"):
+        return "abandoned", "the loop converged without changing anything, so the finding stands"
+    pushed = run(["git", "push", "origin", f"HEAD:refs/heads/{branch}"], check=False)
+    if pushed.returncode != 0:
+        return "abandoned", f"push rejected: {pushed.stderr.strip()[:200]}"
+    return "pushed", "; ".join(final.get("notes", [])[-2:]) or "fixed by the writer loop"
 
 
 def main() -> int:
@@ -1253,6 +1302,13 @@ def main() -> int:
         help="Project-specific review guidance shown to the structured reviewers.",
     )
     parser.add_argument(
+        "--fix-findings",
+        action="store_true",
+        help="With --structured-review: a blocking review finding goes to the writer / checks / reviewers loop "
+             "(and is pushed to the PR branch if it converges); if the loop cannot fix it the PR is abandoned. "
+             "Without this a blocking finding leaves the PR open, waiting.",
+    )
+    parser.add_argument(
         "--update-behind",
         action="store_true",
         help="Bring a PR that is behind the base branch up to date (with the push token) instead of judging "
@@ -1340,6 +1396,13 @@ def main() -> int:
             reason = "the harness changed since" if harness_changed else "CI no longer failing"
             print(f"PR #{number}: {reason} at {head_sha[:7]} — re-reviewing.")
 
+        if args.structured_review and required and checks_state(args.repo, head_sha, required)[0] == "pending":
+            # The reviewers are given the CI results as evidence; judging before they exist would only
+            # produce doubts the checks are about to answer. The sweep that starts when CI ends comes back.
+            print(f"PR #{number}: required checks are still running; waiting for the sweep that follows them.")
+            skipped += 1
+            continue
+
         # Check CI before spending a model call: on a red PR, explaining the
         # failure is worth more than reviewing the diff, and it costs the same
         # one call either way.
@@ -1423,6 +1486,23 @@ def main() -> int:
             continue
 
         is_clean, body_text = split_verdict(review)
+
+        if not is_clean and args.fix_findings:
+            commits = gh_json([f"repos/{args.repo}/pulls/{number}/commits?per_page=100"]) or []
+            if args.max_autofix_commits and autofix_streak(commits) >= args.max_autofix_commits:
+                outcome, detail = "abandoned", f"{args.max_autofix_commits} automatic fixes in a row did not clear the findings"
+            else:
+                outcome, detail = fix_findings_one(pr, args, args.repo, head_sha, body_text)
+            print(f"fix findings {outcome}: {detail}")
+            post_comment(args.repo, number,
+                         comment_body(args.heading, body_text + ("\n\n### Automatic fix\n" + detail if detail else ""), head_sha,
+                                      is_clean=False, merge_outcome="fix pushed" if outcome == "pushed" else "abandoned",
+                                      harness_version=args.harness_version), existing)
+            if outcome != "pushed":
+                abandon_pr(args.repo, number, detail)
+            reviewed += 1
+            print("::endgroup::")
+            continue
 
         # Merge first, comment second, so the comment can state what actually
         # happened rather than what was about to be attempted.
