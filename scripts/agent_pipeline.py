@@ -1157,8 +1157,9 @@ def cmd_main_guard(args: argparse.Namespace) -> int:
         return 0
 
     def note(text: str) -> int:
-        log(text)
-        _gh("api", f"repos/{args.repo}/commits/{sha}/comments", "-f", f"body=Main guard: {text}")
+        log(("[dry run] " if args.dry_run else "") + text)
+        if not args.dry_run:
+            _gh("api", f"repos/{args.repo}/commits/{sha}/comments", "-f", f"body=Main guard: {text}")
         return 0
 
     subject = ((gh_json([f"repos/{args.repo}/commits/{sha}"]) or {}).get("commit") or {}).get("message", "").splitlines()[:1]
@@ -1171,6 +1172,10 @@ def cmd_main_guard(args: argparse.Namespace) -> int:
                     "(supply chain / scanners)")
     earlier = (gh_json([f"repos/{args.repo}/actions/workflows/{run['workflow_id']}/runs?branch={args.base_branch}"
                         "&status=completed&per_page=10"]) or {}).get("workflow_runs", [])
+    if any(r["run_number"] > run["run_number"] and r.get("conclusion") == "success" for r in earlier):
+        # An agent (or the author) already fixed it forward while this run was being re-run: reverting the
+        # old commit now would conflict with, or undo, that repair.
+        return note("not reverting: a later run on this branch is green, so it was already repaired")
     previous = next((r for r in earlier if r["run_number"] < run["run_number"]), None)
     if previous is None or previous.get("conclusion") != "success":
         return note("not reverting: the branch was already red before this commit, so it is not the cause")
@@ -1180,12 +1185,14 @@ def cmd_main_guard(args: argparse.Namespace) -> int:
         # A failure seen once may be a flake (a start-up race, a slow runner). Run only the failed
         # jobs again; this guard is triggered again when that attempt finishes. Only a failure that
         # repeats is treated as caused by the change. A run that passes the second time ends here.
+        if args.dry_run:
+            return note(f"would re-run the failed jobs ({', '.join(failed)}) once before reverting anything")
         if rerun_failed_jobs(args.repo, args.run_id):
             return note(f"re-running the failed jobs ({', '.join(failed)}) once before reverting anything, to rule out a flake")
         log("could not re-run the failed jobs; judging the first failure")
 
     token = os.environ.get("AGENT_PUSH_TOKEN", "")
-    if not token:
+    if not token and not args.dry_run:
         print("::error::AGENT_PUSH_TOKEN is not set: cannot push the revert", file=sys.stderr)
         return 1
     header = base64.b64encode(f"x-access-token:{token}".encode()).decode()
@@ -1200,6 +1207,9 @@ def cmd_main_guard(args: argparse.Namespace) -> int:
         return note("not reverting: nothing but bookkeeping commits landed since the last green run")
     subjects = [git("log", "-1", "--format=%s", c).stdout.strip() for c in suspects]
     label = subjects[-1] if len(suspects) == 1 else f"{len(suspects)} commits since the last green run"
+    if args.dry_run:
+        return note(f"would revert {len(suspects)} change(s) since the last green run: " + "; ".join(subjects)
+                    + f" (failed jobs: {', '.join(failed)}) and open an issue to redo them")
     message = (f"{REVERT_PREFIX}: {label} (pipeline red)\n\nReverts: " + "; ".join(f"{c[:7]} {t}" for c, t in zip(suspects, subjects))
                + f".\nFailed jobs: {', '.join(failed)}.\nAn issue labelled `agent` redoes the change.")
     for attempt in range(1, 4):
@@ -1504,6 +1514,7 @@ def main() -> int:
     mgd.add_argument("--run-id", type=int, required=True)
     mgd.add_argument("--base-branch", default="main")
     mgd.add_argument("--max-reverts", type=int, default=3)
+    mgd.add_argument("--dry-run", action="store_true", help="decide and print, change nothing (no re-run, comment, push or issue)")
     mgd.set_defaults(fn=cmd_main_guard)
 
     d = sub.add_parser("docs-plan")
