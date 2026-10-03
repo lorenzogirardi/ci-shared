@@ -23,7 +23,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Callable
 
-from ai_sanitize import redact
+from ai_sanitize import _HARD_SECRET_RE, redact
 from pr_review_sweep import (
     AUTOFIX_BLOCKED_PREFIX,
     MAX_FIND_CHARS,
@@ -48,6 +48,10 @@ MAX_FINDINGS = 30
 MAX_CHANGES = 8
 MAX_CONTENT_CHARS = 30_000
 BLOCKED_PREFIXES = (AUTOFIX_BLOCKED_PREFIX, ".git/")
+# Files an agent must never write, whatever the plan says: credentials and keys.
+_PROTECTED_NAME_RE = re.compile(r"(^|/)(\.env(\..*)?|id_(rsa|ed25519|ecdsa)(\.pub)?|[^/]*\.(pem|key|p12|pfx|jks|keystore))$")
+MAX_PATCH_FILES = 60
+MAX_PATCH_LINES = 3000
 
 
 def load_prompt(name: str) -> str:
@@ -404,7 +408,7 @@ def parse_changes(data: dict | None, *, allowed: Callable[[str], bool] | None = 
         if not isinstance(item, dict) or not _safe_path(item.get("file")):
             return None
         path = item["file"]
-        if path.startswith(BLOCKED_PREFIXES) or (allowed is not None and not allowed(path)):
+        if is_protected_path(path) or (allowed is not None and not allowed(path)):
             return None
         if "content" in item:
             content = item["content"]
@@ -653,3 +657,75 @@ def test_inventory(max_files: int = 60) -> str:
         names = re.findall(r"^\s*(?:async\s+)?def\s+(test_\w+)", pathlib.Path(f).read_text(errors="replace"), re.MULTILINE)
         lines.append(f"{f}: " + ", ".join(names[:40]))
     return "\n".join(lines) or "(no test files)"
+
+
+# ---------------------------------------------------------------------------
+# Patch policy: checked on what the writer PROPOSES, and again on what is about to be published
+# ---------------------------------------------------------------------------
+
+def is_protected_path(path: str) -> bool:
+    return path.startswith(BLOCKED_PREFIXES) or bool(_PROTECTED_NAME_RE.search(path))
+
+
+def contains_secret(text: str) -> bool:
+    """A credential-shaped string (token, key, JWT). Only the patterns that are almost always real secrets:
+    config-style assignments such as `password = "x"` are normal in tests and docs."""
+    return any(pattern.search(text) for pattern in _HARD_SECRET_RE)
+
+
+_PATHISH_RE = re.compile(r"[\w.\-]+(?:/[\w.\-]+)+/?|[\w\-]+/(?![\w.\-])|[\w\-]+\.[a-z]{1,5}\b")
+
+
+def out_of_scope_paths(plan: dict) -> list[str]:
+    """Path-like tokens the plan itself declared out of scope."""
+    found: list[str] = []
+    for item in plan.get("out_of_scope", []) or []:
+        found += [m.group(0).rstrip("/") for m in _PATHISH_RE.finditer(item)]
+    return found
+
+
+def validate_patch(changes: list[dict], plan: dict) -> list[str]:
+    """Reasons a PROPOSED patch must not be applied. Deterministic, before anything touches the tree: a
+    secret in the new text, a file the plan declared out of scope. (Protected paths and sizes are already
+    refused when the reply is parsed.) The writer is told the reasons and proposes again."""
+    problems: list[str] = []
+    forbidden = out_of_scope_paths(plan)
+    for change in changes:
+        path = change["file"]
+        text = change.get("content") if "content" in change else change.get("replace", "")
+        if contains_secret(text or ""):
+            problems.append(f"{path}: the new text contains something shaped like a credential; secrets never go into code")
+        for token in forbidden:
+            if path == token or path.startswith(token + "/") or pathlib.PurePosixPath(path).name == token:
+                problems.append(f"{path}: the plan declared {token!r} out of scope")
+                break
+    return problems
+
+
+def policy_violations(from_sha: str, max_files: int = MAX_PATCH_FILES, max_lines: int = MAX_PATCH_LINES) -> list[str]:
+    """Final deterministic gate on everything the agents added since `from_sha`, run before anything is
+    published (the reviewers are models; this is not). Protected files, binary files, a credential-shaped
+    string in an added line, a patch too large to be a reasoned change."""
+    def git(*args: str) -> str:
+        return subprocess.run(["git", *args], capture_output=True, text=True).stdout
+
+    violations: list[str] = []
+    files = lines = 0
+    for row in git("diff", "--numstat", f"{from_sha}..HEAD").splitlines():
+        added, removed, path = row.split("\t", 2)
+        files += 1
+        if added == "-":
+            violations.append(f"{path}: a binary file was added or changed")
+        else:
+            lines += int(added) + int(removed)
+        if is_protected_path(path):
+            violations.append(f"{path}: protected path (workflows, credentials, keys)")
+    if files > max_files:
+        violations.append(f"{files} files changed (limit {max_files})")
+    if lines > max_lines:
+        violations.append(f"{lines} lines changed (limit {max_lines})")
+    added_text = "\n".join(ln[1:] for ln in git("diff", "-U0", f"{from_sha}..HEAD").splitlines()
+                           if ln.startswith("+") and not ln.startswith("+++"))
+    if contains_secret(added_text):
+        violations.append("an added line contains something shaped like a credential")
+    return violations

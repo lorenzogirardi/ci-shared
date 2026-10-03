@@ -16,8 +16,10 @@ on:
   workflow_call:
     inputs:
       pr_number:
-        required: true
+        description: 'The pull request to judge, or 0 for every open one except those of Renovate, which the sweep owns.'
+        required: false
         type: number
+        default: 0
       base_branch:
         required: false
         type: string
@@ -31,7 +33,7 @@ on:
         type: string
         default: 'squash'
       trusted_logins:
-        description: 'Accounts whose certification comments count. Empty = the repository owner.'
+        description: 'Accounts whose certification comments count. Empty = the repository owner and github-actions[bot] (the agent workflows post as the latter).'
         required: false
         type: string
         default: ''
@@ -69,7 +71,7 @@ jobs:
       - name: Merge if certified and green
         env:
           GH_TOKEN: ${{ secrets.agent_push_token }}
-          TRUSTED: ${{ inputs.trusted_logins || github.repository_owner }}
+          TRUSTED: ${{ inputs.trusted_logins || format('{0},github-actions[bot]', github.repository_owner) }}
         run: |
           python3 .shared/scripts/agent_pipeline.py merge-gate \
             --repo "${{ github.repository }}" --pr ${{ inputs.pr_number }} \

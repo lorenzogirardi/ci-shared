@@ -180,13 +180,14 @@ def structured_review(caller: lib.ModelCaller, diff: str, title: str, body: str,
     return blocking == 0, text
 
 
-def final_review(caller: lib.ModelCaller, diff: str, plan: dict, prior: list[dict]):
+def final_review(caller: lib.ModelCaller, diff: str, plan: dict, prior: list[dict], guidance: str = ""):
     ranges = lib.diff_ranges(diff)
     user = (
         f"## Plan\n{json.dumps(plan, indent=2)}\n\n## Earlier findings (blocking, from previous rounds)\n"
         f"{json.dumps(prior, indent=2) if prior else '[]'}\n\n"
         f"## Current diff (lines are prefixed `L<number>|` with their line number in the new file)\n"
         f"{lib.annotate_diff(diff)}"
+        + (f"\n\n## Guidance from the maintainers of this repository\n{guidance}" if guidance.strip() else "")
     )
     found = lib.ask_json(caller, "final-reviewer", lib.load_prompt("final-reviewer"), user,
                          lambda d: lib.parse_findings(d, "final-reviewer"))
@@ -215,6 +216,7 @@ class Runtime:
     start: str = "write"      # "write" (issue), "verify" (existing PR), "review" (a push on main), "ci" (a failed CI run)
     fix_kind: str = "feat"    # conventional-commit type of the agent's commits
     write_tests: bool = True  # the test steward evaluates changes to application code
+    guidance: str = ""        # project-specific review guidance, shown to the reviewers
 
 
 class RunState(TypedDict, total=False):
@@ -296,6 +298,11 @@ def run_writer(rt: Runtime, plan: dict, feedback: str):
         changes, explanation = parsed
         if not changes:
             return None, explanation or "the writer found nothing it could change safely"
+        problems = lib.validate_patch(changes, plan)
+        if problems:
+            history.append(f"Round {rnd}: your patch was refused before it touched anything: " + "; ".join(problems)
+                           + ". Propose a patch that respects the plan and the policy.")
+            continue
         applied = lib.apply_changes(changes)
         if applied.error:
             history.append(f"Round {rnd}: applying your changes failed: {applied.error}")
@@ -550,13 +557,13 @@ def build_graph(rt: Runtime):
         }
 
     def n_review(state: RunState) -> dict:
-        result = review_diff(rt.caller, diff_since_base(rt.base_sha), state["plan"])
+        result = review_diff(rt.caller, diff_since_base(rt.base_sha), state["plan"], guidance=rt.guidance)
         if result is None:
             return stop(state, "escalated", "a reviewer did not return a usable reply, so the change could not be certified")
         return after_review(state, *result, "review")
 
     def n_final(state: RunState) -> dict:
-        result = final_review(rt.caller, diff_since_base(rt.base_sha), state["plan"], state.get("prior_blocking", []))
+        result = final_review(rt.caller, diff_since_base(rt.base_sha), state["plan"], state.get("prior_blocking", []), rt.guidance)
         if result is None:
             return stop(state, "escalated", "the final reviewer did not return a usable reply")
         return after_review(state, *result, "final")
@@ -760,8 +767,9 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     outcome = settle(final.get("outcome", "failed"))
     touched = changed_files(base_sha)
-    if any(n.startswith(".github/workflows/") for n in touched):
-        outcome, final["notes"] = "abandoned", final.get("notes", []) + ["refusing to publish: touches .github/workflows/"]
+    violations = lib.policy_violations(base_sha)
+    if violations:
+        outcome, final["notes"] = "abandoned", final.get("notes", []) + ["refusing to publish, policy: " + "; ".join(violations)]
     if outcome != "abandoned" and not touched:
         outcome = "abandoned"
         final["notes"] = final.get("notes", []) + ["the agent produced no change"]
@@ -942,9 +950,10 @@ def cmd_change(args: argparse.Namespace) -> int:
     outcome = settle(final.get("outcome", "failed"))
     new_commits = int(git("rev-list", "--count", f"{head_sha}..HEAD").stdout.strip() or 0)
     touched_now = [n for n in git("diff", "--name-only", head_sha, "HEAD").stdout.split("\n") if n]
-    if any(n.startswith(".github/workflows/") for n in touched_now):
+    violations = lib.policy_violations(head_sha)       # only what the agents added, not the author's own commits
+    if violations:
         outcome, new_commits = "abandoned", 0
-        final["notes"] = final.get("notes", []) + ["refusing to publish: the agent touched .github/workflows/"]
+        final["notes"] = final.get("notes", []) + ["refusing to publish, policy: " + "; ".join(violations)]
     if outcome == "converged" and new_commits == 0:
         outcome = "clean"
     rounds = final.get("rounds", [])
@@ -1055,34 +1064,42 @@ def is_certified(comments: list[dict], head_sha: str, trusted: set[str]) -> bool
     return any(marker in (c.get("body") or "") and (c.get("user") or {}).get("login") in trusted for c in comments)
 
 
-def cmd_merge_gate(args: argparse.Namespace) -> int:
-    """Merge a pull request when, and only when: it is open, not abandoned, its
-    head commit is certified, the circuit breaker is closed, and the required
-    CI checks have succeeded on that same commit (try_merge)."""
-    pr = gh_json([f"repos/{args.repo}/pulls/{args.pr}"])
+def merge_one(args: argparse.Namespace, number: int) -> str:
+    """Merge one pull request when, and only when: it is open, not abandoned, its head commit is
+    certified, the circuit breaker is closed, and the required CI checks have succeeded on that same
+    commit (try_merge). Returns what happened, for the log."""
+    pr = gh_json([f"repos/{args.repo}/pulls/{number}"])
     if not pr or pr.get("state") != "open" or pr.get("draft"):
-        log("not mergeable: the PR is closed or a draft")
-        return 0
+        return "not mergeable: the PR is closed or a draft"
     head = pr["head"]["sha"]
     if ((pr["head"].get("repo") or {}).get("full_name")) != args.repo:
-        log("not merging a PR from a fork")
-        return 0
+        return "not merging a PR from a fork"
     if ABANDONED_LABEL in {label["name"] for label in pr.get("labels", [])}:
-        log("not merging: the agent abandoned this change")
-        return 0
-    comments = gh_json([f"repos/{args.repo}/issues/{args.pr}/comments?per_page=100"]) or []
+        return "not merging: the agent abandoned this change"
+    comments = gh_json([f"repos/{args.repo}/issues/{number}/comments?per_page=100"]) or []
     trusted = {t.strip() for t in args.trusted.split(",") if t.strip()}
     if not is_certified(comments, head, trusted):
-        log(f"not merging: nothing certifies {head[:7]} yet (a later run, or the next push, will)")
-        return 0
+        return f"not merging: nothing certifies {head[:7]} yet (a later run, or the next push, will)"
     reverts = recent_reverts(args.repo, args.base_branch)
     if reverts >= args.max_reverts:
-        log(f"not merging: circuit breaker open ({reverts} automatic reverts in 24h). Merging resumes by itself as they age out.")
-        return 0
+        return f"not merging: circuit breaker open ({reverts} automatic reverts in 24h). Merging resumes by itself as they age out."
     required = tuple(c.strip() for c in args.required_checks.split(",") if c.strip())
-    outcome = try_merge(args.repo, args.pr, head, args.merge_method, required,
-                        poll_seconds=args.poll_seconds, poll_interval=15)
-    log(f"merge gate: {outcome}")
+    return "merge gate: " + try_merge(args.repo, number, head, args.merge_method, required,
+                                      poll_seconds=args.poll_seconds, poll_interval=15)
+
+
+def cmd_merge_gate(args: argparse.Namespace) -> int:
+    """Run the merge gate on one pull request, or (--pr 0) on every open one. The sweep over all of them
+    is what makes the gate impossible to miss: whichever finishes first, certification or CI, and whatever
+    event is lost, the next push or the schedule picks it up. Renovate's PRs belong to the sweep."""
+    numbers = [args.pr]
+    if not args.pr:
+        listed = gh_json([f"repos/{args.repo}/pulls?state=open&per_page=100"]) or []
+        numbers = [p["number"] for p in listed if not ((p.get("user") or {}).get("login") or "").lower().startswith("renovate")]
+    for number in numbers:
+        log(f"PR #{number}: {merge_one(args, number)}")
+    if not numbers:
+        log("no open pull requests for the merge gate")
     return 0
 
 
@@ -1443,7 +1460,7 @@ def main() -> int:
 
     mg = sub.add_parser("merge-gate", help="merge a certified PR whose CI is green")
     mg.add_argument("--repo", required=True)
-    mg.add_argument("--pr", type=int, required=True)
+    mg.add_argument("--pr", type=int, default=0, help="0 = every open pull request (except Renovate's)")
     mg.add_argument("--base-branch", default="main")
     mg.add_argument("--required-checks", default="")
     mg.add_argument("--merge-method", default="squash", choices=("merge", "squash", "rebase"))

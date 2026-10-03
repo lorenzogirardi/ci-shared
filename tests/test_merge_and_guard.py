@@ -257,3 +257,41 @@ class TestMainGuard:
         guard_env(monkeypatch, sha)
         monkeypatch.delenv("AGENT_PUSH_TOKEN")
         assert ap.cmd_main_guard(guard_args()) == 1
+
+
+class TestMergeEverythingOpen:
+    """Found live: a certified PR with green CI sat open, because (1) the agent workflows post as
+    github-actions[bot], not as the repository owner the gate trusted, and (2) when CI finished before
+    the certification no later event picked it up. The gate must work whichever finishes first."""
+
+    def test_the_bot_that_posts_the_certification_is_trusted_by_default(self):
+        root = pathlib.Path(__file__).resolve().parents[1] / ".github/workflows"
+        for name in ("reusable_agent-merge.yml", "reusable_agent-change.yml"):
+            text = (root / name).read_text()
+            assert "format('{0},github-actions[bot]', github.repository_owner)" in text, name
+        assert ap.is_certified([cert(login="github-actions[bot]")], HEAD, {"owner", "github-actions[bot]"})
+        assert not ap.is_certified([cert(login="github-actions[bot]")], HEAD, {"owner"})      # not trusted unless named
+
+    def test_pr_zero_judges_every_open_pr_except_renovates(self, monkeypatch):
+        judged = []
+
+        def fake_gh_json(args):
+            url = args[0]
+            if url.startswith("repos/o/r/pulls?state=open"):
+                return [{"number": 5, "user": {"login": "owner"}}, {"number": 6, "user": {"login": "renovate[bot]"}},
+                        {"number": 7, "user": {"login": "someone"}}]
+            raise AssertionError(url)
+        monkeypatch.setattr(ap, "gh_json", fake_gh_json)
+        monkeypatch.setattr(ap, "merge_one", lambda args, n: judged.append(n) or "ok")
+        assert ap.cmd_merge_gate(gate_args(pr=0)) == 0
+        assert judged == [5, 7]                                  # Renovate's PR belongs to the sweep
+
+    def test_with_nothing_open_it_just_says_so(self, monkeypatch):
+        monkeypatch.setattr(ap, "gh_json", lambda a: [])
+        monkeypatch.setattr(ap, "merge_one", lambda *a: pytest.fail("nothing to judge"))
+        assert ap.cmd_merge_gate(gate_args(pr=0)) == 0
+
+    def test_a_pr_certified_after_its_ci_finished_is_merged_by_the_next_pass(self, gate):
+        merges = gate(comments=[cert(login="github-actions[bot]")])
+        ap.cmd_merge_gate(gate_args(trusted="owner,github-actions[bot]"))
+        assert len(merges) == 1

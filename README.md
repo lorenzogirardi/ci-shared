@@ -9,10 +9,10 @@ Uses the same OpenAI-compatible client (`scripts/openrouter_ai.py`, default
 endpoint OpenCode Zen, works with any `OPENROUTER_ENDPOINT`/`OPENROUTER_MODEL`
 including OpenRouter) that consumer repos already had. No Claude API, no
 Claude Code routines — plain HTTP call from a stdlib-only Python script.
-The one exception is the autofix propose/explore/verify loop
-(`scripts/autofix_core.py`), which is a small langgraph `StateGraph` —
-see `requirements-autofix.txt`, installed only when a caller enables
-`autofix`.
+The one exception is the agent engine (`scripts/agent_pipeline.py`), a
+langgraph `StateGraph` — see `requirements-autofix.txt`, installed only when a
+caller enables a feature that uses it (autofix, structured review, the agent
+workflows).
 
 Full design rationale, diagrams, and the story behind each non-obvious
 decision live in [`docs/architecture.md`](docs/architecture.md). This file is
@@ -133,32 +133,16 @@ back into the next prompt, and retries. Nothing reaches the PR branch until
 one attempt verifies or every attempt is exhausted. The commit and PR
 comment both say plainly that a machine wrote it, unreviewed, and that the
 real CI on the pushed commit — not this loop — decides whether it merges.
-The propose/explore/verify/retry loop itself is a `scripts/autofix_core.py`
-langgraph graph shared with `reusable_main-autofix.yml` below — see
-architecture.md for the node/edge layout and why it still parses a JSON
-fence out of prose instead of native tool-calling.
-
-### `reusable_main-autofix.yml`
-
-Companion to the sweep's autofix, for the case that has no PR at all: a push
-straight to a protected branch (typically `main`) broke CI. Call it from a
-job in your own pipeline with `needs: [<your gate jobs>]` and
-`if: failure() && vars.AI_ENABLED == 'true'` — same needs-list pattern as an
-`always()`-gated reporting job, just triggered on failure instead. It never
-pushes to the protected branch directly: it checks out a new branch from the
-broken commit, runs the same autofix graph, and on success opens a **new
-PR** with the fix (`gh pr create`) so the change goes through the same
-per-PR gate (e.g. `pr-checks.yml`) as anything else. Nothing here merges
-anything.
-
-Key inputs: `base_branch` (default `main`), `python_version`/`verify_command`
-(same meaning as the sweep's), `max_autofix_attempts`.
-
-Secrets: `openrouter_api_key` (required), `autofix_push_token` (**needed**
-here, not just recommended — without it `gh pr create` authenticates as
-`GITHUB_TOKEN` and GitHub's recursive-workflow guard silently suppresses the
-`pull_request: opened` event for the new PR, so the caller's own PR gate
-never runs on it).
+The repair loop is the same engine as every other change (`scripts/agent_pipeline.py`),
+started from the failing CI logs: writer, deterministic checks in a secret-free
+process, failure adjudication (is the code or the test wrong), two independent
+reviewers; retried once with twice the budget, then the PR is abandoned. Before
+the model reads anything, the checks run once on the PR as the bot left it, so
+the NEW dependency version is installed and its source can be read. The push
+token is taken out of `.git/config` while the PR's code runs and put back only
+for the push. There used to be a separate `autofix_core.py` graph and a
+`reusable_main-autofix.yml` for a red base branch; both are gone: a red base
+branch is handled by `reusable_agent-main-guard.yml` (revert, then redo).
 
 ### `reusable_ci-analysis.yml`
 
@@ -266,9 +250,10 @@ Nothing needs to be configured in this repo per consumer — it's stateless.
 pytest tests/ -v
 ```
 
-229 tests, no network, no real `gh` calls — `checks_state`, verdict parsing,
-autofix guardrails (`parse_fix`/`apply_fix`), `run_verify`, the
-`autofix_core.py` langgraph graph, `main_autofix.py`'s PR-opening plumbing,
-and `auto_merge_authors` gating are all exercised against fakes.
+300+ tests, no network, no real `gh` calls — `checks_state`, verdict parsing,
+the engine's graph against real throwaway git repositories and a scripted
+model, failure adjudication, the weakening guard, the merge gate and the main
+guard (with a local bare remote), terminal states, and `auto_merge_authors`
+gating are all exercised against fakes.
 `.github/workflows/test.yml` runs them on every push/PR to this repo
 (installing `scripts/requirements-autofix.txt` first, for the graph tests).
