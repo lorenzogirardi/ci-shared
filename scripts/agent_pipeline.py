@@ -117,7 +117,7 @@ def run_planner(caller: lib.ModelCaller, title: str, body: str, context: str) ->
 # ---------------------------------------------------------------------------
 
 def review_diff(caller: lib.ModelCaller, diff: str, plan: dict | None,
-                reviewers: tuple[str, ...] = REVIEWERS):
+                reviewers: tuple[str, ...] = REVIEWERS, guidance: str = ""):
     """Run the independent reviewers on `diff`. Returns (findings, dropped)
     after validation against the diff and dedup, or None if a reviewer could
     not produce a usable reply (fail closed: the change cannot be certified)."""
@@ -125,6 +125,7 @@ def review_diff(caller: lib.ModelCaller, diff: str, plan: dict | None,
     user = (
         f"## Plan\n{json.dumps(plan, indent=2) if plan else 'No plan was provided; judge the diff on its own.'}\n\n"
         f"## Diff (lines are prefixed `L<number>|` with their line number in the new file)\n{lib.annotate_diff(diff)}"
+        + (f"\n\n## Guidance from the maintainers of this repository\n{guidance}" if guidance.strip() else "")
     )
     kept_all: list[lib.Finding] = []
     dropped_all: list[tuple[lib.Finding, str]] = []
@@ -136,6 +137,29 @@ def review_diff(caller: lib.ModelCaller, diff: str, plan: dict | None,
         kept_all += kept
         dropped_all += dropped
     return lib.dedup_findings(kept_all), dropped_all
+
+
+SEVERITY_NOTE = ("Severity mapping: where this guidance says [Critical], use severity critical or high; "
+                 "everything else is medium or low.")
+
+
+def structured_review(caller: lib.ModelCaller, diff: str, title: str, body: str,
+                      guidance: str = "") -> tuple[bool, str] | None:
+    """Reviewers A and B on a diff for callers that only need a verdict and a
+    text (the Renovate sweep). Returns (clean, markdown) or None when a
+    reviewer was unusable, in which case nothing is certified."""
+    plan = derived_plan(title, lib.sanitize_untrusted(body, 4000))
+    note = f"{SEVERITY_NOTE}\n\n{guidance.strip()}" if guidance.strip() else ""
+    result = review_diff(caller, diff, plan, guidance=note)
+    if result is None:
+        return None
+    findings, dropped = result
+    blocking = sum(1 for f in findings if f.blocking)
+    text = ("Reviewer A (correctness/design) and reviewer B (security/operability), independent, deduplicated: "
+            f"{len(findings)} finding(s), {blocking} blocking"
+            + (f", {len(dropped)} dropped (not on a changed line)" if dropped else "")
+            + f".\n\n{lib.render_findings_md(findings)}")
+    return blocking == 0, text
 
 
 def final_review(caller: lib.ModelCaller, diff: str, plan: dict, prior: list[dict]):

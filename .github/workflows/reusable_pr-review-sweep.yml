@@ -37,6 +37,11 @@ on:
         required: false
         type: string
         default: ''
+      structured_review:
+        description: 'Review with the two independent reviewers of the agent pipeline (structured findings, validated against the diff) instead of the single reviewer, and review a machine-written autofix commit before it can merge. A clean verdict then means: no blocking finding.'
+        required: false
+        type: boolean
+        default: false
       skip_head_prefixes:
         description: 'Comma-separated head-branch prefixes to leave alone (e.g. "agent/"): PRs the agent pipeline opened are certified inside that pipeline.'
         required: false
@@ -196,6 +201,14 @@ jobs:
             --rules-file .github/ai-review-rules.md \
             --out .ai/review-system.txt
 
+      - name: Write the review guidance for the structured reviewers
+        if: inputs.structured_review
+        env:
+          EXTRA: ${{ inputs.system_prompt_extra }}
+        run: |
+          mkdir -p .ai
+          { printf '%s\n\n' "$EXTRA"; [ -f .github/ai-review-rules.md ] && cat .github/ai-review-rules.md || true; } > .ai/review-guidance.txt
+
       - name: Write verify_command to a file
         # A file, not a CLI arg: verify_command is user-authored multiline
         # shell and quoting it safely into an argv string is not worth it.
@@ -209,7 +222,7 @@ jobs:
         # Only autofix_core.py needs this (langgraph); every other path in
         # pr_review_sweep.py stays stdlib-only, so skip the install entirely
         # when autofix is off.
-        if: inputs.autofix
+        if: inputs.autofix || inputs.structured_review
         run: pip install -q -r .shared/scripts/requirements-autofix.txt
 
       - name: Sweep open PRs
@@ -234,6 +247,8 @@ jobs:
             --max-autofix-attempts ${{ inputs.max_autofix_attempts }} \
             --auto-merge-authors "${{ inputs.auto_merge_authors }}" \
             --skip-head-prefixes "${{ inputs.skip_head_prefixes }}" \
+            --review-guidance-file .ai/review-guidance.txt \
+            ${{ inputs.structured_review && '--structured-review' || '' }} \
             ${{ inputs.auto_merge && '--auto-merge' || '' }} \
             ${{ inputs.triage_on_failure && '--triage-on-failure' || '' }} \
             ${{ inputs.autofix && '--autofix' || '' }}
