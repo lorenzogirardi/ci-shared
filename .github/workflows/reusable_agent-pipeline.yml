@@ -20,13 +20,6 @@ on:
       issue_number:
         required: true
         type: number
-      issue_title:
-        required: true
-        type: string
-      issue_body:
-        required: false
-        type: string
-        default: ''
       base_branch:
         required: false
         type: string
@@ -134,16 +127,24 @@ jobs:
           python3 .shared/scripts/agent_pipeline.py guard \
             --repo "${{ github.repository }}" --issue ${{ inputs.issue_number }}
 
-      - name: Write the request and the verify command to files
+      - name: Fetch the request and write the verify command to a file
+        # The issue text is fetched here, never passed through workflow
+        # inputs or expressions: it is untrusted data and goes straight to
+        # files the agents read as data.
         if: steps.guard.outputs.skip != 'true'
         env:
-          TITLE: ${{ inputs.issue_title }}
-          BODY: ${{ inputs.issue_body }}
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_API: repos/${{ github.repository }}/issues/${{ inputs.issue_number }}
           VERIFY_COMMAND: ${{ inputs.verify_command }}
         run: |
+          set -euo pipefail
           mkdir -p .ai
-          printf '%s' "$TITLE" > .ai/issue-title.txt
-          printf '%s' "$BODY" > .ai/issue-body.txt
+          if [ "$(gh api "$ISSUE_API" --jq '.pull_request != null')" = "true" ]; then
+            echo "::error::#${{ inputs.issue_number }} is a pull request, not an issue"
+            exit 1
+          fi
+          gh api "$ISSUE_API" --jq '.title' > .ai/issue-title.txt
+          gh api "$ISSUE_API" --jq '.body // ""' > .ai/issue-body.txt
           printf '%s\n' "$VERIFY_COMMAND" > .ai/verify-command.sh
 
       - name: Run the agents (model key, no write token)

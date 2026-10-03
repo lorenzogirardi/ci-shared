@@ -252,6 +252,8 @@ class TestDocsArchitect:
     def test_changelog_is_not_a_documentation_input(self):
         assert not ap.is_architect_doc("CHANGELOG.md") and not ap.is_architect_doc("docs/CHANGELOG.md")
         assert ap.is_architect_doc("docs/x.md") and ap.is_architect_doc("README.md") and not ap.is_architect_doc("requirements.txt")
+        # app templates are HTML but not documentation; HTML under docs/ is
+        assert not ap.is_architect_doc("app/templates/index.html") and ap.is_architect_doc("docs/case-study.html")
 
     def test_command_writes_only_under_ai_and_refuses_if_the_tree_changes(self, repo, monkeypatch):
         (repo / "docs").mkdir()

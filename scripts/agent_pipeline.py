@@ -560,6 +560,8 @@ def is_architect_doc(path: str) -> bool:
         return False
     if name in ("requirements.txt", "LICENSE.txt") or name.startswith("requirements"):
         return False
+    if path.lower().endswith(".html"):
+        return path.startswith("docs/")  # an app template is not documentation
     return path.lower().endswith(DOC_SUFFIXES) or name == ".env.example"
 
 
