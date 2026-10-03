@@ -1134,16 +1134,24 @@ AUTOFIX_AUTHORS = frozenset({AUTOFIX_AUTHOR, "ci-shared agents"})   # the autofi
 ABANDONED_LABEL = "agent-abandoned"
 
 
+# Commits the pipeline itself adds to the base branch after every run (image tag bump, changelog). They
+# change nothing a PR's CI result depends on; counting them would make every PR "behind" forever and
+# send it round the refresh loop again and again.
+_BOOKKEEPING = re.compile(r"^(Done\s+by Github Actions|docs\(changelog\))", re.IGNORECASE)
+
+
 def pr_is_behind(repo: str, number: int, pr: dict | None = None) -> bool:
-    """True when the base branch has commits the PR does not, so its check results describe an old
-    merge result. Counted from the commits themselves (the compare API): GitHub's `mergeable_state`
-    only says "behind" when the repository requires branches to be up to date, which most do not."""
+    """True when the base branch has real commits the PR does not, so its check results describe an old
+    merge result. Counted from the commits themselves (the compare API): GitHub's `mergeable_state` only
+    says "behind" when the repository requires branches to be up to date, which most do not. The
+    pipeline's own bookkeeping commits do not count."""
     pr = pr or gh_json([f"repos/{repo}/pulls/{number}"]) or {}
     base_ref, head_sha = (pr.get("base") or {}).get("ref"), (pr.get("head") or {}).get("sha")
     if not base_ref or not head_sha:
         return False
-    comparison = gh_json([f"repos/{repo}/compare/{base_ref}...{head_sha}"]) or {}
-    return int(comparison.get("behind_by") or 0) > 0
+    missing = (gh_json([f"repos/{repo}/compare/{head_sha}...{base_ref}"]) or {}).get("commits", [])
+    return any(not _BOOKKEEPING.match(((c.get("commit") or {}).get("message") or "").splitlines()[0] if (c.get("commit") or {}).get("message") else "")
+               for c in missing)
 
 
 def refresh_pr(repo: str, pr: dict) -> str:

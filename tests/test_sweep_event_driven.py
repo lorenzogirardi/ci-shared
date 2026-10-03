@@ -32,11 +32,20 @@ class TestHelpers:
     def test_behind_is_counted_from_the_commits_not_from_the_merge_state(self, monkeypatch):
         # No branch protection here, so GitHub never reports "behind": the compare API is the truth.
         asked = []
-        monkeypatch.setattr(sweep, "gh_json", lambda a: asked.append(a[0]) or {"behind_by": 3, "mergeable_state": "clean"})
+        real = {"commits": [{"commit": {"message": "feat: something real\n\nbody"}}], "mergeable_state": "clean"}
+        monkeypatch.setattr(sweep, "gh_json", lambda a: asked.append(a[0]) or real)
         assert sweep.pr_is_behind("o/r", 5, PR)
-        assert asked == ["repos/o/r/compare/main..." + "a" * 40]
-        monkeypatch.setattr(sweep, "gh_json", lambda a: {"behind_by": 0})
+        assert asked == ["repos/o/r/compare/" + "a" * 40 + "...main"]
+        monkeypatch.setattr(sweep, "gh_json", lambda a: {"commits": []})
         assert not sweep.pr_is_behind("o/r", 5, PR)
+
+    def test_the_pipelines_own_bookkeeping_commits_do_not_make_a_pr_behind(self, monkeypatch):
+        housekeeping = {"commits": [{"commit": {"message": "Done  by Github Actions   Job changemanifest: 270"}},
+                                    {"commit": {"message": "docs(changelog): update for abc1234"}}]}
+        monkeypatch.setattr(sweep, "gh_json", lambda a: housekeeping)
+        assert not sweep.pr_is_behind("o/r", 5, PR)
+        housekeeping["commits"].append({"commit": {"message": "fix: a real change"}})
+        assert sweep.pr_is_behind("o/r", 5, PR)
 
     def test_renovate_is_asked_to_rebase_other_authors_get_the_base_merged_in(self, monkeypatch):
         calls = []
