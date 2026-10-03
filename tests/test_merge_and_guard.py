@@ -132,7 +132,7 @@ def remote(tmp_path, monkeypatch):
 
 
 def guard_env(monkeypatch, sha, *, subject="feat: bad change (#4)", jobs=("build", "k8s-check"), previous="success",
-              reverts=0, conclusion="failure", attempt=2):
+              reverts=0, conclusion="failure", attempt=2, later=None):
     calls = type("Calls", (list,), {})()
     reruns = []
     monkeypatch.setattr(ap, "rerun_failed_jobs", lambda repo, run_id: reruns.append((repo, run_id)) or True)
@@ -148,8 +148,9 @@ def guard_env(monkeypatch, sha, *, subject="feat: bad change (#4)", jobs=("build
         if url.endswith("/runs/9/jobs?per_page=100"):
             return {"jobs": [{"name": j, "conclusion": "failure"} for j in jobs] + [{"name": "docker-sbom", "conclusion": "success"}]}
         if "/workflows/7/runs" in url:
-            return {"workflow_runs": [{"run_number": 12, "conclusion": "failure"},
-                                      {"run_number": 11, "conclusion": previous, "head_sha": GREEN_SHA}]}
+            return {"workflow_runs": ([{"run_number": 13, "conclusion": later}] if later else [])
+                                     + [{"run_number": 12, "conclusion": "failure"},
+                                        {"run_number": 11, "conclusion": previous, "head_sha": GREEN_SHA}]}
         if "/commits?sha=" in url:
             return [{"commit": {"message": f"{ap.REVERT_PREFIX}: r"}}] * reverts
         raise AssertionError(url)
@@ -167,8 +168,10 @@ def guard_env(monkeypatch, sha, *, subject="feat: bad change (#4)", jobs=("build
 GREEN_SHA = ""
 
 
-def guard_args():
-    return argparse.Namespace(repo="o/r", run_id=9, base_branch="main", max_reverts=3)
+def guard_args(**over):
+    base = dict(repo="o/r", run_id=9, base_branch="main", max_reverts=3, dry_run=False)
+    base.update(over)
+    return argparse.Namespace(**base)
 
 
 class TestMainGuard:
@@ -356,3 +359,36 @@ class TestAbandonmentIsTerminalPerCommit:
         monkeypatch.setattr(ap, "post_comment", lambda *a: None)
         ap.cmd_publish_pr(type("A", (), {"repo": "o/r", "pr": 5, "head_ref": "feature"})())
         assert any("--remove-label" in c and ap.ABANDONED_LABEL in c for c in calls)
+
+
+class TestGuardDoesNotFightARepair:
+    def test_a_later_green_run_means_it_was_already_repaired_so_nothing_is_reverted(self, remote, monkeypatch):
+        origin, sha = remote
+        calls = guard_env(monkeypatch, sha, later="success")
+        assert ap.cmd_main_guard(guard_args()) == 0
+        assert git("--git-dir", str(origin), "rev-parse", "main") == sha
+        assert not any(c[:2] == ("issue", "create") for c in calls)
+        assert any("already repaired" in " ".join(c) for c in calls)
+
+    def test_a_later_RED_run_does_not_stop_the_revert(self, remote, monkeypatch):
+        origin, sha = remote
+        guard_env(monkeypatch, sha, later="failure")
+        assert ap.cmd_main_guard(guard_args()) == 0
+        assert git("--git-dir", str(origin), "show", "main:x") == "1"
+
+    def test_dry_run_decides_and_prints_but_changes_nothing(self, remote, monkeypatch, capsys):
+        origin, sha = remote
+        calls = guard_env(monkeypatch, sha, attempt=2)
+        monkeypatch.delenv("AGENT_PUSH_TOKEN", raising=False)                     # not even a token is needed
+        assert ap.cmd_main_guard(guard_args(dry_run=True)) == 0
+        out = capsys.readouterr().out
+        assert "[dry run] would revert 1 change(s)" in out and "feat: bad change (#4)" in out
+        assert git("--git-dir", str(origin), "rev-parse", "main") == sha
+        assert calls == [] and calls.reruns == []
+
+    def test_dry_run_on_a_first_failure_reports_the_rerun_it_would_do(self, remote, monkeypatch, capsys):
+        _, sha = remote
+        calls = guard_env(monkeypatch, sha, attempt=1)
+        assert ap.cmd_main_guard(guard_args(dry_run=True)) == 0
+        assert "would re-run the failed jobs" in capsys.readouterr().out
+        assert calls.reruns == []
