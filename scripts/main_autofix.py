@@ -19,12 +19,36 @@ without needing a PR number to look them up by.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pathlib
 
 from pr_review_sweep import _autofix_report, build_diff, collect_failure_logs, run, run_verify
 
 from autofix_core import run_autofix_graph
+
+
+def open_autofix_pr(repo: str, base_branch: str) -> str:
+    """URL of an already-open `autofix/main-*` PR against `base_branch`, else "".
+
+    Every red push to main would otherwise open its own PR (the branch name
+    carries the run number), piling up near-identical fixes for one breakage.
+    """
+    listed = run(
+        ["gh", "pr", "list", "--repo", repo, "--base", base_branch, "--state", "open",
+         "--json", "headRefName,url", "--limit", "100"],
+        check=False,
+    )
+    if listed.returncode != 0:
+        return ""
+    try:
+        prs = json.loads(listed.stdout or "[]")
+    except ValueError:
+        return ""
+    for pr in prs:
+        if str(pr.get("headRefName", "")).startswith("autofix/main-"):
+            return str(pr.get("url", ""))
+    return ""
 
 
 def main() -> int:
@@ -47,6 +71,11 @@ def main() -> int:
     logs = collect_failure_logs(args.repo, args.head_sha, args.max_chars // 2)
     if not logs.strip():
         print("No failure logs found for this commit yet -- nothing to work from.")
+        return 0
+
+    existing = open_autofix_pr(args.repo, args.base_branch)
+    if existing:
+        print(f"An autofix PR is already open ({existing}) -- not opening another for this run.")
         return 0
 
     diff_path = pathlib.Path(".ai/diff.txt")

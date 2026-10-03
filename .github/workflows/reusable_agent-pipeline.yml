@@ -1,0 +1,195 @@
+name: Reusable Agent Pipeline
+
+# Issue -> planner -> writer -> deterministic checks -> reviewer A + reviewer B
+# -> dedup/validation -> fix loop (bounded) -> final reviewer -> documentation
+# reviewer -> changelog -> pull request. All logic lives in
+# scripts/agent_pipeline.py; this file only wires credentials.
+#
+# Credential boundaries, on purpose:
+#   - the `run` step has the model API key but NO write token. It executes
+#     code a model just wrote (the verify_command), which is run with a
+#     scrubbed environment as well (see agent_lib.run_verify_isolated), and
+#     the checkout keeps no credentials in .git/config.
+#   - only the `publish` step has the write token, and it runs no repo code.
+# Nothing here merges: the merge gate does, for a certified head commit whose CI is green.
+# A run that does not converge is retried once with twice the budget, then the request
+# is abandoned (commented on the issue; nothing is pushed).
+
+on:
+  workflow_call:
+    inputs:
+      issue_number:
+        required: true
+        type: number
+      base_branch:
+        required: false
+        type: string
+        default: 'main'
+      python_version:
+        description: 'Must match the version the real CI gate uses.'
+        required: false
+        type: string
+        default: '3.12'
+      verify_command:
+        description: 'The deterministic gates (lint, tests, smoke test). Run after every change, in an environment without secrets.'
+        required: true
+        type: string
+      verify_timeout_seconds:
+        required: false
+        type: number
+        default: 900
+      max_iterations:
+        description: 'Review -> fix cycles before the loop stops and asks for a person.'
+        required: false
+        type: number
+        default: 3
+      max_verify_retries:
+        required: false
+        type: number
+        default: 3
+      writer_rounds:
+        description: 'Writer turns (exploration + edit) per attempt.'
+        required: false
+        type: number
+        default: 8
+      changelog_path:
+        required: false
+        type: string
+        default: 'CHANGELOG.md'
+      context_files:
+        description: 'Comma-separated files shown to planner and writer as project context.'
+        required: false
+        type: string
+        default: 'CLAUDE.md,README.md'
+      openrouter_model:
+        required: false
+        type: string
+        default: ''
+      openrouter_endpoint:
+        required: false
+        type: string
+        default: ''
+      openrouter_site_url:
+        required: false
+        type: string
+        default: ''
+      openrouter_app_name:
+        required: false
+        type: string
+        default: ''
+    secrets:
+      openrouter_api_key:
+        required: true
+      agent_push_token:
+        description: >
+          Fine-grained PAT (Contents + Pull requests: read/write, this repo only,
+          never `workflow` scope). Required: a PR created as GITHUB_TOKEN does
+          not trigger the PR checks, so it could never be verified.
+        required: true
+
+permissions: {}
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    steps:
+      - name: Checkout caller repo (no credentials kept)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.base_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout shared scripts
+        uses: actions/checkout@v4
+        with:
+          repository: lorenzogirardi/ci-shared
+          ref: v2
+          path: .shared
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Install agent dependencies
+        run: pip install -q -r .shared/scripts/requirements-autofix.txt
+
+      - name: Is an agent PR for this issue already open?
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 .shared/scripts/agent_pipeline.py guard \
+            --repo "${{ github.repository }}" --issue ${{ inputs.issue_number }}
+
+      - name: Fetch the request and write the verify command to a file
+        # The issue text is fetched here, never passed through workflow
+        # inputs or expressions: it is untrusted data and goes straight to
+        # files the agents read as data.
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_API: repos/${{ github.repository }}/issues/${{ inputs.issue_number }}
+          VERIFY_COMMAND: ${{ inputs.verify_command }}
+        run: |
+          set -euo pipefail
+          mkdir -p .ai
+          if [ "$(gh api "$ISSUE_API" --jq '.pull_request != null')" = "true" ]; then
+            echo "::error::#${{ inputs.issue_number }} is a pull request, not an issue"
+            exit 1
+          fi
+          gh api "$ISSUE_API" --jq '.title' > .ai/issue-title.txt
+          gh api "$ISSUE_API" --jq '.body // ""' > .ai/issue-body.txt
+          printf '%s\n' "$VERIFY_COMMAND" > .ai/verify-command.sh
+
+      - name: Run the agents (model key, no write token)
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.openrouter_api_key }}
+          OPENROUTER_MODEL: ${{ inputs.openrouter_model }}
+          OPENROUTER_ENDPOINT: ${{ inputs.openrouter_endpoint }}
+          OPENROUTER_SITE_URL: ${{ inputs.openrouter_site_url }}
+          OPENROUTER_APP_NAME: ${{ inputs.openrouter_app_name }}
+        run: |
+          set -euo pipefail
+          python3 .shared/scripts/agent_pipeline.py run \
+            --ai-script .shared/scripts/openrouter_ai.py \
+            --issue ${{ inputs.issue_number }} \
+            --run-number ${{ github.run_number }} \
+            --issue-title-file .ai/issue-title.txt \
+            --issue-body-file .ai/issue-body.txt \
+            --context-files "${{ inputs.context_files }}" \
+            --verify-command-file .ai/verify-command.sh \
+            --verify-timeout ${{ inputs.verify_timeout_seconds }} \
+            --max-iterations ${{ inputs.max_iterations }} \
+            --max-verify-retries ${{ inputs.max_verify_retries }} \
+            --writer-rounds ${{ inputs.writer_rounds }} \
+            --changelog "${{ inputs.changelog_path }}"
+
+      - name: Publish the branch and open the PR (write token, no repo code runs)
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          AGENT_PUSH_TOKEN: ${{ secrets.agent_push_token }}
+          GH_TOKEN: ${{ secrets.agent_push_token }}
+        run: |
+          python3 .shared/scripts/agent_pipeline.py publish \
+            --repo "${{ github.repository }}" --issue ${{ inputs.issue_number }} \
+            --base-branch "${{ inputs.base_branch }}"
+
+      - name: Upload the run record (plan, per-role prompts and replies, costs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-run-${{ inputs.issue_number }}
+          path: |
+            .ai/agent-run
+            .ai/agents
+          if-no-files-found: ignore
+          include-hidden-files: true
+          retention-days: 14

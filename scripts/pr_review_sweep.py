@@ -673,11 +673,51 @@ def _prepare_diff(pr: dict, args: argparse.Namespace) -> str | None:
     return diff_path.read_text()
 
 
+def structured_verdict(args: argparse.Namespace, pr: dict, diff: str) -> str | None:
+    """Review text ending in the VERDICT line, produced by the two independent
+    reviewers of the agent pipeline (see agent_pipeline.structured_review).
+    Same contract as the single-reviewer path, so everything downstream
+    (split_verdict, the cached-verdict markers, the merge gate) is unchanged.
+    Deferred imports: this module stays stdlib-only unless the flag is on."""
+    import agent_lib
+    from agent_pipeline import structured_review
+
+    guidance_file = pathlib.Path(args.review_guidance_file) if args.review_guidance_file else None
+    guidance = guidance_file.read_text() if guidance_file and guidance_file.is_file() else ""
+    caller = agent_lib.ModelCaller(args.ai_script, max_chars=args.max_chars, timeout=args.timeout,
+                                   work_dir=f".ai/agents/pr-{pr['number']}")
+    result = structured_review(caller, diff, pr["title"], pr.get("body") or "", guidance)
+    if result is None:
+        print(f"Reviewers gave no usable reply for PR #{pr['number']} -- leaving it for the next sweep.",
+              file=sys.stderr)
+        return None
+    clean, text = result
+    return f"{text}\n{CLEAN_VERDICT if clean else DIRTY_VERDICT}"
+
+
+def review_after_autofix(args: argparse.Namespace, pr: dict) -> tuple[str | None, str]:
+    """Before a PR carrying a machine-written fix is merged, the fix gets the
+    same independent review as any other change. Returns (blocked_reason or
+    None, review markdown). Without --structured-review there is no review
+    here (the previous behavior)."""
+    if not getattr(args, "structured_review", False):
+        return None, ""
+    path = pathlib.Path(".ai/diff.txt")
+    build_diff(pr["base"]["sha"], "HEAD", path)
+    verdict = structured_verdict(args, pr, path.read_text())
+    if verdict is None:
+        return "post-fix review unavailable", ""
+    clean, text = split_verdict(verdict)
+    return (None if clean else "post-fix review found blocking issues"), text
+
+
 def review_one(pr: dict, args: argparse.Namespace, system_file: pathlib.Path) -> str | None:
     """Return the review text, or None if the model call failed."""
     diff = _prepare_diff(pr, args)
     if diff is None:
         return None
+    if getattr(args, "structured_review", False):
+        return structured_verdict(args, pr, diff)
 
     # The PR title is untrusted input: it is written into a prompt file as
     # data, never interpolated into a shell command.
@@ -1160,9 +1200,29 @@ def main() -> int:
              "Lets --authors be wider than this -- e.g. autofix a human's PRs too, without "
              "ever merging them unattended.",
     )
+    parser.add_argument(
+        "--structured-review",
+        action="store_true",
+        help="Review with the two independent reviewers of the agent pipeline (structured findings "
+             "validated against the diff) instead of the single reviewer, and review a machine-written "
+             "autofix commit before it can merge. Needs requirements-autofix.txt installed.",
+    )
+    parser.add_argument(
+        "--review-guidance-file",
+        default="",
+        help="Project-specific review guidance shown to the structured reviewers.",
+    )
+    parser.add_argument(
+        "--skip-head-prefixes",
+        default="",
+        help="Comma-separated head-branch prefixes the sweep must leave alone (e.g. 'agent/'). "
+             "PRs opened by the agent pipeline are reviewed, fixed and certified inside that "
+             "pipeline; a second reviewer here would only produce a conflicting verdict.",
+    )
     args = parser.parse_args()
 
     pathlib.Path(".ai").mkdir(exist_ok=True)
+    skip_prefixes = tuple(x.strip() for x in args.skip_head_prefixes.split(",") if x.strip())
     system_file = pathlib.Path(args.system_file)
     authors = {a.strip() for a in args.authors.split(",") if a.strip()}
     auto_merge_authors = {a.strip() for a in args.auto_merge_authors.split(",") if a.strip()}
@@ -1180,6 +1240,8 @@ def main() -> int:
         number, head_sha = pr["number"], pr["head"]["sha"]
         author = (pr.get("user") or {}).get("login", "")
         if authors and author not in authors:
+            continue
+        if skip_prefixes and ((pr.get("head") or {}).get("ref") or "").startswith(skip_prefixes):
             continue
 
         existing = existing_sweep_comment(args.repo, number)
@@ -1236,26 +1298,34 @@ def main() -> int:
                 print(f"::group::Autofixing failed CI on PR #{number} ({author}): {pr['title']}")
                 outcome, detail = autofix_one(pr, args, args.repo, head_sha)
                 print(f"autofix {outcome}: {detail}")
+                fix_review = ""
                 if outcome == "pushed":
                     autofixed += 1
                     merge_outcome = "checks failing"
                     if may_auto_merge(args.auto_merge, auto_merge_authors, author):
-                        # autofix_one just advanced this PR's head; head_sha
-                        # above is the pre-fix commit, so re-fetch before
-                        # polling or we'd be watching the wrong commit's CI.
-                        new_sha = pr_head_sha(args.repo, number) or head_sha
-                        merge_outcome = try_merge(args.repo, number, new_sha, args.merge_method, required,
-                                                   poll_seconds=args.merge_poll_seconds,
-                                                   poll_interval=args.merge_poll_interval)
-                        if merge_outcome == "merged":
-                            merged += 1
+                        # The machine-written fix gets an independent review
+                        # before it can merge; CI alone used to decide.
+                        blocked, fix_review = review_after_autofix(args, pr)
+                        if blocked:
+                            merge_outcome = blocked
+                        else:
+                            # autofix_one just advanced this PR's head; head_sha
+                            # above is the pre-fix commit, so re-fetch before
+                            # polling or we'd be watching the wrong commit's CI.
+                            new_sha = pr_head_sha(args.repo, number) or head_sha
+                            merge_outcome = try_merge(args.repo, number, new_sha, args.merge_method, required,
+                                                       poll_seconds=args.merge_poll_seconds,
+                                                       poll_interval=args.merge_poll_interval)
+                            if merge_outcome == "merged":
+                                merged += 1
                 else:
                     triaged += 1
                     merge_outcome = "checks failing"
                 post_comment(
                     args.repo, number,
                     comment_body(f"{args.heading} — CI failure",
-                                 _autofix_report(outcome, detail), head_sha,
+                                 _autofix_report(outcome, detail)
+                                 + (f"\n\n### Review of the fix\n{fix_review}" if fix_review else ""), head_sha,
                                  is_clean=False, merge_outcome=merge_outcome,
                                  harness_version=args.harness_version),
                     existing,

@@ -222,3 +222,10 @@ def test_append_cost_footer(tmp_path):
     assert "154" not in out  # totals are computed
     assert "150" in out  # token total
     assert "0.14/0.28" in out
+
+def test_openrouter_slug_of_the_configured_model_is_priced():
+    # Without an entry the cost reports show $0.00 for every agent call.
+    sys.path.insert(0, str(SCRIPT.parent))
+    import openrouter_ai
+
+    assert openrouter_ai._model_price("deepseek/deepseek-v4.1-flash") == (0.30, 1.20)

@@ -57,6 +57,9 @@ MODEL_PRICES_USD_PER_1M = {
     "deepseek-v4-flash": (0.14, 0.28),
     "deepseek-v4-flash-free": (0.14, 0.28),
     "deepseek-v4-pro": (1.74, 3.48),
+    # OpenRouter slug used by flask-test-api's OPENROUTER_MODEL variable
+    # (list price per openrouter.ai/api/v1/models: $0.30 in / $1.20 out per 1M).
+    "deepseek/deepseek-v4.1-flash": (0.30, 1.20),
     "claude-sonnet-4.5": (3.00, 15.00),
     "gpt-4o": (2.50, 10.00),
 }

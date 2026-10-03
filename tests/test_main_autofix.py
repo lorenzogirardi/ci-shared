@@ -57,7 +57,10 @@ class TestNoLogsYet:
         assert called["run"] is False
 
 
-def _run_main(monkeypatch, args):
+def _run_main(monkeypatch, args, existing_pr=""):
+    # The dedup lookup shells out to `gh` through the same `run` these tests
+    # replace wholesale; stub it so they keep exercising only their own path.
+    monkeypatch.setattr(main_autofix, "open_autofix_pr", lambda *a, **k: existing_pr)
     monkeypatch.setattr(main_autofix.argparse.ArgumentParser, "parse_args", lambda self: args)
     return main_autofix.main()
 
@@ -126,3 +129,29 @@ class TestDoesNotOpenAPROnFailure:
 
         rc = _run_main(monkeypatch, _common_args(tmp_path))
         assert rc == 1
+
+
+class TestOpenAutofixPr:
+    @staticmethod
+    def _fake_run(stdout, returncode=0):
+        return lambda *a, **k: subprocess.CompletedProcess(a, returncode, stdout=stdout, stderr="")
+
+    def test_finds_open_autofix_branch(self, monkeypatch):
+        out = '[{"headRefName": "renovate/x", "url": "u1"}, {"headRefName": "autofix/main-7", "url": "u2"}]'
+        monkeypatch.setattr(main_autofix, "run", self._fake_run(out))
+        assert main_autofix.open_autofix_pr("o/r", "main") == "u2"
+
+    def test_ignores_unrelated_prs(self, monkeypatch):
+        monkeypatch.setattr(main_autofix, "run", self._fake_run('[{"headRefName": "renovate/x", "url": "u1"}]'))
+        assert main_autofix.open_autofix_pr("o/r", "main") == ""
+
+    def test_gh_failure_or_bad_json_does_not_block_autofix(self, monkeypatch):
+        monkeypatch.setattr(main_autofix, "run", self._fake_run("", returncode=1))
+        assert main_autofix.open_autofix_pr("o/r", "main") == ""
+        monkeypatch.setattr(main_autofix, "run", self._fake_run("not json"))
+        assert main_autofix.open_autofix_pr("o/r", "main") == ""
+
+    def test_main_skips_when_autofix_pr_already_open(self, monkeypatch):
+        monkeypatch.setattr(main_autofix, "collect_failure_logs", lambda *a, **k: "boom")
+        monkeypatch.setattr(main_autofix, "build_diff", lambda *a, **k: pytest.fail("must not reach the model"))
+        assert _run_main(monkeypatch, _common_args(None), existing_pr="https://x/pr/1") == 0

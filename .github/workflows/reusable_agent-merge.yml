@@ -1,0 +1,81 @@
+name: Reusable Agent Merge
+
+# Merge authority. Merges a pull request when, and only when:
+#   - it is open, not a draft, not from a fork, not labelled agent-abandoned;
+#   - its CURRENT head commit is certified: a comment by a trusted account carries
+#     <!-- agent-certified: <sha> --> for exactly that commit (a new push changes
+#     the sha, so an old certification never applies to new code);
+#   - the required CI checks have succeeded on that same commit;
+#   - the circuit breaker is closed (fewer than max_reverts automatic reverts in 24h).
+# The merge is done with the agent token, not GITHUB_TOKEN: a merge made with
+# GITHUB_TOKEN does not trigger the push workflows on the base branch (build,
+# changelog), which would silently skip the checks that follow every merge.
+# No repository code runs here; the only checkout is ci-shared's scripts.
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        required: true
+        type: number
+      base_branch:
+        required: false
+        type: string
+        default: 'main'
+      required_checks:
+        description: 'Comma-separated check names that must have SUCCEEDED on the head commit.'
+        required: true
+        type: string
+      merge_method:
+        required: false
+        type: string
+        default: 'squash'
+      trusted_logins:
+        description: 'Accounts whose certification comments count. Empty = the repository owner.'
+        required: false
+        type: string
+        default: ''
+      poll_seconds:
+        description: 'Wait this long for pending checks to settle before leaving the PR for the next trigger.'
+        required: false
+        type: number
+        default: 0
+      max_reverts:
+        required: false
+        type: number
+        default: 3
+    secrets:
+      agent_push_token:
+        required: true
+
+permissions: {}
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: lorenzogirardi/ci-shared
+          ref: v2
+          path: .shared
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -q -r .shared/scripts/requirements-autofix.txt
+      - name: Merge if certified and green
+        env:
+          GH_TOKEN: ${{ secrets.agent_push_token }}
+          TRUSTED: ${{ inputs.trusted_logins || github.repository_owner }}
+        run: |
+          python3 .shared/scripts/agent_pipeline.py merge-gate \
+            --repo "${{ github.repository }}" --pr ${{ inputs.pr_number }} \
+            --base-branch "${{ inputs.base_branch }}" \
+            --required-checks "${{ inputs.required_checks }}" \
+            --merge-method "${{ inputs.merge_method }}" \
+            --poll-seconds ${{ inputs.poll_seconds }} \
+            --max-reverts ${{ inputs.max_reverts }} \
+            --trusted "$TRUSTED"

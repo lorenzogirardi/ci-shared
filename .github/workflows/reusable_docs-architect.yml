@@ -1,0 +1,88 @@
+name: Reusable Documentation Architect
+
+# Plan-only. Inventories and classifies the documentation (Diataxis:
+# tutorial / how-to / reference / explanation), finds gaps from what the code
+# actually exposes, and proposes a structure and navigation map. It never
+# creates, moves or rewrites a document (the script fails the run if the
+# working tree changed). Later changes must come as a reviewed patch or PR;
+# nothing here merges. The changelog is a separate concern, owned by
+# reusable_changelog.yml.
+
+on:
+  workflow_call:
+    inputs:
+      post_issue:
+        description: 'Also create/update an issue titled "Documentation architecture proposal".'
+        required: false
+        type: boolean
+        default: false
+      max_chars:
+        required: false
+        type: number
+        default: 400000
+      openrouter_model:
+        required: false
+        type: string
+        default: ''
+      openrouter_endpoint:
+        required: false
+        type: string
+        default: ''
+      openrouter_site_url:
+        required: false
+        type: string
+        default: ''
+      openrouter_app_name:
+        required: false
+        type: string
+        default: ''
+    secrets:
+      openrouter_api_key:
+        required: true
+
+permissions: {}
+
+jobs:
+  architect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: lorenzogirardi/ci-shared
+          ref: v2
+          path: .shared
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -q -r .shared/scripts/requirements-autofix.txt
+      - name: Propose the documentation structure
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.openrouter_api_key }}
+          OPENROUTER_MODEL: ${{ inputs.openrouter_model }}
+          OPENROUTER_ENDPOINT: ${{ inputs.openrouter_endpoint }}
+          OPENROUTER_SITE_URL: ${{ inputs.openrouter_site_url }}
+          OPENROUTER_APP_NAME: ${{ inputs.openrouter_app_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 .shared/scripts/agent_pipeline.py docs-plan \
+            --ai-script .shared/scripts/openrouter_ai.py \
+            --max-chars ${{ inputs.max_chars }} \
+            --repo "${{ github.repository }}" \
+            ${{ inputs.post_issue && '--post-issue' || '' }}
+      - name: Upload the proposal
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-architect-proposal
+          path: .ai/docs-architect
+          if-no-files-found: ignore
+          include-hidden-files: true
+          retention-days: 30
