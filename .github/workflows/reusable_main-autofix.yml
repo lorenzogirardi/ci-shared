@@ -66,7 +66,7 @@ on:
         required: true
       autofix_push_token:
         description: >
-          Strongly recommended (fine-grained PAT, Contents: Read/write +
+          Required (the job fails fast without it) (fine-grained PAT, Contents: Read/write +
           Pull requests: Read/write, scoped to this repo only). Without it
           both the branch push AND `gh pr create` authenticate as
           GITHUB_TOKEN, and GitHub's recursive-workflow guard silently
@@ -92,6 +92,15 @@ jobs:
       # must be the PAT, not github.token, whenever one is configured.
       GH_TOKEN: ${{ secrets.autofix_push_token || github.token }}
     steps:
+      - name: Require the push token
+        env:
+          PUSH_TOKEN: ${{ secrets.autofix_push_token }}
+        run: |
+          if [ -z "$PUSH_TOKEN" ]; then
+            echo "::error::autofix_push_token is not set. Without it the fix PR is created as GITHUB_TOKEN and GitHub suppresses its pull_request event, so the PR gate never runs on it. Add the AUTOFIX_PUSH_TOKEN secret."
+            exit 1
+          fi
+
       - name: Checkout caller repo
         uses: actions/checkout@v4
         with:
