@@ -132,13 +132,17 @@ def remote(tmp_path, monkeypatch):
 
 
 def guard_env(monkeypatch, sha, *, subject="feat: bad change (#4)", jobs=("build", "k8s-check"), previous="success",
-              reverts=0, conclusion="failure"):
-    calls = []
+              reverts=0, conclusion="failure", attempt=2):
+    calls = type("Calls", (list,), {})()
+    reruns = []
+    monkeypatch.setattr(ap, "rerun_failed_jobs", lambda repo, run_id: reruns.append((repo, run_id)) or True)
+    calls.reruns = reruns
 
     def fake_gh_json(args):
         url = args[0]
         if url.endswith("/actions/runs/9"):
-            return {"head_sha": sha, "head_branch": "main", "conclusion": conclusion, "workflow_id": 7, "run_number": 12}
+            return {"head_sha": sha, "head_branch": "main", "conclusion": conclusion, "workflow_id": 7, "run_number": 12,
+                    "run_attempt": attempt}
         if f"/commits/{sha}" in url and "?" not in url:
             return {"commit": {"message": subject + "\n\nbody"}}
         if url.endswith("/runs/9/jobs?per_page=100"):
@@ -226,6 +230,22 @@ class TestMainGuard:
         assert git("--git-dir", str(origin), "rev-parse", "main") == sha                  # main untouched
         assert not any(c[:2] == ("issue", "create") for c in calls)
         assert any(why in " ".join(c) for c in calls)                                     # and it says why, on the commit
+
+    def test_a_first_failure_is_re_run_once_before_anything_is_reverted(self, remote, monkeypatch):
+        origin, sha = remote
+        calls = guard_env(monkeypatch, sha, attempt=1)
+        assert ap.cmd_main_guard(guard_args()) == 0
+        assert calls.reruns == [("o/r", 9)]                                                # only the failed jobs, once
+        assert git("--git-dir", str(origin), "rev-parse", "main") == sha                  # nothing reverted yet
+        assert not any(c[:2] == ("issue", "create") for c in calls)
+        assert any("rule out a flake" in " ".join(c) for c in calls)
+
+    def test_the_second_failure_is_judged_for_real(self, remote, monkeypatch):
+        origin, sha = remote
+        calls = guard_env(monkeypatch, sha, attempt=2)
+        assert ap.cmd_main_guard(guard_args()) == 0
+        assert calls.reruns == []                                                          # no endless re-run loop
+        assert git("--git-dir", str(origin), "show", "main:x") == "1"                     # reverted
 
     def test_a_green_or_foreign_run_is_ignored(self, remote, monkeypatch):
         origin, sha = remote
