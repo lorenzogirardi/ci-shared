@@ -235,7 +235,7 @@ jobs:
           printf '%s\n' "$VERIFY_COMMAND" > .ai/verify-command.sh
 
       - name: Install autofix graph dependencies
-        # Only autofix_core.py needs this (langgraph); every other path in
+        # Only the agent engine needs this (langgraph); every other path in
         # pr_review_sweep.py stays stdlib-only, so skip the install entirely
         # when autofix is off.
         if: inputs.autofix || inputs.structured_review

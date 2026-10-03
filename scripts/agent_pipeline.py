@@ -180,13 +180,14 @@ def structured_review(caller: lib.ModelCaller, diff: str, title: str, body: str,
     return blocking == 0, text
 
 
-def final_review(caller: lib.ModelCaller, diff: str, plan: dict, prior: list[dict]):
+def final_review(caller: lib.ModelCaller, diff: str, plan: dict, prior: list[dict], guidance: str = ""):
     ranges = lib.diff_ranges(diff)
     user = (
         f"## Plan\n{json.dumps(plan, indent=2)}\n\n## Earlier findings (blocking, from previous rounds)\n"
         f"{json.dumps(prior, indent=2) if prior else '[]'}\n\n"
         f"## Current diff (lines are prefixed `L<number>|` with their line number in the new file)\n"
         f"{lib.annotate_diff(diff)}"
+        + (f"\n\n## Guidance from the maintainers of this repository\n{guidance}" if guidance.strip() else "")
     )
     found = lib.ask_json(caller, "final-reviewer", lib.load_prompt("final-reviewer"), user,
                          lambda d: lib.parse_findings(d, "final-reviewer"))
@@ -215,6 +216,7 @@ class Runtime:
     start: str = "write"      # "write" (issue), "verify" (existing PR), "review" (a push on main), "ci" (a failed CI run)
     fix_kind: str = "feat"    # conventional-commit type of the agent's commits
     write_tests: bool = True  # the test steward evaluates changes to application code
+    guidance: str = ""        # project-specific review guidance, shown to the reviewers
 
 
 class RunState(TypedDict, total=False):
@@ -550,13 +552,13 @@ def build_graph(rt: Runtime):
         }
 
     def n_review(state: RunState) -> dict:
-        result = review_diff(rt.caller, diff_since_base(rt.base_sha), state["plan"])
+        result = review_diff(rt.caller, diff_since_base(rt.base_sha), state["plan"], guidance=rt.guidance)
         if result is None:
             return stop(state, "escalated", "a reviewer did not return a usable reply, so the change could not be certified")
         return after_review(state, *result, "review")
 
     def n_final(state: RunState) -> dict:
-        result = final_review(rt.caller, diff_since_base(rt.base_sha), state["plan"], state.get("prior_blocking", []))
+        result = final_review(rt.caller, diff_since_base(rt.base_sha), state["plan"], state.get("prior_blocking", []), rt.guidance)
         if result is None:
             return stop(state, "escalated", "the final reviewer did not return a usable reply")
         return after_review(state, *result, "final")

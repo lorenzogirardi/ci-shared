@@ -1,4 +1,4 @@
-# Only needed by autofix_core.py's propose/explore/verify graph -- every
+# Only needed by the agent engine (agent_pipeline.py) -- every
 # other script in this repo (openrouter_ai.py, pr_review_sweep.py's non-
 # autofix paths) stays stdlib-only. Installed as a separate step so a caller
 # that never enables autofix never pays for it.

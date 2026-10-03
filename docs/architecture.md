@@ -36,7 +36,7 @@ ci-shared/
 ├── .github/workflows/
 │   ├── reusable_pr-diff-review.yml    review + comment only, contents: read
 │   ├── reusable_pr-review-sweep.yml   scheduled sweep: review, merge, self-repair
-│   ├── reusable_main-autofix.yml      no-PR case: broken push to main -> a new fix PR
+│   ├── reusable_agent-*.yml           the agent engine's workflows (pipeline, change, merge, main guard, ...)
 │   ├── reusable_ci-analysis.yml       post-pipeline informative report
 │   └── test.yml                       CI for this repo's own scripts
 ├── prompts/
@@ -47,14 +47,14 @@ ci-shared/
 │   ├── ai_append_cost.py   append a token-usage/cost footer to a report
 │   ├── render_prompt.py    fills the shared template with per-caller context
 │   ├── pr_review_sweep.py  the sweep's own logic — review, merge gate, triage, autofix
-│   ├── autofix_core.py     the propose/explore/verify langgraph graph, shared by both autofix callers
-│   ├── main_autofix.py     no-PR autofix entrypoint: broken commit -> new branch -> new PR
+│   ├── agent_pipeline.py   the langgraph engine (replaced autofix_core.py): see README 'v2'
+│   ├── agent_lib.py        strict parsing, evidence, the weakening guard, isolated verify
 │   └── requirements-autofix.txt   the one non-stdlib dependency (langgraph), autofix-only
 ├── tests/
 │   ├── test_openrouter_ai.py     13 tests, mocked HTTP server, no network calls
 │   ├── test_pr_review_sweep.py   91 tests — verdict parsing, checks_state, autofix guardrails, auto_merge_authors
-│   ├── test_autofix_core.py      8 tests — the langgraph graph's control flow
-│   └── test_main_autofix.py      6 tests — the no-PR path's own plumbing
+│   ├── test_agent_pipeline.py    the engine's graph against real throwaway git repos
+│   └── test_merge_and_guard.py   merge gate and main guard (local bare remote)
 ├── README.md               quick-start / inputs reference
 └── docs/architecture.md    this file
 ```
@@ -636,6 +636,11 @@ unattended: `auto_merge_authors` keeps that to the dependency bot, so a
 human's PR gets autofixed on red CI but always waits for that human to
 merge it — the trust extended to `required_checks` covers "propose and push
 a candidate fix", never "land it without anyone looking."
+
+> **Historical.** `autofix_core.py`, `main_autofix.py` and `reusable_main-autofix.yml` were replaced by the engine in
+> `scripts/agent_pipeline.py` (README, section 'v2'). The design notes below record why the first loop looked the way it did;
+> its lessons (explore before editing, grep for every call site of a renamed symbol, prime the environment with the new
+> dependency) live on in the engine's repair path.
 
 #### The propose/explore/verify loop is a langgraph graph (`scripts/autofix_core.py`)
 
