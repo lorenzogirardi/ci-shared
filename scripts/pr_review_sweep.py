@@ -1134,17 +1134,32 @@ AUTOFIX_AUTHORS = frozenset({AUTOFIX_AUTHOR, "ci-shared agents"})   # the autofi
 ABANDONED_LABEL = "agent-abandoned"
 
 
-def pr_is_behind(repo: str, number: int) -> bool:
-    """True when the base branch has moved on since the PR's last CI run, so its checks describe
-    an old merge result. (GitHub computes mergeable_state lazily; 'unknown' counts as not behind.)"""
-    pr = gh_json([f"repos/{repo}/pulls/{number}"]) or {}
-    return pr.get("mergeable_state") == "behind"
+def pr_is_behind(repo: str, number: int, pr: dict | None = None) -> bool:
+    """True when the base branch has commits the PR does not, so its check results describe an old
+    merge result. Counted from the commits themselves (the compare API): GitHub's `mergeable_state`
+    only says "behind" when the repository requires branches to be up to date, which most do not."""
+    pr = pr or gh_json([f"repos/{repo}/pulls/{number}"]) or {}
+    base_ref, head_sha = (pr.get("base") or {}).get("ref"), (pr.get("head") or {}).get("sha")
+    if not base_ref or not head_sha:
+        return False
+    comparison = gh_json([f"repos/{repo}/compare/{base_ref}...{head_sha}"]) or {}
+    return int(comparison.get("behind_by") or 0) > 0
+
+
+def refresh_pr(repo: str, pr: dict) -> str:
+    """Get fresh CI results for a PR that fell behind, by the means that suits its author.
+    Renovate's own PRs are re-based by Renovate (label `rebase`): a branch edited by someone else
+    is one Renovate stops managing. Anyone else's branch gets the base merged in, with the push
+    token (a GITHUB_TOKEN update would not trigger CI). Returns what was done, or "" if nothing."""
+    number = pr["number"]
+    if ((pr.get("user") or {}).get("login") or "").lower().startswith("renovate"):
+        done = run(["gh", "api", "-X", "POST", f"repos/{repo}/issues/{number}/labels", "-f", "labels[]=rebase", "--silent"], check=False)
+        return "asked Renovate to rebase it" if done.returncode == 0 else ""
+    return "updated the branch" if update_branch(repo, number) else ""
 
 
 def update_branch(repo: str, number: int) -> bool:
-    """Merge the base branch into the PR branch so CI runs again on current code. Done with the push
-    token: an update made with GITHUB_TOKEN does not trigger the PR's workflows, which would leave
-    the PR with no check results at all."""
+    """Merge the base branch into the PR branch (push token: see refresh_pr)."""
     token = os.environ.get("UPDATE_TOKEN") or os.environ.get("GH_TOKEN", "")
     done = subprocess.run(["gh", "api", "-X", "PUT", f"repos/{repo}/pulls/{number}/update-branch"],
                           capture_output=True, text=True, env={**os.environ, "GH_TOKEN": token})
@@ -1352,13 +1367,14 @@ def main() -> int:
             continue
         if skip_prefixes and ((pr.get("head") or {}).get("ref") or "").startswith(skip_prefixes):
             continue
-        if args.update_behind and pr_is_behind(args.repo, number):
-            if update_branch(args.repo, number):
-                print(f"PR #{number} was behind {pr['base']['ref']}: updated it; its CI runs again and the sweep that "
-                      "follows judges the new result.")
+        if args.update_behind and pr_is_behind(args.repo, number, pr):
+            did = refresh_pr(args.repo, pr)
+            if did:
+                print(f"PR #{number} is behind {pr['base']['ref']}: {did}; its CI runs again on current code and the "
+                      "sweep that follows judges the new result.")
                 skipped += 1
                 continue
-            print(f"::warning::could not update PR #{number}; judging it as it is")
+            print(f"::warning::could not refresh PR #{number}; judging it as it is")
 
         existing = existing_sweep_comment(args.repo, number)
         existing_body = (existing or {}).get("body") or ""
