@@ -182,3 +182,47 @@ class TestFinalGateStopsPublishing:
         monkeypatch.setattr(ap, "invoke_with_retry", engine)
         ap.cmd_change(self.args(repo))
         assert json.loads(pathlib.Path(".ai/agent-run/result.json").read_text())["outcome"] == "converged"
+
+
+class TestNoAgentWeakensTests:
+    """Found live on a real PR: the weakening guard only covered the test steward; the writer could edit a
+    test without it. The rule is about the tests, not about which role touches them."""
+
+    TEST_FILE = "tests/test_a.py"
+    GOOD = "def test_a():\n    assert f(1) == 1\n    assert f(2) == 2\n"
+
+    def seed(self, repo):
+        commit({self.TEST_FILE: self.GOOD, "app.py": "def f(x): return x\n"})
+        return git("rev-parse", "HEAD")
+
+    def test_the_writer_cannot_drop_an_assertion_to_get_green(self, repo):
+        self.seed(repo)
+        guts = fence({"explanation": "x", "changes": [{"file": self.TEST_FILE, "find": "    assert f(2) == 2\n", "replace": ""}]})
+        caller = FakeCaller({"writer": [guts]})
+        applied, _ = ap.run_writer(ap.Runtime(caller, repo, "true", 30, 3, 2, 3, "", "", 0), {"scope": ["s"], "out_of_scope": []}, "")
+        assert applied is None
+        assert pathlib.Path(self.TEST_FILE).read_text() == self.GOOD                  # reverted
+        assert "weakens the tests" in caller.log[1][1]
+
+    def test_the_writer_may_correct_an_outdated_test_without_weakening_it(self, repo):
+        self.seed(repo)
+        fix = fence({"explanation": "x", "changes": [{"file": self.TEST_FILE, "find": "f(2) == 2", "replace": "f(2) == 3"}]})
+        applied, _ = ap.run_writer(ap.Runtime(FakeCaller({"writer": [fix]}), repo, "true", 30, 3, 2, 3, "", "", 0),
+                                   {"scope": ["s"], "out_of_scope": []}, "")
+        assert applied is not None and "f(2) == 3" in pathlib.Path(self.TEST_FILE).read_text()
+
+    def test_the_final_gate_catches_weakening_in_commits_that_already_exist(self, repo):
+        base = self.seed(repo)
+        commit({self.TEST_FILE: "def test_a():\n    assert f(1) == 1\n"})
+        assert any("tests weakened" in v and "fewer assertions" in v for v in lib.policy_violations(base))
+
+    def test_a_pure_correction_or_an_addition_passes_the_final_gate(self, repo):
+        base = self.seed(repo)
+        commit({self.TEST_FILE: self.GOOD.replace("== 2", "== 3") + "\n\ndef test_b():\n    assert f(3) == 3\n"})
+        assert lib.policy_violations(base) == []
+
+    def test_a_deleted_test_file_is_weakening(self, repo):
+        base = self.seed(repo)
+        git("rm", "-q", self.TEST_FILE)
+        git("commit", "-qm", "remove the test")
+        assert any("was deleted" in v for v in lib.policy_violations(base))
