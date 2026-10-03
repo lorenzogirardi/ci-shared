@@ -1055,34 +1055,42 @@ def is_certified(comments: list[dict], head_sha: str, trusted: set[str]) -> bool
     return any(marker in (c.get("body") or "") and (c.get("user") or {}).get("login") in trusted for c in comments)
 
 
-def cmd_merge_gate(args: argparse.Namespace) -> int:
-    """Merge a pull request when, and only when: it is open, not abandoned, its
-    head commit is certified, the circuit breaker is closed, and the required
-    CI checks have succeeded on that same commit (try_merge)."""
-    pr = gh_json([f"repos/{args.repo}/pulls/{args.pr}"])
+def merge_one(args: argparse.Namespace, number: int) -> str:
+    """Merge one pull request when, and only when: it is open, not abandoned, its head commit is
+    certified, the circuit breaker is closed, and the required CI checks have succeeded on that same
+    commit (try_merge). Returns what happened, for the log."""
+    pr = gh_json([f"repos/{args.repo}/pulls/{number}"])
     if not pr or pr.get("state") != "open" or pr.get("draft"):
-        log("not mergeable: the PR is closed or a draft")
-        return 0
+        return "not mergeable: the PR is closed or a draft"
     head = pr["head"]["sha"]
     if ((pr["head"].get("repo") or {}).get("full_name")) != args.repo:
-        log("not merging a PR from a fork")
-        return 0
+        return "not merging a PR from a fork"
     if ABANDONED_LABEL in {label["name"] for label in pr.get("labels", [])}:
-        log("not merging: the agent abandoned this change")
-        return 0
-    comments = gh_json([f"repos/{args.repo}/issues/{args.pr}/comments?per_page=100"]) or []
+        return "not merging: the agent abandoned this change"
+    comments = gh_json([f"repos/{args.repo}/issues/{number}/comments?per_page=100"]) or []
     trusted = {t.strip() for t in args.trusted.split(",") if t.strip()}
     if not is_certified(comments, head, trusted):
-        log(f"not merging: nothing certifies {head[:7]} yet (a later run, or the next push, will)")
-        return 0
+        return f"not merging: nothing certifies {head[:7]} yet (a later run, or the next push, will)"
     reverts = recent_reverts(args.repo, args.base_branch)
     if reverts >= args.max_reverts:
-        log(f"not merging: circuit breaker open ({reverts} automatic reverts in 24h). Merging resumes by itself as they age out.")
-        return 0
+        return f"not merging: circuit breaker open ({reverts} automatic reverts in 24h). Merging resumes by itself as they age out."
     required = tuple(c.strip() for c in args.required_checks.split(",") if c.strip())
-    outcome = try_merge(args.repo, args.pr, head, args.merge_method, required,
-                        poll_seconds=args.poll_seconds, poll_interval=15)
-    log(f"merge gate: {outcome}")
+    return "merge gate: " + try_merge(args.repo, number, head, args.merge_method, required,
+                                      poll_seconds=args.poll_seconds, poll_interval=15)
+
+
+def cmd_merge_gate(args: argparse.Namespace) -> int:
+    """Run the merge gate on one pull request, or (--pr 0) on every open one. The sweep over all of them
+    is what makes the gate impossible to miss: whichever finishes first, certification or CI, and whatever
+    event is lost, the next push or the schedule picks it up. Renovate's PRs belong to the sweep."""
+    numbers = [args.pr]
+    if not args.pr:
+        listed = gh_json([f"repos/{args.repo}/pulls?state=open&per_page=100"]) or []
+        numbers = [p["number"] for p in listed if not ((p.get("user") or {}).get("login") or "").lower().startswith("renovate")]
+    for number in numbers:
+        log(f"PR #{number}: {merge_one(args, number)}")
+    if not numbers:
+        log("no open pull requests for the merge gate")
     return 0
 
 
@@ -1443,7 +1451,7 @@ def main() -> int:
 
     mg = sub.add_parser("merge-gate", help="merge a certified PR whose CI is green")
     mg.add_argument("--repo", required=True)
-    mg.add_argument("--pr", type=int, required=True)
+    mg.add_argument("--pr", type=int, default=0, help="0 = every open pull request (except Renovate's)")
     mg.add_argument("--base-branch", default="main")
     mg.add_argument("--required-checks", default="")
     mg.add_argument("--merge-method", default="squash", choices=("merge", "squash", "rebase"))

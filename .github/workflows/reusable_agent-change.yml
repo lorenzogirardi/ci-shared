@@ -44,7 +44,7 @@ on:
         type: string
         default: ''
       trusted_logins:
-        description: 'Accounts whose certification comments count. Empty = the repository owner.'
+        description: 'Accounts whose certification comments count. Empty = the repository owner and github-actions[bot].'
         required: false
         type: string
         default: ''
@@ -231,7 +231,7 @@ jobs:
         if: steps.guard.outputs.skip != 'true' && inputs.mode != 'push' && inputs.required_checks != ''
         env:
           GH_TOKEN: ${{ secrets.agent_push_token }}
-          TRUSTED: ${{ inputs.trusted_logins || github.repository_owner }}
+          TRUSTED: ${{ inputs.trusted_logins || format('{0},github-actions[bot]', github.repository_owner) }}
         run: |
           python3 .shared/scripts/agent_pipeline.py merge-gate \
             --repo "${{ github.repository }}" --pr ${{ steps.prepare.outputs.pr }} \
