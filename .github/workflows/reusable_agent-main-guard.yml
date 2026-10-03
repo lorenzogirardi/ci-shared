@@ -1,10 +1,12 @@
 name: Reusable Agent Main Guard
 
 # The safety net after the merge. Called when the pipeline on the base branch
-# FAILED. If a code change plausibly caused it, that commit is reverted at once
-# (git revert, pushed with the agent token) and an issue labelled `agent` is
-# opened with the failure, so the whole pipeline redoes the change knowing why
-# it broke. It does NOT revert when: the failed jobs are not ones a code change
+# FAILED. If a code change plausibly caused it, the branch goes back to the last
+# GREEN state at once: every change since the last green run is reverted in one
+# commit (several can land between two runs, so the tip is not necessarily the
+# culprit; bookkeeping commits are left alone), pushed with the agent token, and
+# an issue labelled `agent` is opened with the failure, so the whole pipeline
+# redoes the change knowing why it broke. It does NOT revert when: the failed jobs are not ones a code change
 # causes (scanners, SBOM), the branch was already red before the commit, the
 # commit is itself an automatic revert, or the circuit breaker is open.
 # No repository code runs here.

@@ -1130,14 +1130,24 @@ def cmd_main_guard(args: argparse.Namespace) -> int:
     header = base64.b64encode(f"x-access-token:{token}".encode()).decode()
     git("config", "user.name", AGENT_AUTHOR)
     git("config", "user.email", "actions@github.com")
-    message = (f"{REVERT_PREFIX}: {subject} (pipeline red)\n\nReverts {sha}. Failed jobs: {', '.join(failed)}.\n"
-               "An issue labelled `agent` redoes the change.")
+    # Back to the last green state. Several commits can land between two pipeline runs, and the tip
+    # is not necessarily the culprit, so every change since the last green run is taken out
+    # (the pipeline's own bookkeeping commits are left alone: reverting them would only churn).
+    suspects = [c for c in git("rev-list", "--reverse", f"{previous['head_sha']}..{sha}").stdout.split()
+                if not _BOT_SUBJECT.match(git("log", "-1", "--format=%s", c).stdout.strip())]
+    if not suspects:
+        return note("not reverting: nothing but bookkeeping commits landed since the last green run")
+    subjects = [git("log", "-1", "--format=%s", c).stdout.strip() for c in suspects]
+    label = subjects[-1] if len(suspects) == 1 else f"{len(suspects)} commits since the last green run"
+    message = (f"{REVERT_PREFIX}: {label} (pipeline red)\n\nReverts: " + "; ".join(f"{c[:7]} {t}" for c, t in zip(suspects, subjects))
+               + f".\nFailed jobs: {', '.join(failed)}.\nAn issue labelled `agent` redoes the change.")
     for attempt in range(1, 4):
         git("fetch", "--quiet", "origin", args.base_branch)
         git("checkout", "--quiet", "-B", args.base_branch, f"origin/{args.base_branch}")
-        if git("revert", "--no-commit", sha).returncode != 0:
+        if any(git("revert", "--no-commit", c).returncode != 0 for c in reversed(suspects)):
             git("revert", "--abort")
-            return note(f"could not revert {sha[:7]} cleanly (later commits depend on it); leaving the branch as it is")
+            git("reset", "--hard", f"origin/{args.base_branch}")
+            return note("could not revert cleanly (later commits depend on it); leaving the branch as it is")
         git("commit", "--quiet", "-m", message)
         pushed = subprocess.run(["git", "-c", f"http.https://github.com/.extraheader=AUTHORIZATION: basic {header}",
                                  "push", "--quiet", "origin", f"HEAD:refs/heads/{args.base_branch}"],
@@ -1148,13 +1158,16 @@ def cmd_main_guard(args: argparse.Namespace) -> int:
             print(f"::error::revert push rejected: {pushed.stderr.replace(header, '***')[:300]}", file=sys.stderr)
             return 1
     logs = collect_failure_logs(args.repo, sha, 6000) or "(no log excerpt available)"
-    body = (f"The pipeline went red after `{sha[:7]}` (\"{subject}\") merged, so it was reverted automatically.\n\n"
+    listing = "\n".join(f"- `{c[:7]}` {t}" for c, t in zip(suspects, subjects))
+    body = (f"The pipeline went red after `{sha[:7]}`, so the changes since the last green run were reverted automatically:\n\n{listing}\n\n"
             f"Failed jobs: {', '.join(failed)}.\n\n## Failure\n```\n{logs[-5000:]}\n```\n\n"
-            f"Implement the original change again: `{subject}`. It must not break the failing checks above.")
-    created = _gh("issue", "create", "--repo", args.repo, "--title", f"Redo: {subject}"[:200], "--body", body, "--label", "agent")
+            "Implement these changes again. They must not break the failing checks above.")
+    title = f"Redo: {subjects[-1]}" if len(suspects) == 1 else f"Redo: {len(suspects)} reverted changes"
+    created = _gh("issue", "create", "--repo", args.repo, "--title", title[:200], "--body", body, "--label", "agent")
     if created.returncode != 0:     # the label may not exist yet: still record the work to redo
-        created = _gh("issue", "create", "--repo", args.repo, "--title", f"Redo: {subject}"[:200], "--body", body)
-    log(f"reverted {sha[:7]}; redo issue: {created.stdout.strip() or created.stderr.strip()[:200]}")
+        created = _gh("issue", "create", "--repo", args.repo, "--title", title[:200], "--body", body)
+    log(f"reverted {len(suspects)} change(s) since the last green run; redo issue: "
+        f"{created.stdout.strip() or created.stderr.strip()[:200]}")
     return 0
 
 

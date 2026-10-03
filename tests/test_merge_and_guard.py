@@ -122,6 +122,7 @@ def remote(tmp_path, monkeypatch):
     git("add", "-A", cwd=work)
     git("commit", "-qm", "feat: good", cwd=work)
     git("push", "-q", "origin", "HEAD:main", cwd=work)
+    monkeypatch.setattr(sys.modules[__name__], "GREEN_SHA", git("rev-parse", "HEAD", cwd=work), raising=False)
     (work / "x").write_text("2\n")
     git("add", "-A", cwd=work)
     git("commit", "-qm", "feat: bad change (#4)\n\nbody", cwd=work)
@@ -143,7 +144,8 @@ def guard_env(monkeypatch, sha, *, subject="feat: bad change (#4)", jobs=("build
         if url.endswith("/runs/9/jobs?per_page=100"):
             return {"jobs": [{"name": j, "conclusion": "failure"} for j in jobs] + [{"name": "docker-sbom", "conclusion": "success"}]}
         if "/workflows/7/runs" in url:
-            return {"workflow_runs": [{"run_number": 12, "conclusion": "failure"}, {"run_number": 11, "conclusion": previous}]}
+            return {"workflow_runs": [{"run_number": 12, "conclusion": "failure"},
+                                      {"run_number": 11, "conclusion": previous, "head_sha": GREEN_SHA}]}
         if "/commits?sha=" in url:
             return [{"commit": {"message": f"{ap.REVERT_PREFIX}: r"}}] * reverts
         raise AssertionError(url)
@@ -156,6 +158,9 @@ def guard_env(monkeypatch, sha, *, subject="feat: bad change (#4)", jobs=("build
     monkeypatch.setattr(ap, "collect_failure_logs", lambda *a, **k: "FAILED tests/integration/test_mgmt.py::test_x")
     monkeypatch.setenv("AGENT_PUSH_TOKEN", "tok")
     return calls
+
+
+GREEN_SHA = ""
 
 
 def guard_args():
@@ -173,6 +178,40 @@ class TestMainGuard:
         assert git("--git-dir", str(origin), "log", "-1", "--format=%an", "main") == ap.AGENT_AUTHOR
         issue = next(c for c in calls if c[:2] == ("issue", "create"))
         assert "agent" in issue and "Redo: feat: bad change (#4)" in issue
+
+    def test_several_commits_between_runs_all_go_back_to_the_last_green_state(self, remote, monkeypatch):
+        origin, _ = remote
+        work = pathlib.Path.cwd()
+        (work / "y").write_text("y\n")
+        git("add", "-A")
+        git("commit", "-qm", "Done  by Github Actions   Job changemanifest: 9")        # bookkeeping: left alone
+        (work / "z").write_text("z\n")
+        git("add", "-A")
+        git("commit", "-qm", "feat: second change")
+        git("push", "-q", "origin", "HEAD:main")
+        tip = git("rev-parse", "HEAD")
+        calls = guard_env(monkeypatch, tip, subject="feat: second change")
+        assert ap.cmd_main_guard(guard_args()) == 0
+        assert git("--git-dir", str(origin), "show", "main:x") == "1"                 # the bad change is out too
+        assert git("--git-dir", str(origin), "show", "main:y") == "y"                 # bookkeeping stays
+        with pytest.raises(subprocess.CalledProcessError):
+            git("--git-dir", str(origin), "show", "main:z")                           # second change reverted
+        subject = git("--git-dir", str(origin), "log", "-1", "--format=%s", "main")
+        assert subject.startswith(f"{ap.REVERT_PREFIX}: 2 commits since the last green run")
+        issue = next(c for c in calls if c[:2] == ("issue", "create"))
+        assert "Redo: 2 reverted changes" in issue
+
+    def test_only_bookkeeping_since_the_last_green_run_is_not_reverted(self, remote, monkeypatch):
+        origin, sha = remote
+        work = pathlib.Path.cwd()
+        git("reset", "-q", "--hard", GREEN_SHA)
+        git("commit", "-q", "--allow-empty", "-m", "docs(changelog): update for abc1234")
+        git("push", "-q", "-f", "origin", "HEAD:main")
+        tip = git("rev-parse", "HEAD")
+        calls = guard_env(monkeypatch, tip, subject="docs(changelog): update for abc1234")
+        assert ap.cmd_main_guard(guard_args()) == 0
+        assert git("--git-dir", str(origin), "rev-parse", "main") == tip and work.exists()
+        assert not any(c[:2] == ("issue", "create") for c in calls)
 
     @pytest.mark.parametrize("kwargs,why", [
         ({"jobs": ("security-gate-trivy",)}, "not ones a code change causes"),
