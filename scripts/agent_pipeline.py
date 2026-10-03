@@ -1091,6 +1091,14 @@ def failing_job_names(repo: str, run_id: int) -> list[str]:
     return [j["name"] for j in jobs if j.get("conclusion") == "failure"]
 
 
+def rerun_failed_jobs(repo: str, run_id: int) -> bool:
+    """Ask GitHub to run only the failed jobs of this run again (a new attempt of the same run)."""
+    token = os.environ.get("RERUN_TOKEN") or os.environ.get("GH_TOKEN", "")
+    done = subprocess.run(["gh", "api", "-X", "POST", f"repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs"],
+                          capture_output=True, text=True, env={**os.environ, "GH_TOKEN": token})
+    return done.returncode == 0
+
+
 def cmd_main_guard(args: argparse.Namespace) -> int:
     """The base branch went red after a merge. If a code change plausibly caused
     it, take the change out at once (git revert, pushed with the agent token) and
@@ -1122,6 +1130,13 @@ def cmd_main_guard(args: argparse.Namespace) -> int:
         return note("not reverting: the branch was already red before this commit, so it is not the cause")
     if recent_reverts(args.repo, args.base_branch) >= args.max_reverts:
         return note("not reverting: circuit breaker open (too many automatic reverts in 24h)")
+    if int(run.get("run_attempt") or 1) < 2:
+        # A failure seen once may be a flake (a start-up race, a slow runner). Run only the failed
+        # jobs again; this guard is triggered again when that attempt finishes. Only a failure that
+        # repeats is treated as caused by the change. A run that passes the second time ends here.
+        if rerun_failed_jobs(args.repo, args.run_id):
+            return note(f"re-running the failed jobs ({', '.join(failed)}) once before reverting anything, to rule out a flake")
+        log("could not re-run the failed jobs; judging the first failure")
 
     token = os.environ.get("AGENT_PUSH_TOKEN", "")
     if not token:

@@ -36,6 +36,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: write      # re-run the failed jobs once, to rule out a flake, before reverting
     steps:
       - name: Checkout the base branch (full history, no credentials kept)
         uses: actions/checkout@v4
@@ -57,6 +58,7 @@ jobs:
         env:
           AGENT_PUSH_TOKEN: ${{ secrets.agent_push_token }}
           GH_TOKEN: ${{ secrets.agent_push_token }}
+          RERUN_TOKEN: ${{ github.token }}
         run: |
           python3 .shared/scripts/agent_pipeline.py main-guard \
             --repo "${{ github.repository }}" --run-id ${{ inputs.run_id }} \
