@@ -4,6 +4,13 @@ name: Reusable Agent Change
 #   mode: pr    a pull request. Checks -> reviewer A + B -> bounded fix loop
 #               (the agent pushes fix commits to the PR branch) -> final reviewer
 #               -> documentation reviewer. One edited comment on the PR.
+#   mode: ci    a CI run on a PR just FAILED (called from a workflow_run trigger).
+#               The failing checks' own logs are the first input; each failing
+#               test gets a verdict (code wrong, test wrong, environment,
+#               preexisting) before anything is changed. Tests are the
+#               specification: the code is fixed unless the PR's own stated
+#               intent explicitly redefines the test. Stops after N consecutive
+#               agent commits that still fail CI (max_ci_attempts).
 #   mode: push  a push straight to the default branch with no PR. Same review;
 #               if blocking findings need a fix it opens a PR from agent/push-<sha>
 #               (never pushes to the default branch). Advisory findings are left
@@ -24,13 +31,18 @@ on:
   workflow_call:
     inputs:
       mode:
-        description: '"pr" or "push"'
+        description: '"pr", "push" or "ci"'
         required: true
         type: string
       base_branch:
         required: false
         type: string
         default: 'main'
+      max_ci_attempts:
+        description: 'mode ci: consecutive agent commits on a branch that may still fail CI before the agent stops.'
+        required: false
+        type: number
+        default: 3
       python_version:
         required: false
         type: string
@@ -90,11 +102,12 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      actions: read
     steps:
       - name: Checkout the change (no credentials kept)
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.mode == 'pr' && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ inputs.mode == 'pr' && github.event.pull_request.head.sha || inputs.mode == 'ci' && github.event.workflow_run.head_sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -117,9 +130,20 @@ jobs:
         id: guard
         env:
           GH_TOKEN: ${{ github.token }}
+          MODE: ${{ inputs.mode }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          FAILED_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           python3 .shared/scripts/agent_pipeline.py guard-change \
-            --mode "${{ inputs.mode }}" --repo "${{ github.repository }}" --sha "$(git rev-parse HEAD)"
+            --mode "$MODE" --repo "${{ github.repository }}" --sha "$(git rev-parse HEAD)" \
+            --max-streak ${{ inputs.max_ci_attempts }}
+          # A failed run for a commit that is no longer the PR head is stale: a
+          # newer push (often the agent's own fix) already superseded it. The
+          # last write to GITHUB_OUTPUT wins.
+          if [ "$MODE" = "ci" ] && [ "$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq '.head.sha')" != "$FAILED_SHA" ]; then
+            echo "stale: the PR head moved on since this CI run"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Prepare the request (title, description, base) as data files
         id: prepare
@@ -127,17 +151,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           MODE: ${{ inputs.mode }}
-          PR_API: repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PUSH_BEFORE: ${{ github.event.before }}
           VERIFY_COMMAND: ${{ inputs.verify_command }}
         run: |
           set -euo pipefail
           mkdir -p .ai
-          if [ "$MODE" = "pr" ]; then
+          if [ "$MODE" = "pr" ] || [ "$MODE" = "ci" ]; then
+            PR_API="repos/${{ github.repository }}/pulls/$PR_NUMBER"
             gh api "$PR_API" --jq '.title' > .ai/change-title.txt
             gh api "$PR_API" --jq '.body // ""' > .ai/change-body.txt
             BASE="$PR_BASE"
+            if [ -z "$BASE" ]; then BASE="$(gh api "$PR_API" --jq '.base.sha')"; fi
+            echo "pr=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+            echo "head_ref=$(gh api "$PR_API" --jq '.head.ref')" >> "$GITHUB_OUTPUT"
           else
             git log -1 --format=%s > .ai/change-title.txt
             git log -1 --format=%b > .ai/change-body.txt
@@ -155,11 +183,18 @@ jobs:
           OPENROUTER_ENDPOINT: ${{ inputs.openrouter_endpoint }}
           OPENROUTER_SITE_URL: ${{ inputs.openrouter_site_url }}
           OPENROUTER_APP_NAME: ${{ inputs.openrouter_app_name }}
+          # mode ci reads the failing checks' logs through the API. This is the
+          # job's GITHUB_TOKEN (contents: read); the verify command never sees it.
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 .shared/scripts/agent_pipeline.py change \
+          CI_ARGS=""
+          if [ "${{ inputs.mode }}" = "ci" ]; then
+            CI_ARGS="--ci-repo ${{ github.repository }} --ci-sha ${{ github.event.workflow_run.head_sha }}"
+          fi
+          python3 .shared/scripts/agent_pipeline.py change $CI_ARGS \
             --ai-script .shared/scripts/openrouter_ai.py \
-            --mode "${{ inputs.mode }}" \
+            --mode "$([ "${{ inputs.mode }}" = "ci" ] && echo pr || echo "${{ inputs.mode }}")" \
             --base-sha "${{ steps.prepare.outputs.base }}" \
             --title-file .ai/change-title.txt --body-file .ai/change-body.txt \
             --context-files "${{ inputs.context_files }}" \
@@ -170,14 +205,14 @@ jobs:
             --writer-rounds ${{ inputs.writer_rounds }}
 
       - name: Publish on the pull request (fixes pushed to its branch, one comment)
-        if: steps.guard.outputs.skip != 'true' && inputs.mode == 'pr'
+        if: steps.guard.outputs.skip != 'true' && inputs.mode != 'push'
         env:
           AGENT_PUSH_TOKEN: ${{ secrets.agent_push_token }}
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 .shared/scripts/agent_pipeline.py publish-pr \
-            --repo "${{ github.repository }}" --pr ${{ github.event.pull_request.number }} \
-            --head-ref "${{ github.event.pull_request.head.ref }}"
+            --repo "${{ github.repository }}" --pr ${{ steps.prepare.outputs.pr }} \
+            --head-ref "${{ steps.prepare.outputs.head_ref }}"
 
       - name: Publish for a push (fix PR if needed, commit comment for the rest)
         if: steps.guard.outputs.skip != 'true' && inputs.mode == 'push'

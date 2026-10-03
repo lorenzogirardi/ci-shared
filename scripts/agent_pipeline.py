@@ -40,7 +40,7 @@ from langgraph.graph import END, StateGraph
 
 import agent_lib as lib
 from changelog_update import add_entry
-from pr_review_sweep import _parse_json_reply, build_diff, gh_json, post_comment
+from pr_review_sweep import _parse_json_reply, build_diff, collect_failure_logs, gh_json, post_comment
 
 OUT_DIR = pathlib.Path(".ai/agent-run")
 BRANCH_PREFIX = "agent/issue-"
@@ -194,8 +194,9 @@ class Runtime:
     context: str
     changelog_path: str
     issue_number: int
-    start: str = "write"      # "write" (issue), "verify" (existing PR), "review" (a push already on main)
+    start: str = "write"      # "write" (issue), "verify" (existing PR), "review" (a push on main), "ci" (a failed CI run)
     fix_kind: str = "feat"    # conventional-commit type of the agent's commits
+    write_tests: bool = True  # the test steward evaluates changes to application code
 
 
 class RunState(TypedDict, total=False):
@@ -211,6 +212,11 @@ class RunState(TypedDict, total=False):
     notes: list
     route: str
     outcome: str
+    failure_output: str
+    verdicts: list
+    adjudications: list
+    tests_done: int
+    applied_kind: str
 
 
 def is_doc_path(path: str) -> bool:
@@ -280,6 +286,73 @@ def run_writer(rt: Runtime, plan: dict, feedback: str):
     return None, "the writer used all its rounds without producing a valid change"
 
 
+# ---------------------------------------------------------------------------
+# Failing tests: who is wrong, the code or the test?
+# ---------------------------------------------------------------------------
+
+CLASSES = ("code_defect", "test_defect", "environment", "preexisting")
+MIN_QUOTE = 12
+
+
+def _squash(text: str) -> str:
+    return re.sub(r"\s+", " ", text.lower()).strip()
+
+
+def intent_text(plan: dict) -> str:
+    """What the change says it is for: the only thing that can justify
+    redefining behaviour a test checks."""
+    return "\n".join([plan.get("summary", ""), *plan.get("scope", []), *plan.get("acceptance_criteria", [])])
+
+
+def parse_verdicts(data: dict, tests: list[str]) -> list[dict] | None:
+    if not isinstance(data, dict) or not isinstance(data.get("verdicts"), list):
+        return None
+    out = []
+    for item in data["verdicts"]:
+        if not isinstance(item, dict) or item.get("test") not in tests or item.get("classification") not in CLASSES:
+            continue
+        out.append({"test": item["test"], "classification": item["classification"],
+                    "confidence": str(item.get("confidence", "medium")),
+                    "intent_evidence": item.get("intent_evidence") if isinstance(item.get("intent_evidence"), str) else "",
+                    "reason": str(item.get("reason", ""))})
+    return out
+
+
+def apply_rules(verdicts: list[dict], tests: list[str], evidence: dict, intent: str) -> list[dict]:
+    """The model proposes, the code decides. Deterministic evidence overrides it
+    (a test that passes on re-run is flaky; one that also fails on the base
+    commit is not this change's fault), a missing verdict means code_defect, and
+    `test_defect` stands only if the model quoted the stated intent verbatim."""
+    by_test = {v["test"]: dict(v) for v in verdicts}
+    final = []
+    for test in tests:
+        v = by_test.get(test) or {"test": test, "classification": "code_defect", "confidence": "low",
+                                  "intent_evidence": "", "reason": "no verdict was returned for this test"}
+        hint = evidence.get(test, {}).get("hint")
+        if hint == "flaky":
+            v["classification"], v["reason"] = "environment", v["reason"] + " [it passed on re-run: flaky]"
+        elif hint == "preexisting":
+            v["classification"], v["reason"] = "preexisting", v["reason"] + " [it already fails on the base commit]"
+        elif v["classification"] == "test_defect":
+            quote = _squash(v.get("intent_evidence", ""))
+            if len(quote) < MIN_QUOTE or quote not in _squash(intent):
+                v["classification"] = "code_defect"
+                v["reason"] += " [downgraded: no verbatim quote of the stated intent justifies changing the test]"
+        final.append(v)
+    return final
+
+
+def uncommitted_sources(applied: dict | None, limit: int = 6000) -> str:
+    if not applied:
+        return ""
+    parts = []
+    for name in applied["edited"] + applied["created"]:
+        path = pathlib.Path(name)
+        if path.is_file():
+            parts.append(f"### {name}\n{path.read_text(errors='replace')[:limit]}")
+    return "\n\n".join(parts)
+
+
 def build_graph(rt: Runtime):
     def stop(state: RunState, outcome: str, note: str) -> dict:
         return {"route": "end", "outcome": outcome, "notes": state.get("notes", []) + [note]}
@@ -292,6 +365,63 @@ def build_graph(rt: Runtime):
         return {"route": "verify", "applied": {"edited": applied.edited, "created": applied.created},
                 "explanation": text}
 
+    def adjudicate(state: RunState, output: str):
+        """(verdicts, evidence) for the failing tests in `output`, or None when
+        the failure is not a test failure (lint, collection) and needs no verdict."""
+        tests = lib.parse_failed_tests(output)
+        if not tests:
+            return None
+        evidence = lib.gather_evidence(tests, rt.base_sha)
+        intent = intent_text(state["plan"])
+        sources = "\n\n".join(
+            f"### {path}\n{pathlib.Path(path).read_text(errors='replace')[:4000]}"
+            for path in sorted({t.split("::")[0] for t in tests}) if pathlib.Path(path).is_file())
+        user = (f"## Stated intent of the change\n{intent}\n\n## Failing tests\n" + "\n".join(tests)
+                + f"\n\n## Failing output\n{output[-4000:]}\n\n## Deterministic evidence per failing test\n"
+                + json.dumps(evidence, indent=2)
+                + f"\n\n## Diff already committed on this branch\n{diff_since_base(rt.base_sha)[:20000]}"
+                + (f"\n\n## Change being tested right now (not committed yet)\n{uncommitted_sources(state.get('applied'))}"
+                   if state.get("applied") else "")
+                + f"\n\n## Source of the failing tests\n{sources}")
+        verdicts = lib.ask_json(rt.caller, "failure-adjudicator", lib.load_prompt("failure-adjudicator"), user,
+                                lambda d: parse_verdicts(d, tests))
+        return apply_rules(verdicts or [], tests, evidence, intent), evidence
+
+    def handle_failure(state: RunState, output: str, applied: lib.Applied | None) -> dict:
+        """Where a failed deterministic check goes next. Tests are the
+        specification: unless the change's own stated intent redefines a test,
+        the code is fixed, never the test."""
+        attempts = state.get("verify_attempts", 0) + 1
+        notes = list(state.get("notes", []))
+        history = list(state.get("adjudications", []))
+        verdict_text = ""
+        result = adjudicate(state, output)
+        if result:
+            verdicts, _ = result
+            classes = {v["classification"] for v in verdicts}
+            history.append({"iteration": state["iteration"], "verdicts": verdicts})
+            notes.append("failure adjudication: " + "; ".join(f"{v['test']} -> {v['classification']}" for v in verdicts))
+            over = attempts > rt.max_verify_retries
+            if classes == {"test_defect"} and rt.write_tests and not over:
+                return {"route": "steward", "verify_attempts": attempts, "failure_output": output,
+                        "verdicts": verdicts, "notes": notes, "adjudications": history}
+            if classes == {"environment"} and not over:
+                return {"route": "verify", "verify_attempts": attempts, "notes": notes, "adjudications": history}
+            verdict_text = ("\n\nADJUDICATION. Tests are the specification, so the code must satisfy them. "
+                            "Verdicts:\n" + json.dumps([v for v in verdicts if v["classification"] != "environment"], indent=2))
+        if applied:
+            lib.revert(applied)
+            what = "your previous change (reverted)"
+        else:
+            what = "the change as submitted"
+        if attempts > rt.max_verify_retries:
+            return {**stop(state, "escalated" if state.get("committed") else "failed",
+                           f"deterministic checks still failing after {attempts} attempts:\n{output[-1500:]}"),
+                    "notes": notes + [f"deterministic checks still failing after {attempts} attempts:\n{output[-1500:]}"],
+                    "adjudications": history}
+        return {"route": "write", "verify_attempts": attempts, "applied": None, "notes": notes, "adjudications": history,
+                "feedback": f"FAILED VERIFICATION of {what}. Fix this:\n{output}{verdict_text}"}
+
     def n_verify(state: RunState) -> dict:
         ok, output = lib.run_verify_isolated(rt.verify_command, rt.verify_timeout)
         log(f"deterministic checks (iteration {state['iteration']}): {'passed' if ok else 'FAILED'}")
@@ -299,21 +429,86 @@ def build_graph(rt: Runtime):
         applied = lib.Applied(raw["edited"], raw["created"]) if raw else None
         if ok:
             if applied:
-                kind = rt.fix_kind if state["iteration"] == 1 else "fix"
+                kind = state.get("applied_kind") or (rt.fix_kind if state["iteration"] == 1 else "fix")
                 commit_round(f"{kind}(agent): {state['explanation'][:120]}\n\nIteration {state['iteration']} of the agent pipeline.")
-            return {"route": "review", "committed": bool(applied) or state.get("committed", False),
-                    "verify_attempts": 0, "applied": None}
+            needs_tests = rt.write_tests and state.get("tests_done") != state["iteration"]
+            return {"route": "tests" if needs_tests else "review",
+                    "committed": bool(applied) or state.get("committed", False),
+                    "verify_attempts": 0, "applied": None, "applied_kind": None}
+        return handle_failure(state, output, applied)
+
+    def n_ci_failure(state: RunState) -> dict:
+        return handle_failure(state, state.get("failure_output", ""), None)
+
+    def back_to_code(state: RunState, applied: lib.Applied | None, why: str) -> dict:
+        """The tests could not be updated legitimately, so the code is what
+        has to change."""
         if applied:
             lib.revert(applied)
-            what = "your previous change (reverted)"
-        else:
-            what = "the change as submitted"
-        attempts = state.get("verify_attempts", 0) + 1
-        if attempts > rt.max_verify_retries:
-            return stop(state, "escalated" if state.get("committed") else "failed",
-                        f"deterministic checks still failing after {attempts} attempts:\n{output[-1500:]}")
-        return {"route": "write", "verify_attempts": attempts, "applied": None,
-                "feedback": f"FAILED VERIFICATION of {what}. Fix this:\n{output}"}
+        return {"route": "write", "applied": None,
+                "notes": state.get("notes", []) + [why],
+                "feedback": f"FAILED VERIFICATION. The tests were judged to need updating but that was not possible ({why}). "
+                            f"Change the CODE so the tests pass:\n{state.get('failure_output', '')}"}
+
+    def merged(state: RunState, extra: lib.Applied) -> dict:
+        raw = state.get("applied") or {"edited": [], "created": []}
+        return {"edited": sorted(set(raw["edited"]) | set(extra.edited)), "created": sorted(set(raw["created"]) | set(extra.created))}
+
+    def n_steward(state: RunState) -> dict:
+        """Reactive: the adjudicator found the tests wrong, with a quote of the intent."""
+        raw = state.get("applied")
+        current = lib.Applied(raw["edited"], raw["created"]) if raw else None
+        wrong = [v for v in state["verdicts"] if v["classification"] == "test_defect"]
+        tests = [v["test"] for v in wrong]
+        sources = "\n\n".join(f"### {p}\n{pathlib.Path(p).read_text(errors='replace')[:6000]}"
+                               for p in sorted({t.split('::')[0] for t in tests}) if pathlib.Path(p).is_file())
+        user = (f"## Mode\nREACTIVE: these tests were judged wrong by the adjudicator.\n\n## Stated intent\n{intent_text(state['plan'])}"
+                f"\n\n## Verdicts\n{json.dumps(wrong, indent=2)}\n\n## Failing output\n{state.get('failure_output', '')[-4000:]}"
+                f"\n\n## Tests to update\n{sources}\n\n## Diff\n{diff_since_base(rt.base_sha)[:20000]}")
+        parsed = lib.ask_json(rt.caller, "test-steward", lib.load_prompt("test-steward"), user,
+                              lambda d: lib.parse_changes(d, allowed=lib.is_test_path))
+        if parsed is None or not parsed[0]:
+            return back_to_code(state, current, "the test steward returned no usable change")
+        changes, explanation = parsed
+        applied = lib.apply_changes(changes)
+        if applied.error:
+            return back_to_code(state, current, f"the test change could not be applied: {applied.error}")
+        violations = lib.weakened_tests("HEAD")
+        if violations:
+            lib.revert(applied)
+            return back_to_code(state, current, "the test change weakens the tests: " + "; ".join(violations))
+        base_explanation = state.get("explanation", "")
+        return {"route": "verify", "applied": merged(state, applied), "applied_kind": "test",
+                "explanation": f"{base_explanation}; tests updated: {explanation}".strip("; "),
+                "notes": state.get("notes", []) + [f"tests updated to the stated intent: {', '.join(applied.files)}"]}
+
+    def n_tests(state: RunState) -> dict:
+        """Proactive: does the change to application code have the tests it needs?"""
+        base = {"tests_done": state["iteration"], "route": "review"}
+        if not any(lib.is_source_path(f) for f in changed_files(rt.base_sha)):
+            return base
+        user = (f"## Mode\nPROACTIVE: decide whether the tests cover this change.\n\n## Stated intent\n{intent_text(state['plan'])}"
+                f"\n\n## Existing tests\n{lib.test_inventory()}\n\n## Diff\n{diff_since_base(rt.base_sha)[:40000]}")
+        parsed = lib.ask_json(rt.caller, "test-steward", lib.load_prompt("test-steward"), user,
+                              lambda d: lib.parse_changes(d, allowed=lib.is_test_path))
+        notes = list(state.get("notes", []))
+        if parsed is None:
+            return {**base, "notes": notes + ["test steward returned no usable reply; test coverage of the change was not evaluated"]}
+        changes, explanation = parsed
+        if not changes:
+            return {**base, "notes": notes + [f"tests: {explanation or 'the existing tests already cover this change'}"]}
+        applied = lib.apply_changes(changes)
+        if applied.error:
+            return {**base, "notes": notes + [f"test steward changes were not applicable: {applied.error}"]}
+        violations = lib.weakened_tests("HEAD")
+        if violations:
+            lib.revert(applied)
+            return {**base, "notes": notes + ["test steward changes refused (they weaken the tests): " + "; ".join(violations)]}
+        found = lib.discriminating(rt.base_sha, [f for f in applied.files if f.endswith(".py")])
+        if found is not None and found[0] == 0:
+            notes.append("the new tests also pass without the change, so they may not test it")
+        return {"tests_done": state["iteration"], "route": "verify", "applied": {"edited": applied.edited, "created": applied.created},
+                "applied_kind": "test", "explanation": f"tests: {explanation}", "notes": notes + [f"tests added/updated: {', '.join(applied.files)}"]}
 
     def after_review(state: RunState, findings: list[lib.Finding], dropped, label: str) -> dict:
         blocking = [f for f in findings if f.blocking]
@@ -395,13 +590,18 @@ def build_graph(rt: Runtime):
 
     graph = StateGraph(RunState)
     for name, fn in (("start", n_start), ("write", n_write), ("verify", n_verify), ("review", n_review),
+                     ("ci_failure", n_ci_failure), ("steward", n_steward), ("tests", n_tests),
                      ("final", n_final), ("docs", n_docs)):
         graph.add_node(name, fn)
     graph.set_entry_point("start")
     route = lambda s: s["route"]  # noqa: E731
-    graph.add_conditional_edges("start", route, {"write": "write", "verify": "verify", "review": "review"})
+    graph.add_conditional_edges("start", route, {"write": "write", "verify": "verify", "review": "review", "ci": "ci_failure"})
+    graph.add_conditional_edges("ci_failure", route, {"write": "write", "steward": "steward", "verify": "verify", "end": END})
+    graph.add_conditional_edges("steward", route, {"verify": "verify", "write": "write", "end": END})
+    graph.add_conditional_edges("tests", route, {"verify": "verify", "review": "review"})
     graph.add_conditional_edges("write", route, {"verify": "verify", "end": END})
-    graph.add_conditional_edges("verify", route, {"review": "review", "write": "write", "end": END})
+    graph.add_conditional_edges("verify", route, {"review": "review", "tests": "tests", "write": "write", "steward": "steward",
+                                                  "verify": "verify", "end": END})
     graph.add_conditional_edges("review", route, {"final": "final", "docs": "docs", "write": "write", "end": END})
     graph.add_conditional_edges("final", route, {"docs": "docs", "write": "write", "end": END})
     graph.add_edge("docs", END)
@@ -624,7 +824,14 @@ def cmd_guard_change(args: argparse.Namespace) -> int:
     author = git("log", "-1", "--format=%an").stdout.strip()
     subject = git("log", "-1", "--format=%s").stdout.strip()
     reason = ""
-    if author == AGENT_AUTHOR:
+    if args.mode == "ci":
+        # A failed CI run on the agent's own fix is exactly when to try again,
+        # but only a bounded number of times in a row.
+        authors = git("log", "-n", "20", "--format=%an").stdout.split("\n")
+        streak = next((i for i, a in enumerate(authors) if a != AGENT_AUTHOR), len(authors))
+        if streak >= args.max_streak:
+            reason = f"the last {streak} commits on this branch are the agent's own and CI still fails: stopping"
+    elif author == AGENT_AUTHOR:
         reason = "the head commit was written by this pipeline"
     elif args.mode == "push":
         if _BOT_SUBJECT.match(subject):
@@ -653,12 +860,23 @@ def cmd_change(args: argparse.Namespace) -> int:
         start = "review"   # the push is already on main; checks on main belong to ai-autofix-main
     else:
         branch, start = "", "verify"
+    failure_output = ""
+    if getattr(args, "ci_sha", ""):
+        # Entered because CI failed: the failing checks' own logs are the first
+        # input, read from the run that failed (it may need services this job
+        # cannot start, e.g. integration tests).
+        start, failure_output = "ci", collect_failure_logs(args.ci_repo, args.ci_sha, 60000)
+        if not failure_output.strip():
+            write_result({"mode": "pr", "outcome": "clean", "branch": "", "head_sha": head_sha, "commits": 0, "plan": plan,
+                          "notes": ["no failing check logs were found for this commit"], "rounds": [], "findings": [],
+                          "files": [], "cost_usd": 0.0, "cost_by_role": {}, "title": ""})
+            return 0
     rt = Runtime(caller, args.base_sha, pathlib.Path(args.verify_command_file).read_text() if args.verify_command_file else "",
                  args.verify_timeout, args.max_iterations, args.max_verify_retries, args.writer_rounds,
                  context, "", 0, start=start, fix_kind="fix")
     limit = (args.max_iterations + 1) * (args.max_verify_retries + 1) * 6 + 30
-    final = build_graph(rt).invoke({"plan": plan, "iteration": 1, "verify_attempts": 0, "notes": [], "rounds": []},
-                                   config={"recursion_limit": limit})
+    final = build_graph(rt).invoke({"plan": plan, "iteration": 1, "verify_attempts": 0, "notes": [], "rounds": [],
+                                    "failure_output": failure_output}, config={"recursion_limit": limit})
 
     outcome = final.get("outcome", "failed")
     new_commits = int(git("rev-list", "--count", f"{head_sha}..HEAD").stdout.strip() or 0)
@@ -674,6 +892,7 @@ def cmd_change(args: argparse.Namespace) -> int:
         "mode": args.mode, "outcome": outcome, "branch": branch, "head_sha": head_sha, "commits": new_commits,
         "plan": plan, "notes": final.get("notes", []), "rounds": rounds,
         "findings": rounds[-1]["findings"] if rounds else [], "files": touched_now, "cost_usd": caller.total_cost_usd(),
+        "adjudications": final.get("adjudications", []),
         "cost_by_role": caller.cost_by_role(),
         "title": f"{'[needs human] ' if outcome == 'escalated' else ''}fix(agent): address review findings of {sha7}",
     }
@@ -703,6 +922,10 @@ def build_change_comment(result: dict, pushed_ok: bool | None) -> str:
             blocking = sum(1 for f in r["findings"] if f["severity"] in lib.BLOCKING)
             table.append(f"| {r['iteration']} | {r['stage']} | {len(r['findings'])} | {blocking} | {r['dropped']} |")
         parts.append("\n".join(table))
+    if result.get("adjudications"):
+        lines = [f"- `{v['test']}`: **{v['classification']}** ({v['confidence']}): {v['reason']}"
+                 for a in result["adjudications"] for v in a["verdicts"]]
+        parts.append("### Who was wrong, the code or the test?\n" + "\n".join(lines))
     if result.get("findings"):
         parts.append("### Findings at the last round\n" + lib.render_findings_md([lib.Finding(**f) for f in result["findings"]]))
     if result.get("notes"):
@@ -948,7 +1171,9 @@ def main() -> int:
     r.set_defaults(fn=cmd_run)
 
     gc = sub.add_parser("guard-change")
-    gc.add_argument("--mode", choices=("pr", "push"), required=True)
+    gc.add_argument("--mode", choices=("pr", "push", "ci"), required=True)
+    gc.add_argument("--max-streak", type=int, default=3,
+                    help="mode ci: stop after this many consecutive agent commits on the branch")
     gc.add_argument("--repo", required=True)
     gc.add_argument("--sha", required=True)
     gc.set_defaults(fn=cmd_guard_change)
@@ -965,6 +1190,8 @@ def main() -> int:
     c.add_argument("--max-iterations", type=int, default=3)
     c.add_argument("--max-verify-retries", type=int, default=3)
     c.add_argument("--writer-rounds", type=int, default=8)
+    c.add_argument("--ci-repo", default="", help="with --ci-sha: read the failing checks' logs of this commit")
+    c.add_argument("--ci-sha", default="")
     c.set_defaults(fn=cmd_change)
 
     pp = sub.add_parser("publish-pr")

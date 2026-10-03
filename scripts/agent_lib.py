@@ -501,3 +501,155 @@ def run_verify_isolated(command: str, timeout: int) -> tuple[bool, str]:
     if proc.returncode == 0:
         return True, ""
     return False, (proc.stdout + "\n" + proc.stderr).strip()[-4000:]
+
+
+# ---------------------------------------------------------------------------
+# Failing tests: deterministic evidence, and a guard against weakening tests
+# ---------------------------------------------------------------------------
+
+# Only real test ids (with `::`): a collection error such as `ERROR tests/x.py - SyntaxError` is
+# a broken file, not a failing test, and has nothing to adjudicate.
+_NODEID_RE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+\.py::\S+)", re.MULTILINE)
+SOURCE_SUFFIXES = (".py", ".js", ".ts", ".go", ".rs", ".java", ".rb", ".php", ".cs", ".c", ".cpp", ".h")
+
+
+def parse_failed_tests(output: str) -> list[str]:
+    """pytest node ids named in a failure report (`FAILED path::test - msg`)."""
+    seen: list[str] = []
+    for match in _NODEID_RE.finditer(output):
+        if match.group(1) not in seen:
+            seen.append(match.group(1))
+    return seen
+
+
+def is_test_path(path: str) -> bool:
+    name = pathlib.PurePosixPath(path).name
+    return (path.startswith(("tests/", "test/")) or "/tests/" in path
+            or name.startswith("test_") or name.endswith("_test.py") or name == "conftest.py")
+
+
+def is_source_path(path: str) -> bool:
+    """Application code: what a change must be covered by tests for."""
+    return (path.endswith(SOURCE_SUFFIXES) and not is_test_path(path)
+            and not path.startswith((".github/", ".shared/", ".ai/", "docs/")))
+
+
+def test_signals(text: str) -> dict[str, int]:
+    return {
+        "tests": len(re.findall(r"^\s*(?:async\s+)?def\s+test_", text, re.MULTILINE)),
+        "asserts": len(re.findall(r"\bassert\b|\bpytest\.raises\b|\.assert_\w+\(", text)),
+        "skips": len(re.findall(r"\bskip\b|\bxfail\b|skipif", text)),
+    }
+
+
+def weakened_tests(ref: str = "HEAD") -> list[str]:
+    """Ways the working tree makes the tests weaker than at `ref`: a test file
+    deleted, fewer tests, fewer assertions, or more skip/xfail. This is what
+    stops a failing test from being "fixed" by gutting it."""
+    def git(*args: str) -> str:
+        return subprocess.run(["git", *args], capture_output=True, text=True).stdout
+
+    violations: list[str] = []
+    for path in git("diff", "--name-only", "--diff-filter=D", ref).split("\n"):
+        if path and is_test_path(path):
+            violations.append(f"{path} was deleted")
+    for path in git("diff", "--name-only", "--diff-filter=M", ref).split("\n"):
+        if not path or not is_test_path(path) or not pathlib.Path(path).is_file():
+            continue
+        before, after = test_signals(git("show", f"{ref}:{path}")), test_signals(pathlib.Path(path).read_text())
+        for key, label in (("tests", "fewer tests"), ("asserts", "fewer assertions")):
+            if after[key] < before[key]:
+                violations.append(f"{path}: {label} ({before[key]} -> {after[key]})")
+        if after["skips"] > before["skips"]:
+            violations.append(f"{path}: more skip/xfail markers ({before['skips']} -> {after['skips']})")
+    return violations
+
+
+def run_pytest(args: list[str], cwd: str | pathlib.Path, timeout: int = 300) -> tuple[str, str]:
+    """('pass' | 'fail' | 'absent' | 'skipped' | 'error', output) for one pytest
+    invocation, in the same secret-free environment as the verify command."""
+    try:
+        proc = subprocess.run([sys.executable, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider", *args],
+                              capture_output=True, text=True, timeout=timeout, cwd=str(cwd), env=scrubbed_env())
+    except subprocess.TimeoutExpired:
+        return "error", f"pytest exceeded {timeout}s"
+    out = (proc.stdout + "\n" + proc.stderr).strip()
+    if proc.returncode == 0:
+        return ("skipped" if "skipped" in out and "passed" not in out else "pass"), out[-1500:]
+    return {1: "fail", 5: "absent"}.get(proc.returncode, "error"), out[-1500:]
+
+
+def evidence_hint(evidence: dict) -> str:
+    """What the deterministic runs say about one failing test, before any model
+    gets an opinion: flaky / unreproducible / new_test / preexisting / regression."""
+    head = evidence.get("head", [])
+    if any(h == "pass" for h in head):
+        return "flaky"
+    if not head or all(h in ("error", "skipped", "absent") for h in head):
+        return "unreproducible"
+    base = evidence.get("base")
+    return {"absent": "new_test", "fail": "preexisting", "pass": "regression"}.get(base, "unknown")
+
+
+def gather_evidence(nodeids: list[str], base_sha: str, *, repeats: int = 2, timeout: int = 300) -> dict[str, dict]:
+    """Re-run each failing test on the current tree (is it flaky?) and on the
+    base commit (did it pass before this change?). Only possible for tests that
+    can run in this job; CI-only tests come back 'unreproducible' and are judged
+    on their output and the change's stated intent instead."""
+    result: dict[str, dict] = {}
+    for nid in nodeids[:5]:
+        result[nid] = {"head": [run_pytest([nid], ".", timeout)[0] for _ in range(repeats)], "base": "unknown"}
+    runnable = [n for n, e in result.items() if any(h in ("fail", "pass") for h in e["head"])]
+    if runnable and base_sha:
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="agent-base-")
+        added = subprocess.run(["git", "worktree", "add", "--detach", tmp, base_sha], capture_output=True, text=True)
+        if added.returncode == 0:
+            try:
+                for nid in runnable:
+                    path = nid.split("::")[0]
+                    exists = subprocess.run(["git", "cat-file", "-e", f"{base_sha}:{path}"], capture_output=True).returncode == 0
+                    # A test file that does not exist on the base was added by this change.
+                    result[nid]["base"] = run_pytest([nid], tmp, timeout)[0] if exists else "absent"
+            finally:
+                subprocess.run(["git", "worktree", "remove", "--force", tmp], capture_output=True)
+    for nid, ev in result.items():
+        ev["hint"] = evidence_hint(ev)
+    return result
+
+
+def discriminating(base_sha: str, files: list[str], timeout: int = 300) -> tuple[int, int] | None:
+    """Do the given test files fail on the BASE source? A test written for a
+    change should fail without it. Returns (tests that failed there, that passed
+    there), or None when this cannot be measured here."""
+    import tempfile
+    if not files or not base_sha:
+        return None
+    tmp = tempfile.mkdtemp(prefix="agent-base-")
+    if subprocess.run(["git", "worktree", "add", "--detach", tmp, base_sha], capture_output=True).returncode != 0:
+        return None
+    try:
+        for f in files:
+            dest = pathlib.Path(tmp) / f
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(pathlib.Path(f).read_text())
+        outcome, out = run_pytest(["--tb=no", *files], tmp, timeout)
+        if outcome in ("error", "absent", "skipped"):
+            return None
+        failed = re.search(r"(\d+) failed", out)
+        passed = re.search(r"(\d+) passed", out)
+        return (int(failed.group(1)) if failed else 0), (int(passed.group(1)) if passed else 0)
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", tmp], capture_output=True)
+
+
+def test_inventory(max_files: int = 60) -> str:
+    """The test files and the test functions in them, so the steward knows what
+    is already covered without reading every file."""
+    files = [f for f in subprocess.run(["git", "ls-files"], capture_output=True, text=True).stdout.split("\n")
+             if f.endswith(".py") and is_test_path(f)][:max_files]
+    lines = []
+    for f in files:
+        names = re.findall(r"^\s*(?:async\s+)?def\s+(test_\w+)", pathlib.Path(f).read_text(errors="replace"), re.MULTILINE)
+        lines.append(f"{f}: " + ", ".join(names[:40]))
+    return "\n".join(lines) or "(no test files)"
