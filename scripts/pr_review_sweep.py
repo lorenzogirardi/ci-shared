@@ -1126,6 +1126,46 @@ def post_comment(repo: str, number: int, body: str, existing: dict | None) -> No
              "-F", f"body=@{path}", "--silent"])
 
 
+AUTOFIX_AUTHOR = "ci-shared autofix"
+ABANDONED_LABEL = "agent-abandoned"
+
+
+def pr_is_behind(repo: str, number: int) -> bool:
+    """True when the base branch has moved on since the PR's last CI run, so its checks describe
+    an old merge result. (GitHub computes mergeable_state lazily; 'unknown' counts as not behind.)"""
+    pr = gh_json([f"repos/{repo}/pulls/{number}"]) or {}
+    return pr.get("mergeable_state") == "behind"
+
+
+def update_branch(repo: str, number: int) -> bool:
+    """Merge the base branch into the PR branch so CI runs again on current code. Done with the push
+    token: an update made with GITHUB_TOKEN does not trigger the PR's workflows, which would leave
+    the PR with no check results at all."""
+    token = os.environ.get("UPDATE_TOKEN") or os.environ.get("GH_TOKEN", "")
+    done = subprocess.run(["gh", "api", "-X", "PUT", f"repos/{repo}/pulls/{number}/update-branch"],
+                          capture_output=True, text=True, env={**os.environ, "GH_TOKEN": token})
+    return done.returncode == 0
+
+
+def autofix_streak(commits: list[dict]) -> int:
+    """How many of the PR's most recent commits were written by the autofix. Each one that did
+    not turn CI green is another attempt, so this is the count to cap."""
+    streak = 0
+    for c in reversed(commits):
+        if ((c.get("commit") or {}).get("author") or {}).get("name") != AUTOFIX_AUTHOR:
+            break
+        streak += 1
+    return streak
+
+
+def abandon_pr(repo: str, number: int, reason: str) -> None:
+    """Terminal state without a hand-off: label, say why, close. The base branch is untouched."""
+    run(["gh", "api", "-X", "POST", f"repos/{repo}/issues/{number}/labels", "-f", f"labels[]={ABANDONED_LABEL}", "--silent"], check=False)
+    run(["gh", "pr", "close", str(number), "--repo", repo, "--comment",
+         f"The automatic repair gave up on this pull request: {reason}. Nothing was merged and the base branch is untouched."],
+        check=False)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Review open PRs and optionally merge clean ones.")
     parser.add_argument("--repo", required=True, help="owner/name")
@@ -1213,6 +1253,19 @@ def main() -> int:
         help="Project-specific review guidance shown to the structured reviewers.",
     )
     parser.add_argument(
+        "--update-behind",
+        action="store_true",
+        help="Bring a PR that is behind the base branch up to date (with the push token) instead of judging "
+             "its stale checks; CI runs again and this sweep, triggered when it finishes, judges the result.",
+    )
+    parser.add_argument(
+        "--max-autofix-commits",
+        type=int,
+        default=0,
+        help="Stop after this many consecutive autofix commits that still leave CI red: the PR is labelled "
+             "agent-abandoned and closed. 0 = no cap (the previous behavior).",
+    )
+    parser.add_argument(
         "--skip-head-prefixes",
         default="",
         help="Comma-separated head-branch prefixes the sweep must leave alone (e.g. 'agent/'). "
@@ -1243,6 +1296,13 @@ def main() -> int:
             continue
         if skip_prefixes and ((pr.get("head") or {}).get("ref") or "").startswith(skip_prefixes):
             continue
+        if args.update_behind and pr_is_behind(args.repo, number):
+            if update_branch(args.repo, number):
+                print(f"PR #{number} was behind {pr['base']['ref']}: updated it; its CI runs again and the sweep that "
+                      "follows judges the new result.")
+                skipped += 1
+                continue
+            print(f"::warning::could not update PR #{number}; judging it as it is")
 
         existing = existing_sweep_comment(args.repo, number)
         existing_body = (existing or {}).get("body") or ""
@@ -1294,6 +1354,13 @@ def main() -> int:
             # One attempt per SHA — if the fix does not work, the commit it
             # pushed becomes the new head and this PR is not retried at the
             # old one, so it cannot loop.
+            if args.autofix and args.max_autofix_commits:
+                commits = gh_json([f"repos/{args.repo}/pulls/{number}/commits?per_page=100"]) or []
+                if autofix_streak(commits) >= args.max_autofix_commits:
+                    abandon_pr(args.repo, number, f"{args.max_autofix_commits} automatic fixes in a row did not make CI pass")
+                    print(f"PR #{number} abandoned after {args.max_autofix_commits} automatic fixes.")
+                    skipped += 1
+                    continue
             if args.autofix:
                 print(f"::group::Autofixing failed CI on PR #{number} ({author}): {pr['title']}")
                 outcome, detail = autofix_one(pr, args, args.repo, head_sha)
