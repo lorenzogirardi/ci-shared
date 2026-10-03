@@ -42,6 +42,16 @@ on:
         required: false
         type: boolean
         default: false
+      update_behind:
+        description: 'Bring a PR that is behind the base branch up to date (with the push token) so its CI describes current code. Needs autofix_push_token.'
+        required: false
+        type: boolean
+        default: false
+      max_autofix_commits:
+        description: 'Stop after this many consecutive autofix commits that still leave CI red: the PR is labelled agent-abandoned and closed. 0 = no cap.'
+        required: false
+        type: number
+        default: 0
       skip_head_prefixes:
         description: 'Comma-separated head-branch prefixes to leave alone (e.g. "agent/"): PRs the agent pipeline opened are certified inside that pipeline.'
         required: false
@@ -158,6 +168,7 @@ jobs:
       OPENROUTER_SITE_URL: ${{ inputs.openrouter_site_url }}
       OPENROUTER_APP_NAME: ${{ inputs.openrouter_app_name }}
       GH_TOKEN: ${{ github.token }}
+      UPDATE_TOKEN: ${{ secrets.autofix_push_token }}
     steps:
       - name: Checkout caller repo
         uses: actions/checkout@v4
@@ -249,6 +260,8 @@ jobs:
             --skip-head-prefixes "${{ inputs.skip_head_prefixes }}" \
             --review-guidance-file .ai/review-guidance.txt \
             ${{ inputs.structured_review && '--structured-review' || '' }} \
+            ${{ inputs.update_behind && '--update-behind' || '' }} \
+            --max-autofix-commits ${{ inputs.max_autofix_commits }} \
             ${{ inputs.auto_merge && '--auto-merge' || '' }} \
             ${{ inputs.triage_on_failure && '--triage-on-failure' || '' }} \
             ${{ inputs.autofix && '--autofix' || '' }}
