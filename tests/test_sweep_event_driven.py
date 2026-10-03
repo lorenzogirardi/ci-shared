@@ -29,11 +29,33 @@ class TestAutofixStreak:
 
 
 class TestHelpers:
-    def test_behind_is_read_from_the_mergeable_state(self, monkeypatch):
-        monkeypatch.setattr(sweep, "gh_json", lambda a: {"mergeable_state": "behind"})
-        assert sweep.pr_is_behind("o/r", 5)
-        monkeypatch.setattr(sweep, "gh_json", lambda a: {"mergeable_state": "unknown"})
-        assert not sweep.pr_is_behind("o/r", 5)
+    def test_behind_is_counted_from_the_commits_not_from_the_merge_state(self, monkeypatch):
+        # No branch protection here, so GitHub never reports "behind": the compare API is the truth.
+        asked = []
+        real = {"commits": [{"commit": {"message": "feat: something real\n\nbody"}}], "mergeable_state": "clean"}
+        monkeypatch.setattr(sweep, "gh_json", lambda a: asked.append(a[0]) or real)
+        assert sweep.pr_is_behind("o/r", 5, PR)
+        assert asked == ["repos/o/r/compare/" + "a" * 40 + "...main"]
+        monkeypatch.setattr(sweep, "gh_json", lambda a: {"commits": []})
+        assert not sweep.pr_is_behind("o/r", 5, PR)
+
+    def test_the_pipelines_own_bookkeeping_commits_do_not_make_a_pr_behind(self, monkeypatch):
+        housekeeping = {"commits": [{"commit": {"message": "Done  by Github Actions   Job changemanifest: 270"}},
+                                    {"commit": {"message": "docs(changelog): update for abc1234"}}]}
+        monkeypatch.setattr(sweep, "gh_json", lambda a: housekeeping)
+        assert not sweep.pr_is_behind("o/r", 5, PR)
+        housekeeping["commits"].append({"commit": {"message": "fix: a real change"}})
+        assert sweep.pr_is_behind("o/r", 5, PR)
+
+    def test_renovate_is_asked_to_rebase_other_authors_get_the_base_merged_in(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(sweep, "run", lambda cmd, **k: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", ""))
+        monkeypatch.setattr(sweep, "update_branch", lambda repo, n: calls.append(["update", n]) or True)
+        assert sweep.refresh_pr("o/r", dict(PR, user={"login": "renovate[bot]"})) == "asked Renovate to rebase it"
+        assert any("labels[]=rebase" in c for c in calls[0]) and len(calls) == 1
+        calls.clear()
+        assert sweep.refresh_pr("o/r", dict(PR, user={"login": "lorenzogirardi"})) == "updated the branch"
+        assert calls == [["update", 5]]
 
     def test_the_update_uses_the_push_token_not_the_default_one(self, monkeypatch):
         seen = {}
@@ -75,8 +97,8 @@ def sweep_env(tmp_path, monkeypatch):
 class TestMainLoop:
     def test_a_pr_behind_main_is_updated_not_judged_on_its_stale_checks(self, sweep_env, monkeypatch):
         updated = []
-        monkeypatch.setattr(sweep, "pr_is_behind", lambda repo, n: True)
-        monkeypatch.setattr(sweep, "update_branch", lambda repo, n: updated.append(n) or True)
+        monkeypatch.setattr(sweep, "pr_is_behind", lambda repo, n, pr=None: True)
+        monkeypatch.setattr(sweep, "refresh_pr", lambda repo, pr: updated.append(pr["number"]) or "updated the branch")
         monkeypatch.setattr(sweep, "existing_sweep_comment", lambda *a: pytest.fail("a stale PR must not be judged"))
         sweep_env("--update-behind")
         assert sweep.main() == 0 and updated == [5]

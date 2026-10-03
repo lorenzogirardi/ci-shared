@@ -42,6 +42,11 @@ on:
         required: false
         type: boolean
         default: false
+      fix_findings:
+        description: 'With structured_review: a blocking finding goes to the writer / checks / reviewers loop and is pushed to the PR branch if it converges; if it cannot be fixed the PR is abandoned. Without this a blocking finding leaves the PR open, waiting.'
+        required: false
+        type: boolean
+        default: false
       update_behind:
         description: 'Bring a PR that is behind the base branch up to date (with the push token) so its CI describes current code. Needs autofix_push_token.'
         required: false
@@ -260,6 +265,7 @@ jobs:
             --skip-head-prefixes "${{ inputs.skip_head_prefixes }}" \
             --review-guidance-file .ai/review-guidance.txt \
             ${{ inputs.structured_review && '--structured-review' || '' }} \
+            ${{ inputs.fix_findings && '--fix-findings' || '' }} \
             ${{ inputs.update_behind && '--update-behind' || '' }} \
             --max-autofix-commits ${{ inputs.max_autofix_commits }} \
             ${{ inputs.auto_merge && '--auto-merge' || '' }} \
