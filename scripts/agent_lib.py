@@ -546,21 +546,31 @@ def test_signals(text: str) -> dict[str, int]:
     }
 
 
-def weakened_tests(ref: str = "HEAD") -> list[str]:
-    """Ways the working tree makes the tests weaker than at `ref`: a test file
-    deleted, fewer tests, fewer assertions, or more skip/xfail. This is what
-    stops a failing test from being "fixed" by gutting it."""
+def weakened_tests(ref: str = "HEAD", to: str | None = None) -> list[str]:
+    """Ways the tests got weaker between `ref` and `to` (default: the working tree): a test file deleted,
+    fewer tests, fewer assertions, or more skip/xfail. This is what stops a failing test from being
+    "fixed" by gutting it. Applies to every change an agent makes, whichever role made it."""
     def git(*args: str) -> str:
         return subprocess.run(["git", *args], capture_output=True, text=True).stdout
 
+    def after_text(path: str) -> str | None:
+        if to is not None:
+            shown = subprocess.run(["git", "show", f"{to}:{path}"], capture_output=True, text=True)
+            return shown.stdout if shown.returncode == 0 else None
+        return pathlib.Path(path).read_text() if pathlib.Path(path).is_file() else None
+
+    target = [to] if to else []
     violations: list[str] = []
-    for path in git("diff", "--name-only", "--diff-filter=D", ref).split("\n"):
+    for path in git("diff", "--name-only", "--diff-filter=D", ref, *target).split("\n"):
         if path and is_test_path(path):
             violations.append(f"{path} was deleted")
-    for path in git("diff", "--name-only", "--diff-filter=M", ref).split("\n"):
-        if not path or not is_test_path(path) or not pathlib.Path(path).is_file():
+    for path in git("diff", "--name-only", "--diff-filter=M", ref, *target).split("\n"):
+        if not path or not is_test_path(path):
             continue
-        before, after = test_signals(git("show", f"{ref}:{path}")), test_signals(pathlib.Path(path).read_text())
+        text = after_text(path)
+        if text is None:
+            continue
+        before, after = test_signals(git("show", f"{ref}:{path}")), test_signals(text)
         for key, label in (("tests", "fewer tests"), ("asserts", "fewer assertions")):
             if after[key] < before[key]:
                 violations.append(f"{path}: {label} ({before[key]} -> {after[key]})")
@@ -728,4 +738,5 @@ def policy_violations(from_sha: str, max_files: int = MAX_PATCH_FILES, max_lines
                            if ln.startswith("+") and not ln.startswith("+++"))
     if contains_secret(added_text):
         violations.append("an added line contains something shaped like a credential")
+    violations += [f"tests weakened: {v}" for v in weakened_tests(from_sha, "HEAD")]
     return violations

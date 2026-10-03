@@ -307,6 +307,13 @@ def run_writer(rt: Runtime, plan: dict, feedback: str):
         if applied.error:
             history.append(f"Round {rnd}: applying your changes failed: {applied.error}")
             continue
+        weakened = lib.weakened_tests("HEAD")
+        if weakened:
+            # The writer may edit a test that is truly outdated, but never weaken one to get a green run.
+            lib.revert(applied)
+            history.append(f"Round {rnd}: your patch was refused, it weakens the tests: " + "; ".join(weakened)
+                           + ". Make the code satisfy the tests, or correct what a test asserts without removing tests or assertions.")
+            continue
         return applied, explanation
     return None, "the writer used all its rounds without producing a valid change"
 
