@@ -414,7 +414,7 @@ class TestChangeCommand:
         monkeypatch.setattr(lib, "ModelCaller", lambda *a, **k: caller)
         ap.cmd_change(change_args(mode="pr", base_sha=pr_repo))
         result = json.loads(pathlib.Path(".ai/agent-run/result.json").read_text())
-        assert result["outcome"] in ("escalated", "failed") and not pathlib.Path(".github").exists()
+        assert result["outcome"] == "abandoned" and not pathlib.Path(".github").exists()
 
 
 class TestGuardChange:
@@ -452,14 +452,18 @@ class TestPublishPr:
         return base
 
     def test_comment_says_what_happened(self):
-        assert "Nothing was changed" in ap.build_change_comment(self.result(), None)
-        assert "pushed 2 commit" in ap.build_change_comment(self.result(outcome="converged", commits=2), True)
-        assert "could not push" in ap.build_change_comment(self.result(outcome="converged", commits=1), False)
-        text = ap.build_change_comment(self.result(outcome="escalated", findings=[
+        clean = ap.build_change_comment(self.result(final_sha="abc1234def"), None)
+        assert "Nothing was changed" in clean and "<!-- agent-certified: abc1234def -->" in clean
+        pushed = ap.build_change_comment(self.result(outcome="converged", commits=2, final_sha="f" * 40), True)
+        assert "pushed 2 commit" in pushed and f"<!-- agent-certified: {'f' * 40} -->" in pushed
+        not_pushed = ap.build_change_comment(self.result(outcome="converged", commits=1, final_sha="f" * 40), False)
+        assert "could not push" in not_pushed and "agent-certified" not in not_pushed   # nothing certified that is not on the branch
+        text = ap.build_change_comment(self.result(outcome="abandoned", findings=[
             {"severity": "high", "file": "a.py", "line": 1, "category": "bug", "evidence": "e", "problem": "p",
              "suggestion": "s", "reviewers": ["reviewer-correctness"]}], rounds=[
             {"iteration": 1, "stage": "review", "findings": [{"severity": "high"}], "dropped": 0}]), None)
-        assert "needs a person" in text and "`a.py:1`" in text and text.startswith("<!-- agent-pr -->")
+        assert "abandoned this change" in text and "`a.py:1`" in text and text.startswith("<!-- agent-pr -->")
+        assert "agent-certified" not in text      # an abandoned change is never certified
 
     def args(self):
         return type("A", (), {"repo": "o/r", "pr": 5, "head_ref": "feature"})()

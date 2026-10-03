@@ -7,6 +7,8 @@ Subcommands
              dedup/validate -> fix loop -> final review -> docs -> changelog.
              Commits to a local branch only; holds NO push credential.
   publish    push that branch and open the PR. The only step with a write token.
+  merge-gate    merge a PR whose head commit is certified and whose CI is green
+  main-guard    the base branch went red: revert the culprit, open a redo issue
   guard-change / change / publish-pr
              the same engine on a change that already exists: a pull request
              (fixes are pushed to its branch) or a push straight to main (a fix
@@ -19,14 +21,19 @@ Why `run` and `publish` are separate: `run` executes code a model just wrote
 repository. See agent_lib.run_verify_isolated.
 
 The loop is bounded (max iterations, max verify retries, writer exploration
-rounds). When it does not converge it stops and says so: the PR is opened as a
-draft titled "[needs human]" with the unresolved findings. Nothing here merges.
+rounds). When an attempt does not converge it is repeated ONCE with twice the
+budget; if that fails too the change is ABANDONED: the base branch is untouched,
+the PR (if any) is labelled `agent-abandoned` and, if the agent opened it, closed.
+No outcome waits for a person (see TERMINAL_ACTIONS). Merging is done by
+`merge-gate`, only for a head commit that is certified and whose CI is green.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import dataclasses
+import datetime
 import json
 import os
 import pathlib
@@ -40,12 +47,23 @@ from langgraph.graph import END, StateGraph
 
 import agent_lib as lib
 from changelog_update import add_entry
-from pr_review_sweep import _parse_json_reply, build_diff, collect_failure_logs, gh_json, post_comment
+from pr_review_sweep import _parse_json_reply, build_diff, collect_failure_logs, gh_json, post_comment, try_merge
 
 OUT_DIR = pathlib.Path(".ai/agent-run")
 BRANCH_PREFIX = "agent/issue-"
 REVIEWERS = ("reviewer-correctness", "reviewer-security")
 PLANNER_ROUNDS = 6
+RETRY_BOOST = 2
+CERT_MARKER = "agent-certified"
+ABANDONED_LABEL = "agent-abandoned"
+# Every way a change can end, and what the system does about it. None of them
+# waits for a person; tests/test_terminal_states.py fails if one ever does.
+TERMINAL_ACTIONS = {
+    "clean": "certify",          # nothing to change: eligible to merge once CI is green
+    "converged": "certify",      # fixed: eligible to merge once CI is green
+    "abandoned": "abandon",      # label + comment; the agent's own PR is closed; base untouched
+    "not_feasible": "abandon",   # the request cannot be implemented as written: commented on the issue
+}
 # Every commit the pipeline makes carries this author, which is how a run
 # recognises its own pushes and does not review them again (no loops).
 AGENT_AUTHOR = "ci-shared agents"
@@ -616,9 +634,7 @@ def build_pr_body(plan: dict, final: dict, issue_number: int, cost: float, by_ro
     def bullets(items: list[str]) -> str:
         return "\n".join(f"- {i}" for i in items) or "- (none)"
 
-    outcome = final["outcome"]
-    status = ("All deterministic checks and every review passed." if outcome == "converged"
-              else "**The agent did not converge. A person needs to look at this.**")
+    status = "All deterministic checks and every review passed."
     parts = [
         f"{status}\n\nImplements #{issue_number}: {plan['summary']}" if issue_number else f"{status}\n\n{plan['summary']}",
         f"## Scope\n{bullets(plan['scope'])}",
@@ -679,6 +695,44 @@ def write_result(result: dict) -> None:
                      + "".join(f"- {n}\n" for n in result.get("notes", [])[:10]))
 
 
+def settle(outcome: str) -> str:
+    """A graph that did not converge ends as `abandoned`, never as a hand-off."""
+    return "abandoned" if outcome in ("escalated", "failed") else outcome
+
+
+def invoke_with_retry(make_runtime, initial: dict) -> dict:
+    """Run the graph; if it does not converge, run it ONCE more with twice the
+    budget, continuing from whatever the first attempt committed. `make_runtime
+    (attempt, previous)` builds the Runtime for each attempt."""
+    final: dict = {}
+    for attempt in (1, 2):
+        rt = make_runtime(attempt, final)
+        state = dict(initial)
+        if attempt == 2:
+            state.update({
+                "notes": final.get("notes", []) + ["attempt 1 did not converge; retrying once with twice the budget"],
+                "rounds": final.get("rounds", []), "committed": final.get("committed", False),
+                "prior_blocking": final.get("prior_blocking", []), "adjudications": final.get("adjudications", []),
+                "feedback": "THE PREVIOUS ATTEMPT DID NOT CONVERGE. What happened:\n" + "\n".join(final.get("notes", [])[-5:]),
+            })
+        limit = (rt.max_iterations + 1) * (rt.max_verify_retries + 1) * 6 + 30
+        final = build_graph(rt).invoke(state, config={"recursion_limit": limit})
+        if final.get("outcome") == "converged":
+            break
+    return final
+
+
+def boosted(rt: Runtime, attempt: int, previous: dict) -> Runtime:
+    """The Runtime for attempt 2: twice the budget, and if attempt 1 already
+    committed work on an issue, check that work instead of starting from nothing."""
+    if attempt == 1:
+        return rt
+    start = "verify" if rt.start == "write" and previous.get("committed") else rt.start
+    return dataclasses.replace(rt, max_iterations=rt.max_iterations * RETRY_BOOST,
+                               max_verify_retries=rt.max_verify_retries * RETRY_BOOST,
+                               writer_rounds=rt.writer_rounds * RETRY_BOOST, start=start)
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     caller = lib.ModelCaller(args.ai_script, max_chars=args.max_chars, timeout=args.timeout)
@@ -689,7 +743,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     plan = run_planner(caller, title, body, context)
     if plan is None:
-        write_result({"outcome": "failed", "notes": ["the planner did not return a usable plan"]})
+        write_result({"outcome": "abandoned", "notes": ["the planner did not return a usable plan"]})
         return 0
     (OUT_DIR / "plan.json").write_text(json.dumps(plan, indent=2))
     if not plan["feasible"]:
@@ -701,21 +755,21 @@ def cmd_run(args: argparse.Namespace) -> int:
     rt = Runtime(caller, base_sha, pathlib.Path(args.verify_command_file).read_text() if args.verify_command_file else "",
                  args.verify_timeout, args.max_iterations, args.max_verify_retries, args.writer_rounds,
                  context, args.changelog, args.issue)
-    limit = (args.max_iterations + 1) * (args.max_verify_retries + 1) * 6 + 30
-    final = build_graph(rt).invoke({"plan": plan, "iteration": 1, "verify_attempts": 0, "notes": [], "rounds": []},
-                                   config={"recursion_limit": limit})
+    final = invoke_with_retry(lambda attempt, previous: boosted(rt, attempt, previous),
+                              {"plan": plan, "iteration": 1, "verify_attempts": 0, "notes": [], "rounds": []})
 
-    outcome = final.get("outcome", "failed")
+    outcome = settle(final.get("outcome", "failed"))
     touched = changed_files(base_sha)
     if any(n.startswith(".github/workflows/") for n in touched):
-        outcome, final["notes"] = "failed", final.get("notes", []) + ["refusing to publish: touches .github/workflows/"]
-    if outcome != "failed" and not touched:
-        outcome = "failed"
+        outcome, final["notes"] = "abandoned", final.get("notes", []) + ["refusing to publish: touches .github/workflows/"]
+    if outcome != "abandoned" and not touched:
+        outcome = "abandoned"
+        final["notes"] = final.get("notes", []) + ["the agent produced no change"]
     cost = caller.total_cost_usd()
     result = {"outcome": outcome, "branch": branch, "plan": plan, "notes": final.get("notes", []),
               "rounds": final.get("rounds", []), "files": touched, "cost_usd": cost,
-              "title": f"{'[needs human] ' if outcome == 'escalated' else ''}{plan['summary'][:150]}"}
-    if outcome in ("converged", "escalated"):
+              "final_sha": git("rev-parse", "HEAD").stdout.strip(), "title": plan["summary"][:150]}
+    if outcome == "converged":
         (OUT_DIR / "pr-body.md").write_text(build_pr_body(plan, final, args.issue, cost, caller.cost_by_role()))
     write_result(result)
     log(f"agent pipeline: {outcome}, {len(touched)} file(s), ${cost:.4f}")
@@ -736,7 +790,7 @@ def cmd_publish(args: argparse.Namespace) -> int:
             _gh("issue", "comment", str(issue), "--repo", args.repo, "--body", text)
 
     def commit_comment() -> None:
-        if args.commit_sha and result.get("findings"):
+        if getattr(args, "commit_sha", "") and result.get("findings"):
             text = ("## Agent review of this push\n\n" + lib.render_findings_md([lib.Finding(**f) for f in result["findings"]])
                     + "\n\nNothing is merged automatically.")
             _gh("api", f"repos/{args.repo}/commits/{args.commit_sha}/comments", "-f", f"body={text}")
@@ -744,11 +798,13 @@ def cmd_publish(args: argparse.Namespace) -> int:
     if outcome == "clean":
         commit_comment()
         return 0
-    if outcome in ("failed", "not_feasible"):
+    if outcome in ("abandoned", "not_feasible"):
         why = "\n".join(f"- {n}" for n in result.get("notes", [])) or "- no detail"
         comment(("The agent could not plan this request" if outcome == "not_feasible"
-                 else "The agent pipeline did not produce a change") + f":\n{why}")
-        return 0 if outcome == "not_feasible" else 1
+                 else "The agent abandoned this request after a second attempt with twice the budget; nothing was changed")
+                + f":\n{why}")
+        commit_comment()
+        return 0
 
     if not token:
         print("::error::AGENT_PUSH_TOKEN is not set: a fix PR created as GITHUB_TOKEN would not trigger the "
@@ -762,21 +818,26 @@ def cmd_publish(args: argparse.Namespace) -> int:
     if pushed.returncode != 0:
         print(f"::error::push rejected: {pushed.stderr.replace(header, '***')[:300]}", file=sys.stderr)
         return 1
-    cmd = ["pr", "create", "--repo", args.repo, "--base", args.base_branch, "--head", result["branch"],
-           "--title", result["title"], "--body-file", str(OUT_DIR / "pr-body.md")]
-    if outcome == "escalated":
-        cmd.append("--draft")
-    created = _gh(*cmd)
+    created = _gh("pr", "create", "--repo", args.repo, "--base", args.base_branch, "--head", result["branch"],
+                  "--title", result["title"], "--body-file", str(OUT_DIR / "pr-body.md"))
     if created.returncode != 0:
         print(f"::error::gh pr create failed: {created.stderr.strip()[:300]}", file=sys.stderr)
         return 1
     url = created.stdout.strip()
-    for label in (["needs-human"] if outcome == "escalated" else []):
-        _gh("pr", "edit", url, "--repo", args.repo, "--add-label", label)  # best effort: label may not exist
+    # Certification is bound to this exact commit: the merge gate accepts it only while
+    # the PR head is still this sha, and only from a trusted author.
+    _gh("pr", "comment", url, "--repo", args.repo, "--body", certification_comment(
+        result.get("final_sha") or result.get("head_sha", ""), "the planned change was implemented; the checks, two independent "
+        "reviews and the final review passed"))
     commit_comment()
-    comment(f"Opened {url} ({'draft, needs a person: the loop did not converge' if outcome == 'escalated' else 'checks and reviews passed'}).")
+    comment(f"Opened {url}. It merges automatically once its CI is green.")
     log(f"opened {url}")
     return 0
+
+
+def certification_comment(sha: str, why: str) -> str:
+    return (f"<!-- agent-pr -->\n<!-- {CERT_MARKER}: {sha} -->\n## Agent review\n\n"
+            f"**Certified at `{sha[:7]}`**: {why}. The pull request merges automatically once its CI is green.")
 
 
 def cmd_review(args: argparse.Namespace) -> int:
@@ -874,15 +935,15 @@ def cmd_change(args: argparse.Namespace) -> int:
     rt = Runtime(caller, args.base_sha, pathlib.Path(args.verify_command_file).read_text() if args.verify_command_file else "",
                  args.verify_timeout, args.max_iterations, args.max_verify_retries, args.writer_rounds,
                  context, "", 0, start=start, fix_kind="fix")
-    limit = (args.max_iterations + 1) * (args.max_verify_retries + 1) * 6 + 30
-    final = build_graph(rt).invoke({"plan": plan, "iteration": 1, "verify_attempts": 0, "notes": [], "rounds": [],
-                                    "failure_output": failure_output}, config={"recursion_limit": limit})
+    final = invoke_with_retry(lambda attempt, previous: boosted(rt, attempt, previous),
+                              {"plan": plan, "iteration": 1, "verify_attempts": 0, "notes": [], "rounds": [],
+                               "failure_output": failure_output})
 
-    outcome = final.get("outcome", "failed")
+    outcome = settle(final.get("outcome", "failed"))
     new_commits = int(git("rev-list", "--count", f"{head_sha}..HEAD").stdout.strip() or 0)
     touched_now = [n for n in git("diff", "--name-only", head_sha, "HEAD").stdout.split("\n") if n]
     if any(n.startswith(".github/workflows/") for n in touched_now):
-        outcome, new_commits = "failed", 0
+        outcome, new_commits = "abandoned", 0
         final["notes"] = final.get("notes", []) + ["refusing to publish: the agent touched .github/workflows/"]
     if outcome == "converged" and new_commits == 0:
         outcome = "clean"
@@ -890,13 +951,14 @@ def cmd_change(args: argparse.Namespace) -> int:
     sha7 = head_sha[:7]
     result = {
         "mode": args.mode, "outcome": outcome, "branch": branch, "head_sha": head_sha, "commits": new_commits,
+        "final_sha": git("rev-parse", "HEAD").stdout.strip(),
         "plan": plan, "notes": final.get("notes", []), "rounds": rounds,
         "findings": rounds[-1]["findings"] if rounds else [], "files": touched_now, "cost_usd": caller.total_cost_usd(),
         "adjudications": final.get("adjudications", []),
         "cost_by_role": caller.cost_by_role(),
-        "title": f"{'[needs human] ' if outcome == 'escalated' else ''}fix(agent): address review findings of {sha7}",
+        "title": f"fix(agent): address review findings of {sha7}",
     }
-    if args.mode == "push" and outcome in ("converged", "escalated"):
+    if args.mode == "push" and outcome == "converged":
         plan["summary"] = f"Review of {sha7}: {title[:120]}"
         (OUT_DIR / "pr-body.md").write_text(build_pr_body(plan, final, 0, result["cost_usd"], result["cost_by_role"]))
     write_result(result)
@@ -907,14 +969,19 @@ def cmd_change(args: argparse.Namespace) -> int:
 def build_change_comment(result: dict, pushed_ok: bool | None) -> str:
     outcome = result["outcome"]
     n = result.get("commits", 0)
+    sha = result.get("final_sha", "")
+    certified = outcome in ("clean", "converged") and pushed_ok is not False and bool(sha)
+    last_note = (result.get("notes") or ["no detail"])[-1].splitlines()[0][:300]
     status = {
         "clean": "No blocking findings, and the deterministic checks pass. Nothing was changed.",
         "converged": f"The agent fixed this and {'pushed' if pushed_ok else 'could not push'} {n} commit(s) to the branch. "
                      "Checks and every review pass.",
-        "escalated": "**This needs a person.** The loop stopped without converging; what is still open is below.",
-        "failed": "**The checks fail and the agent could not fix them.**",
+        "abandoned": f"**The agent abandoned this change** after a second attempt with twice the budget ({last_note}). "
+                     "Nothing was merged and the base branch is untouched.",
     }.get(outcome, outcome)
-    parts = ["<!-- agent-pr -->", "## Agent review", status]
+    if certified:
+        status += f" **Certified at `{sha[:7]}`**: it merges automatically once its CI is green."
+    parts = ["<!-- agent-pr -->" + (f"\n<!-- {CERT_MARKER}: {sha} -->" if certified else ""), "## Agent review", status]
     rounds = result.get("rounds", [])
     if rounds:
         table = ["| Iteration | Stage | Findings | Blocking | Dropped (not on a changed line) |", "|---|---|---|---|---|"]
@@ -931,14 +998,14 @@ def build_change_comment(result: dict, pushed_ok: bool | None) -> str:
     if result.get("notes"):
         parts.append("### Notes\n" + "\n".join(f"- {x}" for x in result["notes"]))
     parts.append(f"_Reviewer A (correctness/design) and reviewer B (security/operability), independent. "
-                 f"Model cost ${result.get('cost_usd', 0):.4f}. Nothing is merged automatically._")
+                 f"Model cost ${result.get('cost_usd', 0):.4f}._")
     return "\n\n".join(parts)
 
 
 def cmd_publish_pr(args: argparse.Namespace) -> int:
     result = json.loads((OUT_DIR / "result.json").read_text())
     pushed_ok: bool | None = None
-    if result["outcome"] in ("converged", "escalated") and result.get("commits"):
+    if result["outcome"] == "converged" and result.get("commits"):
         token = os.environ.get("AGENT_PUSH_TOKEN", "")
         if not token:
             print("::error::AGENT_PUSH_TOKEN is not set: fixes pushed as GITHUB_TOKEN would not re-run the PR checks.",
@@ -956,8 +1023,138 @@ def cmd_publish_pr(args: argparse.Namespace) -> int:
     comments = gh_json([f"repos/{args.repo}/issues/{args.pr}/comments?per_page=100"]) or []
     existing = next((c for c in comments if "<!-- agent-pr -->" in (c.get("body") or "")), None)
     post_comment(args.repo, args.pr, build_change_comment(result, pushed_ok), existing)
-    if result["outcome"] in ("escalated", "failed"):
-        _gh("pr", "edit", str(args.pr), "--repo", args.repo, "--add-label", "needs-human")  # best effort
+    if result["outcome"] == "abandoned":
+        # Terminal, with no hand-off: the PR is labelled so the merge gate never touches it, and
+        # a PR the agent itself opened is closed. A person's own PR is left open and unmerged.
+        _gh("pr", "edit", str(args.pr), "--repo", args.repo, "--add-label", ABANDONED_LABEL)  # best effort
+        if args.head_ref.startswith("agent/"):
+            _gh("pr", "close", str(args.pr), "--repo", args.repo)
+    return 0
+
+
+# --- merge authority and the safety net after the merge ----------------------
+
+CODE_JOBS = ("build", "quality-gate", "k8s-check", "docker")   # failures a code change can cause
+REVERT_PREFIX = "revert(agent)"
+
+
+def recent_reverts(repo: str, branch: str, hours: int = 24) -> int:
+    """How many automatic reverts landed on `branch` lately. This is the circuit
+    breaker: stateless (it reads the history, nothing to keep in sync), and it
+    stops automatic merging when the pipeline keeps shipping things that break."""
+    since = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    commits = gh_json([f"repos/{repo}/commits?sha={branch}&since={since}&per_page=100"]) or []
+    return sum(1 for c in commits if ((c.get("commit") or {}).get("message") or "").startswith(REVERT_PREFIX))
+
+
+def is_certified(comments: list[dict], head_sha: str, trusted: set[str]) -> bool:
+    """Certified = a comment by a trusted account carries the marker for exactly
+    this head commit. Anyone can post a comment, so the author is checked; a new
+    push changes the sha and the certification no longer applies."""
+    marker = f"<!-- {CERT_MARKER}: {head_sha} -->"
+    return any(marker in (c.get("body") or "") and (c.get("user") or {}).get("login") in trusted for c in comments)
+
+
+def cmd_merge_gate(args: argparse.Namespace) -> int:
+    """Merge a pull request when, and only when: it is open, not abandoned, its
+    head commit is certified, the circuit breaker is closed, and the required
+    CI checks have succeeded on that same commit (try_merge)."""
+    pr = gh_json([f"repos/{args.repo}/pulls/{args.pr}"])
+    if not pr or pr.get("state") != "open" or pr.get("draft"):
+        log("not mergeable: the PR is closed or a draft")
+        return 0
+    head = pr["head"]["sha"]
+    if ((pr["head"].get("repo") or {}).get("full_name")) != args.repo:
+        log("not merging a PR from a fork")
+        return 0
+    if ABANDONED_LABEL in {label["name"] for label in pr.get("labels", [])}:
+        log("not merging: the agent abandoned this change")
+        return 0
+    comments = gh_json([f"repos/{args.repo}/issues/{args.pr}/comments?per_page=100"]) or []
+    trusted = {t.strip() for t in args.trusted.split(",") if t.strip()}
+    if not is_certified(comments, head, trusted):
+        log(f"not merging: nothing certifies {head[:7]} yet (a later run, or the next push, will)")
+        return 0
+    reverts = recent_reverts(args.repo, args.base_branch)
+    if reverts >= args.max_reverts:
+        log(f"not merging: circuit breaker open ({reverts} automatic reverts in 24h). Merging resumes by itself as they age out.")
+        return 0
+    required = tuple(c.strip() for c in args.required_checks.split(",") if c.strip())
+    outcome = try_merge(args.repo, args.pr, head, args.merge_method, required,
+                        poll_seconds=args.poll_seconds, poll_interval=15)
+    log(f"merge gate: {outcome}")
+    return 0
+
+
+def failing_job_names(repo: str, run_id: int) -> list[str]:
+    jobs = (gh_json([f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"]) or {}).get("jobs", [])
+    return [j["name"] for j in jobs if j.get("conclusion") == "failure"]
+
+
+def cmd_main_guard(args: argparse.Namespace) -> int:
+    """The base branch went red after a merge. If a code change plausibly caused
+    it, take the change out at once (git revert, pushed with the agent token) and
+    open an issue labelled `agent` so the whole pipeline redoes it, this time
+    knowing why it broke. Never reverts a revert, and stops at the breaker."""
+    run = gh_json([f"repos/{args.repo}/actions/runs/{args.run_id}"]) or {}
+    sha = run.get("head_sha", "")
+    if run.get("head_branch") != args.base_branch or run.get("conclusion") != "failure" or not sha:
+        log("nothing to guard: not a failed run on the base branch")
+        return 0
+
+    def note(text: str) -> int:
+        log(text)
+        _gh("api", f"repos/{args.repo}/commits/{sha}/comments", "-f", f"body=Main guard: {text}")
+        return 0
+
+    subject = ((gh_json([f"repos/{args.repo}/commits/{sha}"]) or {}).get("commit") or {}).get("message", "").splitlines()[:1]
+    subject = subject[0] if subject else sha[:7]
+    if subject.startswith(REVERT_PREFIX):
+        return note("the automatic revert is itself red; not reverting a revert")
+    failed = failing_job_names(args.repo, args.run_id)
+    if not set(failed) & set(CODE_JOBS):
+        return note(f"not reverting: the failed jobs ({', '.join(failed) or 'none'}) are not ones a code change causes "
+                    "(supply chain / scanners)")
+    earlier = (gh_json([f"repos/{args.repo}/actions/workflows/{run['workflow_id']}/runs?branch={args.base_branch}"
+                        "&status=completed&per_page=10"]) or {}).get("workflow_runs", [])
+    previous = next((r for r in earlier if r["run_number"] < run["run_number"]), None)
+    if previous is None or previous.get("conclusion") != "success":
+        return note("not reverting: the branch was already red before this commit, so it is not the cause")
+    if recent_reverts(args.repo, args.base_branch) >= args.max_reverts:
+        return note("not reverting: circuit breaker open (too many automatic reverts in 24h)")
+
+    token = os.environ.get("AGENT_PUSH_TOKEN", "")
+    if not token:
+        print("::error::AGENT_PUSH_TOKEN is not set: cannot push the revert", file=sys.stderr)
+        return 1
+    header = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    git("config", "user.name", AGENT_AUTHOR)
+    git("config", "user.email", "actions@github.com")
+    message = (f"{REVERT_PREFIX}: {subject} (pipeline red)\n\nReverts {sha}. Failed jobs: {', '.join(failed)}.\n"
+               "An issue labelled `agent` redoes the change.")
+    for attempt in range(1, 4):
+        git("fetch", "--quiet", "origin", args.base_branch)
+        git("checkout", "--quiet", "-B", args.base_branch, f"origin/{args.base_branch}")
+        if git("revert", "--no-commit", sha).returncode != 0:
+            git("revert", "--abort")
+            return note(f"could not revert {sha[:7]} cleanly (later commits depend on it); leaving the branch as it is")
+        git("commit", "--quiet", "-m", message)
+        pushed = subprocess.run(["git", "-c", f"http.https://github.com/.extraheader=AUTHORIZATION: basic {header}",
+                                 "push", "--quiet", "origin", f"HEAD:refs/heads/{args.base_branch}"],
+                                capture_output=True, text=True)
+        if pushed.returncode == 0:
+            break
+        if attempt == 3:
+            print(f"::error::revert push rejected: {pushed.stderr.replace(header, '***')[:300]}", file=sys.stderr)
+            return 1
+    logs = collect_failure_logs(args.repo, sha, 6000) or "(no log excerpt available)"
+    body = (f"The pipeline went red after `{sha[:7]}` (\"{subject}\") merged, so it was reverted automatically.\n\n"
+            f"Failed jobs: {', '.join(failed)}.\n\n## Failure\n```\n{logs[-5000:]}\n```\n\n"
+            f"Implement the original change again: `{subject}`. It must not break the failing checks above.")
+    created = _gh("issue", "create", "--repo", args.repo, "--title", f"Redo: {subject}"[:200], "--body", body, "--label", "agent")
+    if created.returncode != 0:     # the label may not exist yet: still record the work to redo
+        created = _gh("issue", "create", "--repo", args.repo, "--title", f"Redo: {subject}"[:200], "--body", body)
+    log(f"reverted {sha[:7]}; redo issue: {created.stdout.strip() or created.stderr.strip()[:200]}")
     return 0
 
 
@@ -1215,6 +1412,24 @@ def main() -> int:
     rv.add_argument("--head-sha", required=True)
     rv.add_argument("--post", action="store_true")
     rv.set_defaults(fn=cmd_review)
+
+    mg = sub.add_parser("merge-gate", help="merge a certified PR whose CI is green")
+    mg.add_argument("--repo", required=True)
+    mg.add_argument("--pr", type=int, required=True)
+    mg.add_argument("--base-branch", default="main")
+    mg.add_argument("--required-checks", default="")
+    mg.add_argument("--merge-method", default="squash", choices=("merge", "squash", "rebase"))
+    mg.add_argument("--poll-seconds", type=int, default=120)
+    mg.add_argument("--trusted", required=True, help="comma-separated logins whose certification comments count")
+    mg.add_argument("--max-reverts", type=int, default=3)
+    mg.set_defaults(fn=cmd_merge_gate)
+
+    mgd = sub.add_parser("main-guard", help="revert the commit that turned the base branch red, and open a redo issue")
+    mgd.add_argument("--repo", required=True)
+    mgd.add_argument("--run-id", type=int, required=True)
+    mgd.add_argument("--base-branch", default="main")
+    mgd.add_argument("--max-reverts", type=int, default=3)
+    mgd.set_defaults(fn=cmd_main_guard)
 
     d = sub.add_parser("docs-plan")
     model_args(d)

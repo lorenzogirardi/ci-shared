@@ -11,8 +11,9 @@ name: Reusable Agent Pipeline
 #     scrubbed environment as well (see agent_lib.run_verify_isolated), and
 #     the checkout keeps no credentials in .git/config.
 #   - only the `publish` step has the write token, and it runs no repo code.
-# Nothing here merges. A run that does not converge opens a DRAFT PR titled
-# "[needs human]" instead.
+# Nothing here merges: the merge gate does, for a certified head commit whose CI is green.
+# A run that does not converge is retried once with twice the budget, then the request
+# is abandoned (commented on the issue; nothing is pushed).
 
 on:
   workflow_call:

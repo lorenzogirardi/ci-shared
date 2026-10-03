@@ -44,7 +44,7 @@ for repos that have not moved. All reusable workflows in `v2` check out
 
 | Workflow | Roles | Writes? |
 |---|---|---|
-| `reusable_agent-pipeline.yml` | planner -> writer -> deterministic checks -> reviewer A (correctness/design) + reviewer B (security/operability) -> dedup/validation -> bounded fix loop -> final reviewer -> documentation reviewer -> changelog | opens a PR (draft + `[needs human]` if the loop does not converge); never merges |
+| `reusable_agent-pipeline.yml` | planner -> writer -> deterministic checks -> reviewer A (correctness/design) + reviewer B (security/operability) -> dedup/validation -> bounded fix loop -> final reviewer -> documentation reviewer -> changelog | opens a PR certified at its head commit; retried once with twice the budget, then abandoned (commented, nothing pushed); never merges itself |
 | `reusable_agent-change.yml` | the same engine on a change that already exists, no planner: `mode: pr` (any PR: checks, reviewers A+B, fixes pushed to the PR branch, final reviewer, docs) or `mode: push` (a push straight to the default branch: review, then a fix PR if something blocks) | fix commits on the PR branch, or a PR from `agent/push-<sha>`; never merges; ignores its own commits |
 | `reusable_agent-review.yml` | reviewers A and B on any PR diff | one comment |
 | `reusable_changelog.yml` | none (deterministic) | one `docs(changelog)` commit per push to the default branch |

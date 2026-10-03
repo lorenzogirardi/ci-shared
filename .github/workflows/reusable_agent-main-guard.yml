@@ -1,0 +1,61 @@
+name: Reusable Agent Main Guard
+
+# The safety net after the merge. Called when the pipeline on the base branch
+# FAILED. If a code change plausibly caused it, that commit is reverted at once
+# (git revert, pushed with the agent token) and an issue labelled `agent` is
+# opened with the failure, so the whole pipeline redoes the change knowing why
+# it broke. It does NOT revert when: the failed jobs are not ones a code change
+# causes (scanners, SBOM), the branch was already red before the commit, the
+# commit is itself an automatic revert, or the circuit breaker is open.
+# No repository code runs here.
+
+on:
+  workflow_call:
+    inputs:
+      run_id:
+        required: true
+        type: number
+      base_branch:
+        required: false
+        type: string
+        default: 'main'
+      max_reverts:
+        required: false
+        type: number
+        default: 3
+    secrets:
+      agent_push_token:
+        required: true
+
+permissions: {}
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout the base branch (full history, no credentials kept)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.base_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: lorenzogirardi/ci-shared
+          ref: v2
+          path: .shared
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -q -r .shared/scripts/requirements-autofix.txt
+      - name: Revert the culprit and queue the redo
+        env:
+          AGENT_PUSH_TOKEN: ${{ secrets.agent_push_token }}
+          GH_TOKEN: ${{ secrets.agent_push_token }}
+        run: |
+          python3 .shared/scripts/agent_pipeline.py main-guard \
+            --repo "${{ github.repository }}" --run-id ${{ inputs.run_id }} \
+            --base-branch "${{ inputs.base_branch }}" --max-reverts ${{ inputs.max_reverts }}

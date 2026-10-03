@@ -38,6 +38,16 @@ on:
         required: false
         type: string
         default: 'main'
+      required_checks:
+        description: 'Checks that must have succeeded before the merge gate merges a certified PR (modes pr and ci).'
+        required: false
+        type: string
+        default: ''
+      trusted_logins:
+        description: 'Accounts whose certification comments count. Empty = the repository owner.'
+        required: false
+        type: string
+        default: ''
       max_ci_attempts:
         description: 'mode ci: consecutive agent commits on a branch that may still fail CI before the agent stops.'
         required: false
@@ -213,6 +223,20 @@ jobs:
           python3 .shared/scripts/agent_pipeline.py publish-pr \
             --repo "${{ github.repository }}" --pr ${{ steps.prepare.outputs.pr }} \
             --head-ref "${{ steps.prepare.outputs.head_ref }}"
+
+      - name: Merge gate (merges only a certified head commit whose CI is green)
+        # A pending CI is not waited for here: the merge workflow runs when it finishes.
+        # Both orders work: certification first, then CI -> that run merges; CI first, then
+        # certification -> this step merges.
+        if: steps.guard.outputs.skip != 'true' && inputs.mode != 'push' && inputs.required_checks != ''
+        env:
+          GH_TOKEN: ${{ secrets.agent_push_token }}
+          TRUSTED: ${{ inputs.trusted_logins || github.repository_owner }}
+        run: |
+          python3 .shared/scripts/agent_pipeline.py merge-gate \
+            --repo "${{ github.repository }}" --pr ${{ steps.prepare.outputs.pr }} \
+            --base-branch "${{ inputs.base_branch }}" --required-checks "${{ inputs.required_checks }}" \
+            --poll-seconds 0 --trusted "$TRUSTED"
 
       - name: Publish for a push (fix PR if needed, commit comment for the rest)
         if: steps.guard.outputs.skip != 'true' && inputs.mode == 'push'
