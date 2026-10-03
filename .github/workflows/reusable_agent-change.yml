@@ -1,0 +1,202 @@
+name: Reusable Agent Change
+
+# Runs the pipeline on a change that ALREADY exists, whoever wrote it:
+#   mode: pr    a pull request. Checks -> reviewer A + B -> bounded fix loop
+#               (the agent pushes fix commits to the PR branch) -> final reviewer
+#               -> documentation reviewer. One edited comment on the PR.
+#   mode: push  a push straight to the default branch with no PR. Same review;
+#               if blocking findings need a fix it opens a PR from agent/push-<sha>
+#               (never pushes to the default branch). Advisory findings are left
+#               as a commit comment.
+# There is no planner/writer-from-scratch here; the author's own title and
+# description are the intent. Nothing is merged.
+#
+# Does not loop: every commit the pipeline makes has the author
+# "ci-shared agents", and a run whose head commit has that author does nothing.
+# A push whose commit belongs to a PR is skipped (the PR was reviewed).
+#
+# Credential boundaries are the same as reusable_agent-pipeline.yml: the step
+# that runs the agents has the model key and no write token; the deterministic
+# checks run with no secrets in their environment from a checkout that keeps no
+# credentials; only the last step holds a write token and runs no repo code.
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: '"pr" or "push"'
+        required: true
+        type: string
+      base_branch:
+        required: false
+        type: string
+        default: 'main'
+      python_version:
+        required: false
+        type: string
+        default: '3.12'
+      verify_command:
+        required: true
+        type: string
+      verify_timeout_seconds:
+        required: false
+        type: number
+        default: 900
+      max_iterations:
+        required: false
+        type: number
+        default: 3
+      max_verify_retries:
+        required: false
+        type: number
+        default: 3
+      writer_rounds:
+        required: false
+        type: number
+        default: 8
+      context_files:
+        required: false
+        type: string
+        default: 'CLAUDE.md,README.md'
+      openrouter_model:
+        required: false
+        type: string
+        default: ''
+      openrouter_endpoint:
+        required: false
+        type: string
+        default: ''
+      openrouter_site_url:
+        required: false
+        type: string
+        default: ''
+      openrouter_app_name:
+        required: false
+        type: string
+        default: ''
+    secrets:
+      openrouter_api_key:
+        required: true
+      agent_push_token:
+        description: 'Fine-grained PAT (Contents + Pull requests: read/write, this repo only, no `workflow` scope). Needed to push fixes so the PR checks re-run.'
+        required: true
+
+permissions: {}
+
+jobs:
+  change:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout the change (no credentials kept)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.mode == 'pr' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout shared scripts
+        uses: actions/checkout@v4
+        with:
+          repository: lorenzogirardi/ci-shared
+          ref: v2
+          path: .shared
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Install agent dependencies
+        run: pip install -q -r .shared/scripts/requirements-autofix.txt
+
+      - name: Does this change need a run?
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 .shared/scripts/agent_pipeline.py guard-change \
+            --mode "${{ inputs.mode }}" --repo "${{ github.repository }}" --sha "$(git rev-parse HEAD)"
+
+      - name: Prepare the request (title, description, base) as data files
+        id: prepare
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ inputs.mode }}
+          PR_API: repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          VERIFY_COMMAND: ${{ inputs.verify_command }}
+        run: |
+          set -euo pipefail
+          mkdir -p .ai
+          if [ "$MODE" = "pr" ]; then
+            gh api "$PR_API" --jq '.title' > .ai/change-title.txt
+            gh api "$PR_API" --jq '.body // ""' > .ai/change-body.txt
+            BASE="$PR_BASE"
+          else
+            git log -1 --format=%s > .ai/change-title.txt
+            git log -1 --format=%b > .ai/change-body.txt
+            BASE="$PUSH_BEFORE"
+            if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then BASE="$(git rev-parse HEAD~1)"; fi
+          fi
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$VERIFY_COMMAND" > .ai/verify-command.sh
+
+      - name: Run the agents (model key, no write token)
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.openrouter_api_key }}
+          OPENROUTER_MODEL: ${{ inputs.openrouter_model }}
+          OPENROUTER_ENDPOINT: ${{ inputs.openrouter_endpoint }}
+          OPENROUTER_SITE_URL: ${{ inputs.openrouter_site_url }}
+          OPENROUTER_APP_NAME: ${{ inputs.openrouter_app_name }}
+        run: |
+          set -euo pipefail
+          python3 .shared/scripts/agent_pipeline.py change \
+            --ai-script .shared/scripts/openrouter_ai.py \
+            --mode "${{ inputs.mode }}" \
+            --base-sha "${{ steps.prepare.outputs.base }}" \
+            --title-file .ai/change-title.txt --body-file .ai/change-body.txt \
+            --context-files "${{ inputs.context_files }}" \
+            --verify-command-file .ai/verify-command.sh \
+            --verify-timeout ${{ inputs.verify_timeout_seconds }} \
+            --max-iterations ${{ inputs.max_iterations }} \
+            --max-verify-retries ${{ inputs.max_verify_retries }} \
+            --writer-rounds ${{ inputs.writer_rounds }}
+
+      - name: Publish on the pull request (fixes pushed to its branch, one comment)
+        if: steps.guard.outputs.skip != 'true' && inputs.mode == 'pr'
+        env:
+          AGENT_PUSH_TOKEN: ${{ secrets.agent_push_token }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 .shared/scripts/agent_pipeline.py publish-pr \
+            --repo "${{ github.repository }}" --pr ${{ github.event.pull_request.number }} \
+            --head-ref "${{ github.event.pull_request.head.ref }}"
+
+      - name: Publish for a push (fix PR if needed, commit comment for the rest)
+        if: steps.guard.outputs.skip != 'true' && inputs.mode == 'push'
+        env:
+          AGENT_PUSH_TOKEN: ${{ secrets.agent_push_token }}
+          GH_TOKEN: ${{ secrets.agent_push_token }}
+        run: |
+          python3 .shared/scripts/agent_pipeline.py publish \
+            --repo "${{ github.repository }}" --base-branch "${{ inputs.base_branch }}" \
+            --commit-sha "${{ github.sha }}"
+
+      - name: Upload the run record (prompts, replies, findings, costs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-change-${{ inputs.mode }}-${{ github.run_id }}
+          path: |
+            .ai/agent-run
+            .ai/agents
+          if-no-files-found: ignore
+          include-hidden-files: true
+          retention-days: 14

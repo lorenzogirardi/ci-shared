@@ -7,6 +7,10 @@ Subcommands
              dedup/validate -> fix loop -> final review -> docs -> changelog.
              Commits to a local branch only; holds NO push credential.
   publish    push that branch and open the PR. The only step with a write token.
+  guard-change / change / publish-pr
+             the same engine on a change that already exists: a pull request
+             (fixes are pushed to its branch) or a push straight to main (a fix
+             PR is opened). No planner: the author's description is the intent.
   review     the two independent reviewers on any PR diff (reusable elsewhere)
   docs-plan  documentation architect: a Diataxis-style proposal, read-only
 
@@ -42,6 +46,10 @@ OUT_DIR = pathlib.Path(".ai/agent-run")
 BRANCH_PREFIX = "agent/issue-"
 REVIEWERS = ("reviewer-correctness", "reviewer-security")
 PLANNER_ROUNDS = 6
+# Every commit the pipeline makes carries this author, which is how a run
+# recognises its own pushes and does not review them again (no loops).
+AGENT_AUTHOR = "ci-shared agents"
+_BOT_SUBJECT = re.compile(r"^(Done\s+by Github Actions|docs\(changelog\))", re.IGNORECASE)
 _ADD_EXCLUDES = ("--", ".", ":!.ai", ":!.shared")
 
 
@@ -162,6 +170,8 @@ class Runtime:
     context: str
     changelog_path: str
     issue_number: int
+    start: str = "write"      # "write" (issue), "verify" (existing PR), "review" (a push already on main)
+    fix_kind: str = "feat"    # conventional-commit type of the agent's commits
 
 
 class RunState(TypedDict, total=False):
@@ -190,7 +200,7 @@ def commit_round(message: str) -> bool:
     git("add", "-A", *_ADD_EXCLUDES)
     if git("diff", "--cached", "--quiet").returncode == 0:
         return False
-    git("config", "user.name", "ci-shared agents")
+    git("config", "user.name", AGENT_AUTHOR)
     git("config", "user.email", "actions@github.com")
     done = git("commit", "--quiet", "-m", message)
     if done.returncode != 0:
@@ -253,25 +263,33 @@ def build_graph(rt: Runtime):
     def n_write(state: RunState) -> dict:
         applied, text = run_writer(rt, state["plan"], state.get("feedback", ""))
         if applied is None:
-            return stop(state, "escalated" if state.get("committed") else "failed", f"writer: {text}")
+            reportable = state.get("committed") or state.get("rounds")
+            return stop(state, "escalated" if reportable else "failed", f"writer: {text}")
         return {"route": "verify", "applied": {"edited": applied.edited, "created": applied.created},
                 "explanation": text}
 
     def n_verify(state: RunState) -> dict:
         ok, output = lib.run_verify_isolated(rt.verify_command, rt.verify_timeout)
         log(f"deterministic checks (iteration {state['iteration']}): {'passed' if ok else 'FAILED'}")
-        applied = lib.Applied(state["applied"]["edited"], state["applied"]["created"])
+        raw = state.get("applied")
+        applied = lib.Applied(raw["edited"], raw["created"]) if raw else None
         if ok:
-            kind = "feat" if state["iteration"] == 1 else "fix"
-            commit_round(f"{kind}(agent): {state['explanation'][:120]}\n\nIteration {state['iteration']} of the agent pipeline.")
-            return {"route": "review", "committed": True, "verify_attempts": 0}
-        lib.revert(applied)
+            if applied:
+                kind = rt.fix_kind if state["iteration"] == 1 else "fix"
+                commit_round(f"{kind}(agent): {state['explanation'][:120]}\n\nIteration {state['iteration']} of the agent pipeline.")
+            return {"route": "review", "committed": bool(applied) or state.get("committed", False),
+                    "verify_attempts": 0, "applied": None}
+        if applied:
+            lib.revert(applied)
+            what = "your previous change (reverted)"
+        else:
+            what = "the change as submitted"
         attempts = state.get("verify_attempts", 0) + 1
         if attempts > rt.max_verify_retries:
             return stop(state, "escalated" if state.get("committed") else "failed",
                         f"deterministic checks still failing after {attempts} attempts:\n{output[-1500:]}")
-        return {"route": "write", "verify_attempts": attempts,
-                "feedback": f"FAILED VERIFICATION of your previous change (reverted). Fix this:\n{output}"}
+        return {"route": "write", "verify_attempts": attempts, "applied": None,
+                "feedback": f"FAILED VERIFICATION of {what}. Fix this:\n{output}"}
 
     def after_review(state: RunState, findings: list[lib.Finding], dropped, label: str) -> dict:
         blocking = [f for f in findings if f.blocking]
@@ -280,7 +298,10 @@ def build_graph(rt: Runtime):
             "findings": [f.to_dict() for f in findings], "dropped": len(dropped),
         }]
         if not blocking:
-            return {"route": "docs" if label == "final" else "final", "rounds": rounds}
+            # A final review certifies the agent's own changes; if it made none
+            # (a clean PR or push), the first review already was the verdict.
+            skip_final = label == "final" or not state.get("committed")
+            return {"route": "docs" if skip_final else "final", "rounds": rounds}
         if state["iteration"] >= rt.max_iterations:
             return {**stop(state, "escalated", f"{len(blocking)} blocking finding(s) remain after {state['iteration']} iteration(s)"),
                     "rounds": rounds}
@@ -345,15 +366,19 @@ def build_graph(rt: Runtime):
             notes.append(f"changelog entry added to {rt.changelog_path}")
         return {"route": "end", "outcome": "converged", "notes": notes}
 
+    def n_start(state: RunState) -> dict:
+        return {"route": rt.start}
+
     graph = StateGraph(RunState)
-    for name, fn in (("write", n_write), ("verify", n_verify), ("review", n_review),
+    for name, fn in (("start", n_start), ("write", n_write), ("verify", n_verify), ("review", n_review),
                      ("final", n_final), ("docs", n_docs)):
         graph.add_node(name, fn)
-    graph.set_entry_point("write")
+    graph.set_entry_point("start")
     route = lambda s: s["route"]  # noqa: E731
+    graph.add_conditional_edges("start", route, {"write": "write", "verify": "verify", "review": "review"})
     graph.add_conditional_edges("write", route, {"verify": "verify", "end": END})
     graph.add_conditional_edges("verify", route, {"review": "review", "write": "write", "end": END})
-    graph.add_conditional_edges("review", route, {"final": "final", "write": "write", "end": END})
+    graph.add_conditional_edges("review", route, {"final": "final", "docs": "docs", "write": "write", "end": END})
     graph.add_conditional_edges("final", route, {"docs": "docs", "write": "write", "end": END})
     graph.add_edge("docs", END)
     return graph.compile()
@@ -486,6 +511,15 @@ def cmd_publish(args: argparse.Namespace) -> int:
         if issue:
             _gh("issue", "comment", str(issue), "--repo", args.repo, "--body", text)
 
+    def commit_comment() -> None:
+        if args.commit_sha and result.get("findings"):
+            text = ("## Agent review of this push\n\n" + lib.render_findings_md([lib.Finding(**f) for f in result["findings"]])
+                    + "\n\nNothing is merged automatically.")
+            _gh("api", f"repos/{args.repo}/commits/{args.commit_sha}/comments", "-f", f"body={text}")
+
+    if outcome == "clean":
+        commit_comment()
+        return 0
     if outcome in ("failed", "not_feasible"):
         why = "\n".join(f"- {n}" for n in result.get("notes", [])) or "- no detail"
         comment(("The agent could not plan this request" if outcome == "not_feasible"
@@ -515,6 +549,7 @@ def cmd_publish(args: argparse.Namespace) -> int:
     url = created.stdout.strip()
     for label in (["needs-human"] if outcome == "escalated" else []):
         _gh("pr", "edit", url, "--repo", args.repo, "--add-label", label)  # best effort: label may not exist
+    commit_comment()
     comment(f"Opened {url} ({'draft, needs a person: the loop did not converge' if outcome == 'escalated' else 'checks and reviews passed'}).")
     log(f"opened {url}")
     return 0
@@ -542,6 +577,140 @@ def cmd_review(args: argparse.Namespace) -> int:
         post_comment(args.repo, args.pr, body, existing)
     else:
         print(body)
+    return 0
+
+
+# --- existing changes: a pull request, or a push straight to main ------------
+
+def derived_plan(title: str, body: str) -> dict:
+    """A change that already exists has no planner step: the author's own
+    description is the intent, and the writer may only fix what reviewers or
+    the checks report."""
+    return {"feasible": True, "summary": title[:200] or "Change under review", "reason": "",
+            "scope": [f"The change as described: {title[:200]}" + (f" - {body.strip()[:400]}" if body.strip() else "")],
+            "out_of_scope": ["Anything not needed to fix a failing check or a blocking review finding"],
+            "acceptance_criteria": ["The deterministic checks pass", "No blocking review finding remains"],
+            "files_hint": [], "risks": []}
+
+
+def cmd_guard_change(args: argparse.Namespace) -> int:
+    """Should this run do nothing? Never reviews its own commits (no loops),
+    bookkeeping commits, or a push whose commit belongs to a PR (that PR is
+    reviewed on its own)."""
+    author = git("log", "-1", "--format=%an").stdout.strip()
+    subject = git("log", "-1", "--format=%s").stdout.strip()
+    reason = ""
+    if author == AGENT_AUTHOR:
+        reason = "the head commit was written by this pipeline"
+    elif args.mode == "push":
+        if _BOT_SUBJECT.match(subject):
+            reason = "bookkeeping commit"
+        else:
+            prs = gh_json([f"repos/{args.repo}/commits/{args.sha}/pulls"]) or []
+            if prs:
+                reason = f"the commit belongs to PR #{prs[0]['number']}, which is reviewed there"
+    set_output("skip", "true" if reason else "false")
+    log(f"skipping: {reason}" if reason else "this change needs a run")
+    return 0
+
+
+def cmd_change(args: argparse.Namespace) -> int:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    caller = lib.ModelCaller(args.ai_script, max_chars=args.max_chars, timeout=args.timeout)
+    title = pathlib.Path(args.title_file).read_text().strip()
+    body = pathlib.Path(args.body_file).read_text()
+    context = lib.read_context_files([c.strip() for c in args.context_files.split(",") if c.strip()])
+    head_sha = git("rev-parse", "HEAD").stdout.strip()
+    plan = derived_plan(title, lib.sanitize_untrusted(body, 4000))
+
+    if args.mode == "push":
+        branch = f"agent/push-{head_sha[:7]}"
+        git("checkout", "--quiet", "-B", branch, head_sha)
+        start = "review"   # the push is already on main; checks on main belong to ai-autofix-main
+    else:
+        branch, start = "", "verify"
+    rt = Runtime(caller, args.base_sha, pathlib.Path(args.verify_command_file).read_text() if args.verify_command_file else "",
+                 args.verify_timeout, args.max_iterations, args.max_verify_retries, args.writer_rounds,
+                 context, "", 0, start=start, fix_kind="fix")
+    limit = (args.max_iterations + 1) * (args.max_verify_retries + 1) * 6 + 30
+    final = build_graph(rt).invoke({"plan": plan, "iteration": 1, "verify_attempts": 0, "notes": [], "rounds": []},
+                                   config={"recursion_limit": limit})
+
+    outcome = final.get("outcome", "failed")
+    new_commits = int(git("rev-list", "--count", f"{head_sha}..HEAD").stdout.strip() or 0)
+    touched_now = [n for n in git("diff", "--name-only", head_sha, "HEAD").stdout.split("\n") if n]
+    if any(n.startswith(".github/workflows/") for n in touched_now):
+        outcome, new_commits = "failed", 0
+        final["notes"] = final.get("notes", []) + ["refusing to publish: the agent touched .github/workflows/"]
+    if outcome == "converged" and new_commits == 0:
+        outcome = "clean"
+    rounds = final.get("rounds", [])
+    sha7 = head_sha[:7]
+    result = {
+        "mode": args.mode, "outcome": outcome, "branch": branch, "head_sha": head_sha, "commits": new_commits,
+        "plan": plan, "notes": final.get("notes", []), "rounds": rounds,
+        "findings": rounds[-1]["findings"] if rounds else [], "files": touched_now, "cost_usd": caller.total_cost_usd(),
+        "cost_by_role": caller.cost_by_role(),
+        "title": f"{'[needs human] ' if outcome == 'escalated' else ''}fix(agent): address review findings of {sha7}",
+    }
+    if args.mode == "push" and outcome in ("converged", "escalated"):
+        plan["summary"] = f"Review of {sha7}: {title[:120]}"
+        (OUT_DIR / "pr-body.md").write_text(build_pr_body(plan, final, 0, result["cost_usd"], result["cost_by_role"]))
+    write_result(result)
+    log(f"agent {args.mode} review: {outcome}, {new_commits} new commit(s), ${result['cost_usd']:.4f}")
+    return 0
+
+
+def build_change_comment(result: dict, pushed_ok: bool | None) -> str:
+    outcome = result["outcome"]
+    n = result.get("commits", 0)
+    status = {
+        "clean": "No blocking findings, and the deterministic checks pass. Nothing was changed.",
+        "converged": f"The agent fixed this and {'pushed' if pushed_ok else 'could not push'} {n} commit(s) to the branch. "
+                     "Checks and every review pass.",
+        "escalated": "**This needs a person.** The loop stopped without converging; what is still open is below.",
+        "failed": "**The checks fail and the agent could not fix them.**",
+    }.get(outcome, outcome)
+    parts = ["<!-- agent-pr -->", "## Agent review", status]
+    rounds = result.get("rounds", [])
+    if rounds:
+        table = ["| Iteration | Stage | Findings | Blocking | Dropped (not on a changed line) |", "|---|---|---|---|---|"]
+        for r in rounds:
+            blocking = sum(1 for f in r["findings"] if f["severity"] in lib.BLOCKING)
+            table.append(f"| {r['iteration']} | {r['stage']} | {len(r['findings'])} | {blocking} | {r['dropped']} |")
+        parts.append("\n".join(table))
+    if result.get("findings"):
+        parts.append("### Findings at the last round\n" + lib.render_findings_md([lib.Finding(**f) for f in result["findings"]]))
+    if result.get("notes"):
+        parts.append("### Notes\n" + "\n".join(f"- {x}" for x in result["notes"]))
+    parts.append(f"_Reviewer A (correctness/design) and reviewer B (security/operability), independent. "
+                 f"Model cost ${result.get('cost_usd', 0):.4f}. Nothing is merged automatically._")
+    return "\n\n".join(parts)
+
+
+def cmd_publish_pr(args: argparse.Namespace) -> int:
+    result = json.loads((OUT_DIR / "result.json").read_text())
+    pushed_ok: bool | None = None
+    if result["outcome"] in ("converged", "escalated") and result.get("commits"):
+        token = os.environ.get("AGENT_PUSH_TOKEN", "")
+        if not token:
+            print("::error::AGENT_PUSH_TOKEN is not set: fixes pushed as GITHUB_TOKEN would not re-run the PR checks.",
+                  file=sys.stderr)
+            return 1
+        header = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        pushed = subprocess.run(
+            ["git", "-c", f"http.https://github.com/.extraheader=AUTHORIZATION: basic {header}",
+             "push", "--quiet", "origin", f"HEAD:refs/heads/{args.head_ref}"], capture_output=True, text=True)
+        pushed_ok = pushed.returncode == 0
+        if not pushed_ok:
+            result["notes"] = result.get("notes", []) + [
+                "the fixes could not be pushed (the branch moved while the agent worked): "
+                + pushed.stderr.replace(header, "***").strip()[:200]]
+    comments = gh_json([f"repos/{args.repo}/issues/{args.pr}/comments?per_page=100"]) or []
+    existing = next((c for c in comments if "<!-- agent-pr -->" in (c.get("body") or "")), None)
+    post_comment(args.repo, args.pr, build_change_comment(result, pushed_ok), existing)
+    if result["outcome"] in ("escalated", "failed"):
+        _gh("pr", "edit", str(args.pr), "--repo", args.repo, "--add-label", "needs-human")  # best effort
     return 0
 
 
@@ -754,7 +923,34 @@ def main() -> int:
     r.add_argument("--changelog", default="CHANGELOG.md")
     r.set_defaults(fn=cmd_run)
 
+    gc = sub.add_parser("guard-change")
+    gc.add_argument("--mode", choices=("pr", "push"), required=True)
+    gc.add_argument("--repo", required=True)
+    gc.add_argument("--sha", required=True)
+    gc.set_defaults(fn=cmd_guard_change)
+
+    c = sub.add_parser("change", help="review and fix an existing PR or a push to main")
+    model_args(c)
+    c.add_argument("--mode", choices=("pr", "push"), required=True)
+    c.add_argument("--base-sha", required=True)
+    c.add_argument("--title-file", required=True)
+    c.add_argument("--body-file", required=True)
+    c.add_argument("--context-files", default="CLAUDE.md,README.md")
+    c.add_argument("--verify-command-file", default="")
+    c.add_argument("--verify-timeout", type=int, default=600)
+    c.add_argument("--max-iterations", type=int, default=3)
+    c.add_argument("--max-verify-retries", type=int, default=3)
+    c.add_argument("--writer-rounds", type=int, default=8)
+    c.set_defaults(fn=cmd_change)
+
+    pp = sub.add_parser("publish-pr")
+    pp.add_argument("--repo", required=True)
+    pp.add_argument("--pr", type=int, required=True)
+    pp.add_argument("--head-ref", required=True)
+    pp.set_defaults(fn=cmd_publish_pr)
+
     p = sub.add_parser("publish")
+    p.add_argument("--commit-sha", default="")
     p.add_argument("--repo", required=True)
     p.add_argument("--issue", type=int, default=0)
     p.add_argument("--base-branch", default="main")

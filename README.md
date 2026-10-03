@@ -45,6 +45,7 @@ for repos that have not moved. All reusable workflows in `v2` check out
 | Workflow | Roles | Writes? |
 |---|---|---|
 | `reusable_agent-pipeline.yml` | planner -> writer -> deterministic checks -> reviewer A (correctness/design) + reviewer B (security/operability) -> dedup/validation -> bounded fix loop -> final reviewer -> documentation reviewer -> changelog | opens a PR (draft + `[needs human]` if the loop does not converge); never merges |
+| `reusable_agent-change.yml` | the same engine on a change that already exists, no planner: `mode: pr` (any PR: checks, reviewers A+B, fixes pushed to the PR branch, final reviewer, docs) or `mode: push` (a push straight to the default branch: review, then a fix PR if something blocks) | fix commits on the PR branch, or a PR from `agent/push-<sha>`; never merges; ignores its own commits |
 | `reusable_agent-review.yml` | reviewers A and B on any PR diff | one comment |
 | `reusable_changelog.yml` | none (deterministic) | one `docs(changelog)` commit per push to the default branch |
 | `reusable_docs-architect.yml` | documentation architect (Diataxis) | **nothing**: a proposal, optionally as an issue |
@@ -265,7 +266,7 @@ Nothing needs to be configured in this repo per consumer — it's stateless.
 pytest tests/ -v
 ```
 
-212 tests, no network, no real `gh` calls — `checks_state`, verdict parsing,
+229 tests, no network, no real `gh` calls — `checks_state`, verdict parsing,
 autofix guardrails (`parse_fix`/`apply_fix`), `run_verify`, the
 `autofix_core.py` langgraph graph, `main_autofix.py`'s PR-opening plumbing,
 and `auto_merge_authors` gating are all exercised against fakes.

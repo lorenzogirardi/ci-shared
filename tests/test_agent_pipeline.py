@@ -304,3 +304,198 @@ class TestPublish:
             {"outcome": "converged", "branch": "agent/issue-7-1", "title": "t"}))
         monkeypatch.delenv("AGENT_PUSH_TOKEN", raising=False)
         assert ap.cmd_publish(self.args()) == 1
+
+
+# --- changes that already exist: a pull request, a push to main -------------
+
+def git_out(*a):
+    return subprocess.run(["git", *a], capture_output=True, text=True).stdout.strip()
+
+
+@pytest.fixture
+def pr_repo(repo):
+    """main + a feature branch carrying the change under review."""
+    base = git_out("rev-parse", "HEAD")
+    subprocess.run(["git", "checkout", "-qb", "feature"], check=True)
+    pathlib.Path("greet.py").write_text("def greeting():\n    return 'hello'\n")
+    subprocess.run(["git", "add", "-A"], check=True)
+    subprocess.run(["git", "commit", "-qm", "feat: add greeting"], check=True)
+    return base
+
+
+def run_pr_graph(caller, base, verify="test -f greet.py", start="verify"):
+    rt = ap.Runtime(caller, base, verify, 30, 3, 2, 4, "", "", 0, start=start, fix_kind="fix")
+    final = ap.build_graph(rt).invoke({"plan": ap.derived_plan("Add greeting", ""), "iteration": 1, "verify_attempts": 0,
+                                       "notes": [], "rounds": []}, config={"recursion_limit": 200})
+    return rt, final
+
+
+class TestPullRequestMode:
+    def test_clean_pr_is_certified_without_touching_it(self, pr_repo):
+        head = git_out("rev-parse", "HEAD")
+        caller = FakeCaller({"reviewer-correctness": [no_findings()], "reviewer-security": [no_findings()],
+                             "doc-reviewer": [fence({"explanation": "no doc change needed", "changes": []})]})
+        _, final = run_pr_graph(caller, pr_repo)
+        assert final["outcome"] == "converged"
+        assert git_out("rev-parse", "HEAD") == head
+        roles = [r for r, _ in caller.log]
+        assert "writer" not in roles and "final-reviewer" not in roles  # nothing changed, no second opinion needed
+
+    def test_blocking_finding_is_fixed_on_the_branch_by_the_agent(self, pr_repo):
+        head = git_out("rev-parse", "HEAD")
+        fix = fence({"explanation": "fix greeting", "changes": [
+            {"file": "greet.py", "find": "'hello'", "replace": "'hello, world'"}]})
+        caller = FakeCaller({
+            "writer": [fix], "reviewer-correctness": [blocking_finding(), no_findings()],
+            "reviewer-security": [no_findings()], "final-reviewer": [no_findings()],
+            "doc-reviewer": [fence({"explanation": "none", "changes": []})],
+        })
+        _, final = run_pr_graph(caller, pr_repo)
+        assert final["outcome"] == "converged"
+        assert git_out("rev-list", "--count", f"{head}..HEAD") == "1"
+        assert git_out("log", "-1", "--format=%an") == ap.AGENT_AUTHOR   # how a later run recognises its own push
+        assert git_out("log", "-1", "--format=%s").startswith("fix(agent)")
+
+    def test_a_pr_whose_checks_fail_as_submitted_gets_fixed(self, pr_repo):
+        make_ok = fence({"explanation": "add the missing file", "changes": [{"file": "ok.txt", "content": "ok"}]})
+        caller = FakeCaller({
+            "writer": [make_ok], "reviewer-correctness": [no_findings()], "reviewer-security": [no_findings()],
+            "final-reviewer": [no_findings()], "doc-reviewer": [fence({"explanation": "none", "changes": []})]})
+        _, final = run_pr_graph(caller, pr_repo, verify="test -f ok.txt")
+        assert final["outcome"] == "converged" and pathlib.Path("ok.txt").is_file()
+        assert "the change as submitted" in [u for r, u in caller.log if r == "writer"][0]
+
+    def test_unfixable_blocking_finding_is_reported_not_hidden(self, pr_repo):
+        caller = FakeCaller({"reviewer-correctness": [blocking_finding()], "reviewer-security": [no_findings()]})
+        _, final = run_pr_graph(caller, pr_repo)   # the writer never answers
+        assert final["outcome"] == "escalated" and final["rounds"][-1]["findings"]
+
+
+def change_args(**over):
+    base = dict(ai_script="x", max_chars=1000, timeout=5, title_file=".ai/t.txt", body_file=".ai/b.txt",
+                context_files="", base_sha="", mode="pr", verify_command_file="", verify_timeout=30,
+                max_iterations=3, max_verify_retries=2, writer_rounds=4)
+    base.update(over)
+    pathlib.Path(".ai").mkdir(exist_ok=True)
+    pathlib.Path(".ai/t.txt").write_text("feat: add greeting")
+    pathlib.Path(".ai/b.txt").write_text("body")
+    return type("A", (), base)()
+
+
+class TestChangeCommand:
+    def test_clean_push_to_main_produces_no_branch_content_and_a_clean_result(self, pr_repo, monkeypatch):
+        subprocess.run(["git", "checkout", "-q", "main"], check=True)
+        subprocess.run(["git", "merge", "-q", "--ff-only", "feature"], check=True)
+        caller = FakeCaller({"reviewer-correctness": [no_findings()], "reviewer-security": [no_findings()],
+                             "doc-reviewer": [fence({"explanation": "none", "changes": []})]})
+        monkeypatch.setattr(lib, "ModelCaller", lambda *a, **k: caller)
+        assert ap.cmd_change(change_args(mode="push", base_sha=pr_repo)) == 0
+        result = json.loads(pathlib.Path(".ai/agent-run/result.json").read_text())
+        assert result["outcome"] == "clean" and result["commits"] == 0 and result["branch"].startswith("agent/push-")
+
+    def test_push_with_a_blocking_finding_gets_a_fix_branch(self, pr_repo, monkeypatch):
+        subprocess.run(["git", "checkout", "-q", "main"], check=True)
+        subprocess.run(["git", "merge", "-q", "--ff-only", "feature"], check=True)
+        fix = fence({"explanation": "fix greeting", "changes": [{"file": "greet.py", "find": "'hello'", "replace": "'hi'"}]})
+        caller = FakeCaller({"writer": [fix], "reviewer-correctness": [blocking_finding(), no_findings()],
+                             "reviewer-security": [no_findings()], "final-reviewer": [no_findings()],
+                             "doc-reviewer": [fence({"explanation": "none", "changes": []})]})
+        monkeypatch.setattr(lib, "ModelCaller", lambda *a, **k: caller)
+        assert ap.cmd_change(change_args(mode="push", base_sha=pr_repo)) == 0
+        result = json.loads(pathlib.Path(".ai/agent-run/result.json").read_text())
+        assert result["outcome"] == "converged" and result["commits"] == 1
+        assert git_out("rev-parse", "--abbrev-ref", "HEAD") == result["branch"]
+        assert pathlib.Path(".ai/agent-run/pr-body.md").is_file()
+        assert git_out("rev-parse", "main") != git_out("rev-parse", "HEAD")   # main itself is never touched
+
+    def test_agent_touching_workflows_is_never_published(self, pr_repo, monkeypatch):
+        bad = fence({"explanation": "x", "changes": [{"file": ".github/workflows/x.yml", "content": "x"}]})
+        caller = FakeCaller({"writer": [bad], "reviewer-correctness": [blocking_finding()], "reviewer-security": [no_findings()]})
+        monkeypatch.setattr(lib, "ModelCaller", lambda *a, **k: caller)
+        ap.cmd_change(change_args(mode="pr", base_sha=pr_repo))
+        result = json.loads(pathlib.Path(".ai/agent-run/result.json").read_text())
+        assert result["outcome"] in ("escalated", "failed") and not pathlib.Path(".github").exists()
+
+
+class TestGuardChange:
+    def run_guard(self, monkeypatch, tmp_path, mode, prs=None):
+        out = tmp_path / "out.txt"
+        out.unlink(missing_ok=True)
+        monkeypatch.setenv("GITHUB_OUTPUT", str(out))
+        monkeypatch.setattr(ap, "gh_json", lambda a: prs or [])
+        args = type("A", (), {"mode": mode, "repo": "o/r", "sha": git_out("rev-parse", "HEAD")})()
+        ap.cmd_guard_change(args)
+        return out.read_text().strip()
+
+    def test_own_commit_is_skipped_in_both_modes(self, repo, monkeypatch, tmp_path):
+        pathlib.Path("a.txt").write_text("x")
+        subprocess.run(["git", "add", "-A"], check=True)
+        subprocess.run(["git", "-c", f"user.name={ap.AGENT_AUTHOR}", "commit", "-qm", "fix(agent): x"], check=True)
+        assert self.run_guard(monkeypatch, tmp_path, "pr") == "skip=true"
+
+    def test_human_pr_runs(self, repo, monkeypatch, tmp_path):
+        assert self.run_guard(monkeypatch, tmp_path, "pr") == "skip=false"
+
+    def test_push_that_belongs_to_a_pr_or_is_bookkeeping_is_skipped(self, repo, monkeypatch, tmp_path):
+        assert self.run_guard(monkeypatch, tmp_path, "push", prs=[{"number": 4}]) == "skip=true"
+        subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "Done  by Github Actions   Job changemanifest: 9"], check=True)
+        assert self.run_guard(monkeypatch, tmp_path, "push") == "skip=true"
+
+    def test_direct_push_with_no_pr_runs(self, repo, monkeypatch, tmp_path):
+        assert self.run_guard(monkeypatch, tmp_path, "push") == "skip=false"
+
+
+class TestPublishPr:
+    def result(self, **over):
+        base = {"outcome": "clean", "commits": 0, "rounds": [], "findings": [], "notes": [], "cost_usd": 0.01}
+        base.update(over)
+        return base
+
+    def test_comment_says_what_happened(self):
+        assert "Nothing was changed" in ap.build_change_comment(self.result(), None)
+        assert "pushed 2 commit" in ap.build_change_comment(self.result(outcome="converged", commits=2), True)
+        assert "could not push" in ap.build_change_comment(self.result(outcome="converged", commits=1), False)
+        text = ap.build_change_comment(self.result(outcome="escalated", findings=[
+            {"severity": "high", "file": "a.py", "line": 1, "category": "bug", "evidence": "e", "problem": "p",
+             "suggestion": "s", "reviewers": ["reviewer-correctness"]}], rounds=[
+            {"iteration": 1, "stage": "review", "findings": [{"severity": "high"}], "dropped": 0}]), None)
+        assert "needs a person" in text and "`a.py:1`" in text and text.startswith("<!-- agent-pr -->")
+
+    def args(self):
+        return type("A", (), {"repo": "o/r", "pr": 5, "head_ref": "feature"})()
+
+    def test_clean_run_only_comments_and_never_needs_the_push_token(self, repo, monkeypatch):
+        (repo / ".ai/agent-run").mkdir(parents=True)
+        (repo / ".ai/agent-run/result.json").write_text(json.dumps(self.result()))
+        posted = []
+        monkeypatch.setattr(ap, "gh_json", lambda a: [])
+        monkeypatch.setattr(ap, "post_comment", lambda repo_, n, body, existing: posted.append((n, body)))
+        monkeypatch.delenv("AGENT_PUSH_TOKEN", raising=False)
+        assert ap.cmd_publish_pr(self.args()) == 0 and posted[0][0] == 5
+
+    def test_fixes_cannot_be_pushed_without_the_token(self, repo, monkeypatch):
+        (repo / ".ai/agent-run").mkdir(parents=True)
+        (repo / ".ai/agent-run/result.json").write_text(json.dumps(self.result(outcome="converged", commits=1)))
+        monkeypatch.delenv("AGENT_PUSH_TOKEN", raising=False)
+        assert ap.cmd_publish_pr(self.args()) == 1
+
+    def test_a_rejected_push_is_reported_in_the_comment(self, repo, monkeypatch):
+        (repo / ".ai/agent-run").mkdir(parents=True)
+        (repo / ".ai/agent-run/result.json").write_text(json.dumps(self.result(outcome="converged", commits=1)))
+        monkeypatch.setenv("AGENT_PUSH_TOKEN", "pat")
+        posted = []
+        monkeypatch.setattr(ap, "gh_json", lambda a: [])
+        monkeypatch.setattr(ap, "post_comment", lambda repo_, n, body, existing: posted.append(body))
+        assert ap.cmd_publish_pr(self.args()) == 0   # no remote in the test repo, so the push fails
+        assert "could not push" in posted[0] and "pat" not in posted[0].replace("push", "")
+
+    def test_push_review_with_only_advisory_findings_leaves_a_commit_comment(self, repo, monkeypatch):
+        (repo / ".ai/agent-run").mkdir(parents=True)
+        (repo / ".ai/agent-run/result.json").write_text(json.dumps(self.result(findings=[
+            {"severity": "low", "file": "a.py", "line": 1, "category": "design", "evidence": "e", "problem": "p",
+             "suggestion": "s", "reviewers": ["reviewer-correctness"]}])))
+        calls = []
+        monkeypatch.setattr(ap, "_gh", lambda *a: calls.append(a) or subprocess.CompletedProcess(a, 0, "", ""))
+        args = type("A", (), {"repo": "o/r", "issue": 0, "base_branch": "main", "commit_sha": "abc"})()
+        assert ap.cmd_publish(args) == 0
+        assert calls and calls[0][1] == "repos/o/r/commits/abc/comments"
