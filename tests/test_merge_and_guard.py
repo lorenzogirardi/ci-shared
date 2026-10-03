@@ -3,6 +3,7 @@ head commit is certified by a trusted author and CI is green; if the base branch
 turns red, the culprit is reverted by itself and the work is queued again."""
 
 import argparse
+import json
 import pathlib
 import subprocess
 import sys
@@ -76,9 +77,8 @@ class TestMergeGate:
         assert call[:4] == ("o/r", 5, HEAD, "squash") and call[4] == ("checks", "integration", "workflows")
 
     @pytest.mark.parametrize("pr", [pr_data(draft=True), pr_data(state="closed"),
-                                    pr_data(head={"sha": HEAD, "repo": {"full_name": "fork/r"}}),
-                                    pr_data(labels=[{"name": ap.ABANDONED_LABEL}])])
-    def test_draft_closed_fork_or_abandoned_is_never_merged(self, gate, pr):
+                                    pr_data(head={"sha": HEAD, "repo": {"full_name": "fork/r"}})])
+    def test_draft_closed_or_fork_is_never_merged(self, gate, pr):
         merges = gate(pr=pr)
         ap.cmd_merge_gate(gate_args())
         assert merges == []
@@ -295,3 +295,64 @@ class TestMergeEverythingOpen:
         merges = gate(comments=[cert(login="github-actions[bot]")])
         ap.cmd_merge_gate(gate_args(trusted="owner,github-actions[bot]"))
         assert len(merges) == 1
+
+
+def abandoned(sha=HEAD):
+    return {"user": {"login": "github-actions[bot]"}, "body": f"<!-- agent-pr -->\n<!-- agent-abandoned: {sha} -->\nabandoned"}
+
+
+class TestAbandonmentIsTerminalPerCommit:
+    """Found live: a PR the agent had abandoned was handed to the repair loop again by the next failed CI run,
+    which paid for the same conclusion twice. Abandonment is bound to the head commit like the certification:
+    the same commit is never retried, a new push by the author starts a fresh attempt."""
+
+    def test_an_abandoned_commit_is_never_merged_even_if_it_was_certified_earlier(self, gate):
+        merges = gate(comments=[cert(), abandoned()])
+        ap.cmd_merge_gate(gate_args())
+        assert merges == []
+
+    def test_an_abandonment_of_an_older_commit_does_not_block_a_new_one(self, gate):
+        merges = gate(comments=[abandoned(OLD), cert()])
+        ap.cmd_merge_gate(gate_args())
+        assert len(merges) == 1
+
+    def test_the_label_blocks_until_the_new_commit_is_certified(self, gate):
+        labelled = pr_data(labels=[{"name": ap.ABANDONED_LABEL}])
+        blocked = gate(pr=labelled, comments=[])
+        ap.cmd_merge_gate(gate_args())
+        assert blocked == []
+        merged = gate(pr=labelled, comments=[cert()])                       # the author pushed a fix and it was certified
+        ap.cmd_merge_gate(gate_args())
+        assert len(merged) == 1
+
+    def test_the_repair_loop_does_not_run_again_on_an_abandoned_commit(self, remote, monkeypatch, tmp_path):
+        out = tmp_path / "o.txt"
+        monkeypatch.setenv("GITHUB_OUTPUT", str(out))
+        sha = git("rev-parse", "HEAD")
+        monkeypatch.setattr(ap, "gh_json", lambda a: [abandoned(sha)])
+        for mode in ("ci", "pr"):
+            out.unlink(missing_ok=True)
+            ap.cmd_guard_change(type("A", (), {"mode": mode, "repo": "o/r", "sha": sha, "pr": 5, "max_streak": 3})())
+            assert out.read_text().strip() == "skip=true", mode
+
+    def test_a_new_commit_after_the_abandonment_gets_a_fresh_attempt(self, remote, monkeypatch, tmp_path):
+        out = tmp_path / "o.txt"
+        monkeypatch.setenv("GITHUB_OUTPUT", str(out))
+        monkeypatch.setattr(ap, "gh_json", lambda a: [abandoned(OLD)])
+        ap.cmd_guard_change(type("A", (), {"mode": "ci", "repo": "o/r", "sha": git("rev-parse", "HEAD"), "pr": 5, "max_streak": 3})())
+        assert out.read_text().strip() == "skip=false"
+
+    def test_the_comment_binds_the_abandonment_to_the_head_the_agent_worked_on(self):
+        text = ap.build_change_comment({"outcome": "abandoned", "head_sha": HEAD, "notes": ["why"], "commits": 0}, None)
+        assert f"<!-- agent-abandoned: {HEAD} -->" in text and "agent-certified" not in text
+
+    def test_a_certification_takes_the_abandoned_label_off(self, remote, monkeypatch):
+        (pathlib.Path(".ai/agent-run")).mkdir(parents=True, exist_ok=True)
+        (pathlib.Path(".ai/agent-run/result.json")).write_text(json.dumps(
+            {"outcome": "clean", "commits": 0, "rounds": [], "findings": [], "notes": [], "final_sha": HEAD, "cost_usd": 0}))
+        calls = []
+        monkeypatch.setattr(ap, "_gh", lambda *a: calls.append(a) or subprocess.CompletedProcess(a, 0, "", ""))
+        monkeypatch.setattr(ap, "gh_json", lambda a: [])
+        monkeypatch.setattr(ap, "post_comment", lambda *a: None)
+        ap.cmd_publish_pr(type("A", (), {"repo": "o/r", "pr": 5, "head_ref": "feature"})())
+        assert any("--remove-label" in c and ap.ABANDONED_LABEL in c for c in calls)

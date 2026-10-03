@@ -141,12 +141,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           MODE: ${{ inputs.mode }}
-          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number }}
           FAILED_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           python3 .shared/scripts/agent_pipeline.py guard-change \
             --mode "$MODE" --repo "${{ github.repository }}" --sha "$(git rev-parse HEAD)" \
-            --max-streak ${{ inputs.max_ci_attempts }}
+            --pr "${PR_NUMBER:-0}" --max-streak ${{ inputs.max_ci_attempts }}
           # A failed run for a commit that is no longer the PR head is stale: a
           # newer push (often the agent's own fix) already superseded it. The
           # last write to GITHUB_OUTPUT wins.
