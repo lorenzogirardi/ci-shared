@@ -298,6 +298,11 @@ def run_writer(rt: Runtime, plan: dict, feedback: str):
         changes, explanation = parsed
         if not changes:
             return None, explanation or "the writer found nothing it could change safely"
+        problems = lib.validate_patch(changes, plan)
+        if problems:
+            history.append(f"Round {rnd}: your patch was refused before it touched anything: " + "; ".join(problems)
+                           + ". Propose a patch that respects the plan and the policy.")
+            continue
         applied = lib.apply_changes(changes)
         if applied.error:
             history.append(f"Round {rnd}: applying your changes failed: {applied.error}")
@@ -762,8 +767,9 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     outcome = settle(final.get("outcome", "failed"))
     touched = changed_files(base_sha)
-    if any(n.startswith(".github/workflows/") for n in touched):
-        outcome, final["notes"] = "abandoned", final.get("notes", []) + ["refusing to publish: touches .github/workflows/"]
+    violations = lib.policy_violations(base_sha)
+    if violations:
+        outcome, final["notes"] = "abandoned", final.get("notes", []) + ["refusing to publish, policy: " + "; ".join(violations)]
     if outcome != "abandoned" and not touched:
         outcome = "abandoned"
         final["notes"] = final.get("notes", []) + ["the agent produced no change"]
@@ -944,9 +950,10 @@ def cmd_change(args: argparse.Namespace) -> int:
     outcome = settle(final.get("outcome", "failed"))
     new_commits = int(git("rev-list", "--count", f"{head_sha}..HEAD").stdout.strip() or 0)
     touched_now = [n for n in git("diff", "--name-only", head_sha, "HEAD").stdout.split("\n") if n]
-    if any(n.startswith(".github/workflows/") for n in touched_now):
+    violations = lib.policy_violations(head_sha)       # only what the agents added, not the author's own commits
+    if violations:
         outcome, new_commits = "abandoned", 0
-        final["notes"] = final.get("notes", []) + ["refusing to publish: the agent touched .github/workflows/"]
+        final["notes"] = final.get("notes", []) + ["refusing to publish, policy: " + "; ".join(violations)]
     if outcome == "converged" and new_commits == 0:
         outcome = "clean"
     rounds = final.get("rounds", [])
