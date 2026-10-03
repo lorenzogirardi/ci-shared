@@ -55,6 +55,7 @@ REVIEWERS = ("reviewer-correctness", "reviewer-security")
 PLANNER_ROUNDS = 6
 RETRY_BOOST = 2
 CERT_MARKER = "agent-certified"
+ABANDON_MARKER = "agent-abandoned"
 ABANDONED_LABEL = "agent-abandoned"
 # Every way a change can end, and what the system does about it. None of them
 # waits for a person; tests/test_terminal_states.py fails if one ever does.
@@ -900,6 +901,12 @@ def cmd_guard_change(args: argparse.Namespace) -> int:
     author = git("log", "-1", "--format=%an").stdout.strip()
     subject = git("log", "-1", "--format=%s").stdout.strip()
     reason = ""
+    if getattr(args, "pr", 0) and args.mode in ("pr", "ci"):
+        comments = gh_json([f"repos/{args.repo}/issues/{args.pr}/comments?per_page=100"]) or []
+        if is_abandoned(comments, args.sha):
+            set_output("skip", "true")
+            log("skipping: the agent already abandoned this exact commit; a new push starts a new attempt")
+            return 0
     if args.mode == "ci":
         # A failed CI run on the agent's own fix is exactly when to try again,
         # but only a bounded number of times in a row.
@@ -997,7 +1004,9 @@ def build_change_comment(result: dict, pushed_ok: bool | None) -> str:
     }.get(outcome, outcome)
     if certified:
         status += f" **Certified at `{sha[:7]}`**: it merges automatically once its CI is green."
-    parts = ["<!-- agent-pr -->" + (f"\n<!-- {CERT_MARKER}: {sha} -->" if certified else ""), "## Agent review", status]
+    abandoned_head = result.get("head_sha", "") if outcome == "abandoned" else ""
+    parts = ["<!-- agent-pr -->" + (f"\n<!-- {CERT_MARKER}: {sha} -->" if certified else "")
+             + (f"\n<!-- {ABANDON_MARKER}: {abandoned_head} -->" if abandoned_head else ""), "## Agent review", status]
     rounds = result.get("rounds", [])
     if rounds:
         table = ["| Iteration | Stage | Findings | Blocking | Dropped (not on a changed line) |", "|---|---|---|---|---|"]
@@ -1039,6 +1048,9 @@ def cmd_publish_pr(args: argparse.Namespace) -> int:
     comments = gh_json([f"repos/{args.repo}/issues/{args.pr}/comments?per_page=100"]) or []
     existing = next((c for c in comments if "<!-- agent-pr -->" in (c.get("body") or "")), None)
     post_comment(args.repo, args.pr, build_change_comment(result, pushed_ok), existing)
+    if result["outcome"] in ("clean", "converged"):
+        # A new push by the author, now certified, is not abandoned any more.
+        _gh("pr", "edit", str(args.pr), "--repo", args.repo, "--remove-label", ABANDONED_LABEL)  # best effort
     if result["outcome"] == "abandoned":
         # Terminal, with no hand-off: the PR is labelled so the merge gate never touches it, and
         # a PR the agent itself opened is closed. A person's own PR is left open and unmerged.
@@ -1081,11 +1093,14 @@ def merge_one(args: argparse.Namespace, number: int) -> str:
     head = pr["head"]["sha"]
     if ((pr["head"].get("repo") or {}).get("full_name")) != args.repo:
         return "not merging a PR from a fork"
-    if ABANDONED_LABEL in {label["name"] for label in pr.get("labels", [])}:
-        return "not merging: the agent abandoned this change"
     comments = gh_json([f"repos/{args.repo}/issues/{number}/comments?per_page=100"]) or []
     trusted = {t.strip() for t in args.trusted.split(",") if t.strip()}
-    if not is_certified(comments, head, trusted):
+    certified = is_certified(comments, head, trusted)
+    if is_abandoned(comments, head):
+        return "not merging: the agent abandoned this change at this commit"
+    if ABANDONED_LABEL in {label["name"] for label in pr.get("labels", [])} and not certified:
+        return "not merging: labelled abandoned, and nothing certifies this commit"
+    if not certified:
         return f"not merging: nothing certifies {head[:7]} yet (a later run, or the next push, will)"
     reverts = recent_reverts(args.repo, args.base_branch)
     if reverts >= args.max_reverts:
@@ -1093,6 +1108,13 @@ def merge_one(args: argparse.Namespace, number: int) -> str:
     required = tuple(c.strip() for c in args.required_checks.split(",") if c.strip())
     return "merge gate: " + try_merge(args.repo, number, head, args.merge_method, required,
                                       poll_seconds=args.poll_seconds, poll_interval=15)
+
+
+def is_abandoned(comments: list[dict], head_sha: str) -> bool:
+    """The agent gave up on exactly this head commit. Bound to the sha like the certification, so the
+    author pushing a new commit starts a fresh attempt instead of staying blocked forever."""
+    marker = f"<!-- {ABANDON_MARKER}: {head_sha} -->"
+    return any(marker in (c.get("body") or "") for c in comments)
 
 
 def cmd_merge_gate(args: argparse.Namespace) -> int:
@@ -1425,6 +1447,7 @@ def main() -> int:
                     help="mode ci: stop after this many consecutive agent commits on the branch")
     gc.add_argument("--repo", required=True)
     gc.add_argument("--sha", required=True)
+    gc.add_argument("--pr", type=int, default=0, help="modes pr/ci: skip a commit the agent already abandoned")
     gc.set_defaults(fn=cmd_guard_change)
 
     c = sub.add_parser("change", help="review and fix an existing PR or a push to main")
