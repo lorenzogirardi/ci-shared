@@ -40,6 +40,7 @@ import pathlib
 import re
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TypedDict
 
@@ -148,8 +149,15 @@ def review_diff(caller: lib.ModelCaller, diff: str, plan: dict | None,
     )
     kept_all: list[lib.Finding] = []
     dropped_all: list[tuple[lib.Finding, str]] = []
-    for name in reviewers:
-        found = lib.ask_json(caller, name, lib.load_prompt(name), user, lambda d, n=name: lib.parse_findings(d, n))
+
+    def one(name: str):
+        return lib.ask_json(caller, name, lib.load_prompt(name), user, lambda d, n=name: lib.parse_findings(d, n))
+
+    # Independent reviewers share nothing, so they run at the same time. Results are read back in the
+    # declared order, so the deduplication (and the report) do not depend on who finished first.
+    with ThreadPoolExecutor(max_workers=max(1, len(reviewers))) as pool:
+        results = list(pool.map(one, reviewers))
+    for found in results:
         if found is None:
             return None
         kept, dropped = lib.validate_findings(found, ranges)
@@ -544,7 +552,12 @@ def build_graph(rt: Runtime):
                 "applied_kind": "test", "explanation": f"tests: {explanation}", "notes": notes + [f"tests added/updated: {', '.join(applied.files)}"]}
 
     def after_review(state: RunState, findings: list[lib.Finding], dropped, label: str) -> dict:
+        in_scope = [f for f in findings if lib.finding_in_scope(f, state["plan"])]
+        out_of_scope = len(findings) - len(in_scope)
+        findings = in_scope
         blocking = [f for f in findings if f.blocking]
+        scope_note = ([f"{out_of_scope} finding(s) concern files the plan declared out of scope and were not acted on"]
+                      if out_of_scope else [])
         rounds = state.get("rounds", []) + [{
             "iteration": state["iteration"], "stage": label,
             "findings": [f.to_dict() for f in findings], "dropped": len(dropped),
@@ -553,13 +566,15 @@ def build_graph(rt: Runtime):
             # A final review certifies the agent's own changes; if it made none
             # (a clean PR or push), the first review already was the verdict.
             skip_final = label == "final" or not state.get("committed")
-            return {"route": "docs" if skip_final else "final", "rounds": rounds}
+            return {"route": "docs" if skip_final else "final", "rounds": rounds,
+                    "notes": state.get("notes", []) + scope_note}
         if state["iteration"] >= rt.max_iterations:
             return {**stop(state, "escalated", f"{len(blocking)} blocking finding(s) remain after {state['iteration']} iteration(s)"),
                     "rounds": rounds}
         return {
             "route": "write", "rounds": rounds, "iteration": state["iteration"] + 1,
             "prior_blocking": state.get("prior_blocking", []) + [f.to_dict() for f in blocking],
+            "notes": state.get("notes", []) + scope_note,
             "feedback": "REVIEW FINDINGS to fix (each is blocking; fix exactly these, minimally):\n"
                         + lib.findings_for_writer(blocking),
         }
@@ -892,6 +907,37 @@ def derived_plan(title: str, body: str) -> dict:
             "out_of_scope": ["Anything not needed to fix a failing check or a blocking review finding"],
             "acceptance_criteria": ["The deterministic checks pass", "No blocking review finding remains"],
             "files_hint": [], "risks": []}
+
+
+INFRA_STEP_RE = re.compile(
+    r"^(Set up job|Initialize containers|Complete job|Post .*|Run actions/(checkout|setup-[a-z]+|cache|upload-artifact|download-artifact)"
+    r"|Checkout.*|Set up .*|Harden Runner|Pre Harden Runner|Testing on a k8s Kind Cluster|Create a kind cluster|Run helm/kind-action.*)",
+    re.IGNORECASE)
+
+
+def cmd_ci_infra(args: argparse.Namespace) -> int:
+    """A job that fell over before it ran anything of ours (runner start-up, checkout, cluster creation) says
+    nothing about the change. Re-run the failed jobs once and let the agent wait for that result, instead of
+    spending a repair loop on a failure that is not in the code."""
+    run = gh_json([f"repos/{args.repo}/actions/runs/{args.run_id}"]) or {}
+    jobs = (gh_json([f"repos/{args.repo}/actions/runs/{args.run_id}/jobs?per_page=100"]) or {}).get("jobs", [])
+    failed_steps = [(j["name"], st["name"]) for j in jobs if j.get("conclusion") == "failure"
+                    for st in j.get("steps", []) if st.get("conclusion") == "failure"]
+    # A failed job with no failed step at all failed in the runner itself.
+    bare = [j["name"] for j in jobs if j.get("conclusion") == "failure" and not any(s.get("conclusion") == "failure" for s in j.get("steps", []))]
+    infra = bool(failed_steps or bare) and all(INFRA_STEP_RE.match(step) for _, step in failed_steps)
+    first_attempt = int(run.get("run_attempt") or 1) < 2
+    if infra and first_attempt:
+        if args.dry_run:
+            log("[dry run] infrastructure failure on " + ", ".join(sorted({job for job, _ in failed_steps} | set(bare))) + ": would re-run it once")
+        elif rerun_failed_jobs(args.repo, args.run_id):
+            log("infrastructure failure (" + "; ".join(f"{j}: {s}" for j, s in failed_steps) + "): re-running the failed jobs once; "
+                "the repair loop waits for that result")
+        set_output("infra_retry", "true")
+        return 0
+    set_output("infra_retry", "false")
+    log("not an infrastructure failure, or already re-run once: the repair loop judges it" if (failed_steps or bare) else "no failed job found")
+    return 0
 
 
 def cmd_guard_change(args: argparse.Namespace) -> int:
@@ -1450,6 +1496,12 @@ def main() -> int:
     r.add_argument("--writer-rounds", type=int, default=8)
     r.add_argument("--changelog", default="CHANGELOG.md")
     r.set_defaults(fn=cmd_run)
+
+    ci = sub.add_parser("ci-infra", help="re-run once a CI run that failed in the runner, not in the code")
+    ci.add_argument("--repo", required=True)
+    ci.add_argument("--run-id", type=int, required=True)
+    ci.add_argument("--dry-run", action="store_true")
+    ci.set_defaults(fn=cmd_ci_infra)
 
     gc = sub.add_parser("guard-change")
     gc.add_argument("--mode", choices=("pr", "push", "ci"), required=True)

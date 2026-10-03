@@ -20,6 +20,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -79,11 +80,14 @@ class ModelCaller:
         self.work_dir = pathlib.Path(work_dir)
         self.calls = 0
         self.usage: list[dict] = []
+        self._lock = threading.Lock()      # reviewers run in parallel and share these counters
 
     def call(self, role: str, system: str, user: str) -> str | None:
         self.work_dir.mkdir(parents=True, exist_ok=True)
-        self.calls += 1
-        stem = self.work_dir / f"{self.calls:03d}-{role}"
+        with self._lock:
+            self.calls += 1
+            number = self.calls
+        stem = self.work_dir / f"{number:03d}-{role}"
         system_path, user_path = stem.with_suffix(".system.txt"), stem.with_suffix(".user.txt")
         usage_path = stem.with_suffix(".usage.json")
         system_path.write_text(system)
@@ -101,7 +105,9 @@ class ModelCaller:
         stem.with_suffix(".reply.txt").write_text(proc.stdout)
         if usage_path.is_file():
             try:
-                self.usage.append({"role": role, **json.loads(usage_path.read_text())})
+                record = {"role": role, **json.loads(usage_path.read_text())}
+                with self._lock:
+                    self.usage.append(record)
             except (ValueError, OSError):
                 pass
         return proc.stdout
@@ -740,3 +746,13 @@ def policy_violations(from_sha: str, max_files: int = MAX_PATCH_FILES, max_lines
         violations.append("an added line contains something shaped like a credential")
     violations += [f"tests weakened: {v}" for v in weakened_tests(from_sha, "HEAD")]
     return violations
+
+
+def finding_in_scope(finding: "Finding", plan: dict) -> bool:
+    """A finding about a file the plan declared out of scope is not acted on: the writer is not allowed
+    to touch it, so sending it back would only burn rounds."""
+    path = finding.file
+    for token in out_of_scope_paths(plan):
+        if path == token or path.startswith(token + "/") or pathlib.PurePosixPath(path).name == token:
+            return False
+    return True
