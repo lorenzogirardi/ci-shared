@@ -112,7 +112,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-      actions: read
+      actions: write      # re-run a CI job that failed in the runner, not in the code (mode ci)
     steps:
       - name: Checkout the change (no credentials kept)
         uses: actions/checkout@v4
@@ -136,6 +136,15 @@ jobs:
       - name: Install agent dependencies
         run: pip install -q -r .shared/scripts/requirements-autofix.txt
 
+      - name: Did CI fail in the runner rather than in the code? (re-run it once, do not repair)
+        id: infra
+        if: inputs.mode == 'ci'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 .shared/scripts/agent_pipeline.py ci-infra \
+            --repo "${{ github.repository }}" --run-id ${{ github.event.workflow_run.id }}
+
       - name: Does this change need a run?
         id: guard
         env:
@@ -150,6 +159,9 @@ jobs:
           # A failed run for a commit that is no longer the PR head is stale: a
           # newer push (often the agent's own fix) already superseded it. The
           # last write to GITHUB_OUTPUT wins.
+          if [ "${{ steps.infra.outputs.infra_retry }}" = "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
           if [ "$MODE" = "ci" ] && [ "$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq '.head.sha')" != "$FAILED_SHA" ]; then
             echo "stale: the PR head moved on since this CI run"
             echo "skip=true" >> "$GITHUB_OUTPUT"
