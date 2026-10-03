@@ -36,6 +36,35 @@ consumers; a breaking change instead gets a new `v2` tag (and its own
 `ref: v2` literal) so existing `@v1` consumers are unaffected until they bump
 on purpose.
 
+## v2: role-based agents
+
+`v2` adds the agents below on top of everything `v1` does; `v1` stays frozen
+for repos that have not moved. All reusable workflows in `v2` check out
+`ref: v2`.
+
+| Workflow | Roles | Writes? |
+|---|---|---|
+| `reusable_agent-pipeline.yml` | planner -> writer -> deterministic checks -> reviewer A (correctness/design) + reviewer B (security/operability) -> dedup/validation -> bounded fix loop -> final reviewer -> documentation reviewer -> changelog | opens a PR (draft + `[needs human]` if the loop does not converge); never merges |
+| `reusable_agent-review.yml` | reviewers A and B on any PR diff | one comment |
+| `reusable_changelog.yml` | none (deterministic) | one `docs(changelog)` commit per push to the default branch |
+| `reusable_docs-architect.yml` | documentation architect (Diataxis) | **nothing**: a proposal, optionally as an issue |
+
+How it fits together:
+
+- Roles are prompts in `prompts/agents/`; the code that acts on their output
+  (`scripts/agent_lib.py`) is strict: findings need severity, file, line,
+  evidence and fix, and are dropped unless the line is inside a changed hunk;
+  writer changes are capped, unique-anchored, all-or-nothing and never touch
+  `.github/workflows/`.
+- Deterministic checks run in a process whose environment contains no model
+  key and no token, from a checkout that keeps no credentials. Only the final
+  `publish` step holds a write token and it runs no repository code.
+- The loop is bounded (`max_iterations`, `max_verify_retries`,
+  `writer_rounds`). When it stops without converging, the PR says so.
+- `reusable_pr-review-sweep.yml` gained `skip_head_prefixes` so the sweep
+  leaves `agent/` branches to the pipeline that certifies them.
+- Cost per role is recorded (`.ai/agents/*.usage.json`) and shown in the PR.
+
 ## Workflows
 
 ### `reusable_pr-diff-review.yml`
@@ -236,7 +265,7 @@ Nothing needs to be configured in this repo per consumer — it's stateless.
 pytest tests/ -v
 ```
 
-118 tests, no network, no real `gh` calls — `checks_state`, verdict parsing,
+212 tests, no network, no real `gh` calls — `checks_state`, verdict parsing,
 autofix guardrails (`parse_fix`/`apply_fix`), `run_verify`, the
 `autofix_core.py` langgraph graph, `main_autofix.py`'s PR-opening plumbing,
 and `auto_merge_authors` gating are all exercised against fakes.

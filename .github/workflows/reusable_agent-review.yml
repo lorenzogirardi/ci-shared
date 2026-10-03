@@ -1,0 +1,78 @@
+name: Reusable Agent Review
+
+# Reviewer A (correctness/design) and reviewer B (security/operability) on a
+# pull request: independent calls, structured findings validated against the
+# diff, deduplicated, posted as one comment. Reads the diff only; no repository
+# code is executed, so no secrets are at risk from the PR content.
+# Usable on any PR, not only the agent pipeline's own.
+
+on:
+  workflow_call:
+    inputs:
+      max_chars:
+        required: false
+        type: number
+        default: 140000
+      openrouter_model:
+        required: false
+        type: string
+        default: ''
+      openrouter_endpoint:
+        required: false
+        type: string
+        default: ''
+      openrouter_site_url:
+        required: false
+        type: string
+        default: ''
+      openrouter_app_name:
+        required: false
+        type: string
+        default: ''
+    secrets:
+      openrouter_api_key:
+        required: true
+
+permissions: {}
+
+jobs:
+  review:
+    if: github.event.pull_request.head.repo.fork != true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: lorenzogirardi/ci-shared
+          ref: v2
+          path: .shared
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -q -r .shared/scripts/requirements-autofix.txt
+      - name: Review
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.openrouter_api_key }}
+          OPENROUTER_MODEL: ${{ inputs.openrouter_model }}
+          OPENROUTER_ENDPOINT: ${{ inputs.openrouter_endpoint }}
+          OPENROUTER_SITE_URL: ${{ inputs.openrouter_site_url }}
+          OPENROUTER_APP_NAME: ${{ inputs.openrouter_app_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 .shared/scripts/agent_pipeline.py review \
+            --ai-script .shared/scripts/openrouter_ai.py \
+            --max-chars ${{ inputs.max_chars }} \
+            --repo "${{ github.repository }}" \
+            --pr ${{ github.event.pull_request.number }} \
+            --base-sha "${{ github.event.pull_request.base.sha }}" \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --post

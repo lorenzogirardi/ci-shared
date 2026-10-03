@@ -1,0 +1,74 @@
+name: Reusable Changelog
+
+# Keeps a Keep-a-Changelog file current on every push to the default branch
+# (a squash merge is one push, a direct push is too). Deterministic, no model:
+# a guarantee must not depend on a model call succeeding. One entry per
+# commit, from its subject; commits that already touched the changelog (an
+# agent PR does) and the pipeline's own bookkeeping commits are skipped.
+# The push uses GITHUB_TOKEN, so it does not trigger further workflows.
+
+on:
+  workflow_call:
+    inputs:
+      changelog_path:
+        required: false
+        type: string
+        default: 'CHANGELOG.md'
+      branch:
+        required: false
+        type: string
+        default: 'main'
+
+permissions: {}
+
+jobs:
+  changelog:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: lorenzogirardi/ci-shared
+          ref: v2
+          path: .shared
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Update the changelog (re-applied on top of whatever landed meanwhile)
+        env:
+          FILE: ${{ inputs.changelog_path }}
+          BRANCH: ${{ inputs.branch }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for attempt in 1 2 3 4 5; do
+            if [ "$attempt" -gt 1 ]; then
+              git fetch --quiet origin "$BRANCH"
+              git reset --quiet --hard "origin/$BRANCH"
+            fi
+            python3 .shared/scripts/changelog_update.py from-push \
+              --file "$FILE" --before "$BEFORE" --after "$AFTER" --repo-url "$REPO_URL"
+            if git diff --quiet -- "$FILE"; then
+              echo "nothing to record"
+              exit 0
+            fi
+            git add -- "$FILE"
+            git commit -q -m "docs(changelog): update for ${AFTER::7}"
+            if git push origin "HEAD:$BRANCH"; then
+              echo "pushed on attempt $attempt"
+              exit 0
+            fi
+            sleep $((attempt * 3))
+          done
+          echo "::error::could not push the changelog after 5 attempts"
+          exit 1

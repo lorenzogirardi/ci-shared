@@ -84,7 +84,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: lorenzogirardi/ci-shared
-          ref: v1
+          ref: v2
           path: .shared
 
       - name: Download AI context artifacts

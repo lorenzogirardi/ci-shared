@@ -1160,9 +1160,17 @@ def main() -> int:
              "Lets --authors be wider than this -- e.g. autofix a human's PRs too, without "
              "ever merging them unattended.",
     )
+    parser.add_argument(
+        "--skip-head-prefixes",
+        default="",
+        help="Comma-separated head-branch prefixes the sweep must leave alone (e.g. 'agent/'). "
+             "PRs opened by the agent pipeline are reviewed, fixed and certified inside that "
+             "pipeline; a second reviewer here would only produce a conflicting verdict.",
+    )
     args = parser.parse_args()
 
     pathlib.Path(".ai").mkdir(exist_ok=True)
+    skip_prefixes = tuple(x.strip() for x in args.skip_head_prefixes.split(",") if x.strip())
     system_file = pathlib.Path(args.system_file)
     authors = {a.strip() for a in args.authors.split(",") if a.strip()}
     auto_merge_authors = {a.strip() for a in args.auto_merge_authors.split(",") if a.strip()}
@@ -1180,6 +1188,8 @@ def main() -> int:
         number, head_sha = pr["number"], pr["head"]["sha"]
         author = (pr.get("user") or {}).get("login", "")
         if authors and author not in authors:
+            continue
+        if skip_prefixes and ((pr.get("head") or {}).get("ref") or "").startswith(skip_prefixes):
             continue
 
         existing = existing_sweep_comment(args.repo, number)
