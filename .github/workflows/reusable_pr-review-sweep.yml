@@ -47,6 +47,11 @@ on:
         required: false
         type: boolean
         default: false
+      workflow_prs_to_bot:
+        description: 'A PR that touches .github/workflows/ is left to the dependency bot (it merges it itself once the required checks pass) and is abandoned if its checks fail on current code. The agents cannot edit those files.'
+        required: false
+        type: boolean
+        default: false
       update_behind:
         description: 'Bring a PR that is behind the base branch up to date (with the push token) so its CI describes current code. Needs autofix_push_token.'
         required: false
@@ -267,6 +272,7 @@ jobs:
             ${{ inputs.structured_review && '--structured-review' || '' }} \
             ${{ inputs.fix_findings && '--fix-findings' || '' }} \
             ${{ inputs.update_behind && '--update-behind' || '' }} \
+            ${{ inputs.workflow_prs_to_bot && '--workflow-prs-to-bot' || '' }} \
             --max-autofix-commits ${{ inputs.max_autofix_commits }} \
             ${{ inputs.auto_merge && '--auto-merge' || '' }} \
             ${{ inputs.triage_on_failure && '--triage-on-failure' || '' }} \
