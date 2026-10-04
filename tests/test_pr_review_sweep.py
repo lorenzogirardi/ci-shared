@@ -37,6 +37,7 @@ from pr_review_sweep import (  # noqa: E402
     resolve_readable_path,
     split_verdict,
     touches_workflow_files,
+    workflow_pr_action,
     try_merge,
 )
 
@@ -538,7 +539,8 @@ class TestWorkflowFileMerge:
 
     def test_workflow_file_outcome_reads_as_clean_but_unmerged(self):
         body = comment_body("h", "x", "c" * 40, is_clean=True, merge_outcome="workflow-file")
-        assert "needs a human to merge" in body
+        assert "the dependency bot merges that itself" in body
+        assert "needs a human" not in body
         # Still marked clean, so a later sweep retries the merge (cheaply, no
         # model call) instead of treating a workflow-only bump as a finding.
         assert "<!-- verdict: clean -->" in body
@@ -742,3 +744,20 @@ class TestBuildContext:
 
     def test_empty_history_is_empty_context(self):
         assert build_context([]) == ""
+
+
+class TestWorkflowPrsBelongToTheBot:
+    """No agent can edit or merge a workflow file, so such a PR is never waited on by a person:
+    green or running it is the bot's to merge, red on current code it is abandoned."""
+
+    @pytest.mark.parametrize("state", ["green", "pending", "none"])
+    def test_left_to_the_bot_unless_red(self, state):
+        assert workflow_pr_action(state) == "leave"
+
+    def test_red_on_current_code_is_abandoned(self):
+        assert workflow_pr_action("failing") == "abandon"
+
+    def test_no_text_hands_the_pr_to_a_person(self):
+        for outcome in ("workflow-file",):
+            for clean in (True, False):
+                assert "needs a human" not in comment_body("h", "x", "c" * 40, is_clean=clean, merge_outcome=outcome)

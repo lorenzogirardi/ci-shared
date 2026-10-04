@@ -873,7 +873,7 @@ def comment_body(
             "checks failing": "clean, but CI is failing — not merging",
             "checks pending": "clean, but CI has not finished — will retry next sweep",
             "no checks": "clean, but no CI checks reported — not merging unattended",
-            "workflow-file": "clean, but touches .github/workflows/ — needs a human to merge",
+            "workflow-file": "clean, but touches .github/workflows/ — the dependency bot merges that itself once the required checks pass",
         }[merge_outcome]
     elif merge_outcome == "merged":
         # autofix pushed a fix and this same run polled until the real
@@ -883,7 +883,7 @@ def comment_body(
         verdict = "an automated fix was pushed; CI has not finished yet — the next sweep will check again"
     elif merge_outcome == "workflow-file":
         verdict = ("an automated fix was pushed and CI passed, but this PR touches "
-                   ".github/workflows/ — needs a human to merge")
+                   ".github/workflows/ — the dependency bot merges that itself once the required checks pass")
     elif merge_outcome == "failed":
         verdict = "an automated fix was pushed and CI passed, but the merge itself was refused — see the run log"
     elif merge_outcome == "checks failing":
@@ -937,6 +937,13 @@ def touches_workflow_files(repo: str, number: int) -> bool:
     if result.returncode != 0:
         return False
     return any(f.startswith(".github/workflows/") for f in result.stdout.splitlines())
+
+
+def workflow_pr_action(ci_state: str) -> str:
+    """What the sweep does with a PR that touches workflow files. No agent can edit or merge it, so
+    it is never waited on: green or still running it is the dependency bot's to merge; red on current
+    code it is abandoned, which is a terminal state, not a hand-off."""
+    return "abandon" if ci_state == "failing" else "leave"
 
 
 def pr_head_sha(repo: str, number: int) -> str:
@@ -1004,7 +1011,7 @@ def try_merge(repo: str, number: int, head_sha: str, method: str,
     waved through as clean broke main precisely there.
     """
     if touches_workflow_files(repo, number):
-        print(f"Not merging PR #{number}: touches .github/workflows/ — left for manual merge.")
+        print(f"Not merging PR #{number}: touches .github/workflows/ — the dependency bot merges those itself.")
         return "workflow-file"
 
     if poll_seconds:
@@ -1248,6 +1255,13 @@ def main() -> int:
              "its stale checks; CI runs again and this sweep, triggered when it finishes, judges the result.",
     )
     parser.add_argument(
+        "--workflow-prs-to-bot",
+        action="store_true",
+        help="A PR that touches .github/workflows/ is neither reviewed nor repaired here (the agent token cannot "
+             "write those files): the dependency bot merges it itself once the required checks pass. If its CI "
+             "is red on current code it is abandoned (label, reason, closed) instead of waiting for a person.",
+    )
+    parser.add_argument(
         "--max-autofix-commits",
         type=int,
         default=0,
@@ -1293,6 +1307,16 @@ def main() -> int:
                 skipped += 1
                 continue
             print(f"::warning::could not refresh PR #{number}; judging it as it is")
+
+        if args.workflow_prs_to_bot and touches_workflow_files(args.repo, number):
+            if workflow_pr_action(checks_state(args.repo, head_sha, required)[0]) == "abandon":
+                abandon_pr(args.repo, number, "it changes .github/workflows/, which the agents cannot repair, and its checks "
+                           "fail on current code; the dependency bot proposes the next version by itself")
+                print(f"PR #{number} touches workflows and its CI is red: abandoned.")
+            else:
+                print(f"PR #{number} touches workflows: left to the dependency bot's own automerge.")
+            skipped += 1
+            continue
 
         existing = existing_sweep_comment(args.repo, number)
         existing_body = (existing or {}).get("body") or ""
