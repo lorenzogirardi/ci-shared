@@ -446,7 +446,33 @@ class TestGuardChange:
         pathlib.Path("a.txt").write_text("x")
         subprocess.run(["git", "add", "-A"], check=True)
         subprocess.run(["git", "-c", f"user.name={ap.AGENT_AUTHOR}", "commit", "-qm", "fix(agent): x"], check=True)
-        assert self.run_guard(monkeypatch, tmp_path, "pr") == "skip=true"
+        assert self.run_guard(monkeypatch, tmp_path, "push") == "skip=true"
+        assert self.guard_pr(monkeypatch, tmp_path, certified=True) == "skip=true"
+
+    def guard_pr(self, monkeypatch, tmp_path, certified, max_streak=3):
+        out = tmp_path / "out.txt"
+        out.unlink(missing_ok=True)
+        monkeypatch.setenv("GITHUB_OUTPUT", str(out))
+        sha = git_out("rev-parse", "HEAD")
+        comments = [{"body": f"<!-- agent-pr -->\n<!-- agent-certified: {sha} -->"}] if certified else []
+        monkeypatch.setattr(ap, "gh_json", lambda a: comments)
+        ap.cmd_guard_change(type("A", (), {"mode": "pr", "repo": "o/r", "sha": sha, "pr": 5, "max_streak": max_streak})())
+        return out.read_text().strip()
+
+    def test_the_agents_own_commit_without_a_verdict_is_reviewed(self, repo, monkeypatch, tmp_path):
+        """flask-test-api PR #197: the run that pushed the fix lost its verdict to a second run; the head was the
+        agent's own commit, so nothing ever looked at it again and the PR stayed open, green and uncertified."""
+        pathlib.Path("a.txt").write_text("x")
+        subprocess.run(["git", "add", "-A"], check=True)
+        subprocess.run(["git", "-c", f"user.name={ap.AGENT_AUTHOR}", "commit", "-qm", "fix(agent): x"], check=True)
+        assert self.guard_pr(monkeypatch, tmp_path, certified=False) == "skip=false"
+
+    def test_but_not_forever(self, repo, monkeypatch, tmp_path):
+        for i in range(3):
+            pathlib.Path(f"a{i}.txt").write_text("x")
+            subprocess.run(["git", "add", "-A"], check=True)
+            subprocess.run(["git", "-c", f"user.name={ap.AGENT_AUTHOR}", "commit", "-qm", f"fix(agent): {i}"], check=True)
+        assert self.guard_pr(monkeypatch, tmp_path, certified=False, max_streak=3) == "skip=true"
 
     def test_human_pr_runs(self, repo, monkeypatch, tmp_path):
         assert self.run_guard(monkeypatch, tmp_path, "pr") == "skip=false"
@@ -506,7 +532,29 @@ class TestPublishPr:
         monkeypatch.setattr(ap, "gh_json", lambda a: [])
         monkeypatch.setattr(ap, "post_comment", lambda repo_, n, body, existing: posted.append(body))
         assert ap.cmd_publish_pr(self.args()) == 0   # no remote in the test repo, so the push fails
-        assert "could not push" in posted[0] and "pat" not in posted[0].replace("push", "")
+        # The branch moved: this run's verdict is about an old commit, so it says nothing at all.
+        assert posted == []
+
+    def test_a_run_whose_commit_is_no_longer_the_head_publishes_nothing(self, repo, monkeypatch):
+        """flask-test-api PR #197: a second agent run finished after the first had pushed and certified, and
+        overwrote that certification with its own 'could not push' report."""
+        (repo / ".ai/agent-run").mkdir(parents=True)
+        (repo / ".ai/agent-run/result.json").write_text(json.dumps({**self.result(), "head_sha": "a" * 40}))
+        posted, edits = [], []
+        monkeypatch.setattr(ap, "gh_json", lambda a: {"head": {"sha": "b" * 40}} if "/pulls/" in a[0] else [])
+        monkeypatch.setattr(ap, "post_comment", lambda repo_, n, body, existing: posted.append(body))
+        monkeypatch.setattr(ap, "_gh", lambda *a, **k: edits.append(a))
+        assert ap.cmd_publish_pr(self.args()) == 0
+        assert posted == [] and edits == []
+
+    def test_a_run_on_the_current_head_publishes_as_before(self, repo, monkeypatch):
+        (repo / ".ai/agent-run").mkdir(parents=True)
+        (repo / ".ai/agent-run/result.json").write_text(json.dumps({**self.result(), "head_sha": "a" * 40}))
+        posted = []
+        monkeypatch.setattr(ap, "gh_json", lambda a: {"head": {"sha": "a" * 40}} if "/pulls/" in a[0] else [])
+        monkeypatch.setattr(ap, "post_comment", lambda repo_, n, body, existing: posted.append(body))
+        monkeypatch.setattr(ap, "_gh", lambda *a, **k: None)
+        assert ap.cmd_publish_pr(self.args()) == 0 and len(posted) == 1
 
     def test_push_review_with_only_advisory_findings_leaves_a_commit_comment(self, repo, monkeypatch):
         (repo / ".ai/agent-run").mkdir(parents=True)

@@ -88,3 +88,43 @@ def test_failed_agent_workflows_are_reported_and_others_are_not():
 
 def test_the_report_says_when_nothing_is_wrong():
     assert "Nothing found" in h.render([], [], [], False)
+
+
+class TestStuckPullRequests:
+    SHA = "59183e7a681f5d029e27ba2d0e7b281042e490a5"
+
+    def pr(self, **over):
+        base = {"number": 197, "title": "feat: lower the sleep limit", "draft": False, "user": {"login": "lorenzogirardi"},
+                "head": {"sha": self.SHA, "repo": {"full_name": "o/r"}}, "base": {"repo": {"full_name": "o/r"}},
+                "updated_at": "2026-10-08T17:19:00Z"}
+        base.update(over)
+        return base
+
+    def checks(self, minutes_ago=200, status="completed"):
+        done = (NOW - dt.timedelta(minutes=minutes_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return [{"name": "checks", "status": status, "conclusion": "success", "completed_at": done if status == "completed" else None}]
+
+    def find(self, pulls, comments=(), checks=None, minutes=90):
+        return h.stuck_pull_requests(pulls, lambda n: [{"body": b} for b in comments], lambda sha: checks if checks is not None else self.checks(),
+                                     NOW, minutes, ("renovate[bot]",))
+
+    def test_a_green_pull_request_with_no_verdict_for_hours_is_stuck(self):
+        """flask-test-api PR #197: green, uncertified, nothing left to run, open for 3.5 hours."""
+        found = self.find([self.pr()], comments=["<!-- agent-pr -->\nThe agent fixed this and could not push"])
+        assert [f["pr"] for f in found] == [197] and found[0]["idle_minutes"] == 200
+
+    def test_a_verdict_on_the_head_commit_means_it_is_not_stuck(self):
+        assert self.find([self.pr()], comments=[f"<!-- agent-certified: {self.SHA} -->"]) == []
+        assert self.find([self.pr()], comments=[f"<!-- agent-abandoned: {self.SHA} -->"]) == []
+
+    def test_a_verdict_on_an_older_commit_does_not_count(self):
+        assert len(self.find([self.pr()], comments=["<!-- agent-certified: " + "a" * 40 + " -->"])) == 1
+
+    def test_recent_or_running_work_is_left_alone(self):
+        assert self.find([self.pr()], checks=self.checks(minutes_ago=10)) == []
+        assert self.find([self.pr()], checks=self.checks(status="in_progress")) == []
+
+    def test_drafts_forks_and_the_dependency_bot_are_not_ours(self):
+        assert self.find([self.pr(draft=True)]) == []
+        assert self.find([self.pr(user={"login": "renovate[bot]"})]) == []
+        assert self.find([self.pr(head={"sha": self.SHA, "repo": {"full_name": "someone/fork"}})]) == []
