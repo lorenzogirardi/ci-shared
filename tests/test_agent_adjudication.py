@@ -240,6 +240,27 @@ class TestLoopRouting:
         assert any(s.startswith("test(agent)") for s in subjects(repo))
         assert "writer" not in [r for r, _ in caller.log]
 
+    def test_a_test_the_steward_rewrote_and_that_fails_never_changes_the_application(self, repo):
+        """flask-test-api PR #192: asked to move a test to the new intended behaviour, the steward also asserted
+        something the application did not do; the writer then removed an app-wide handler to make it pass."""
+        self.break_code()
+        code_before = pathlib.Path("calc.py").read_text()
+        verdict = fence({"verdicts": [{"test": "tests/test_calc.py::test_add", "classification": "test_defect", "confidence": "high",
+                                       "intent_evidence": "make add multiply its arguments", "reason": "the intent redefines add"}]})
+        over = fence({"explanation": "x", "changes": [
+            {"file": "tests/test_calc.py", "find": "assert add(1, 2) == 3", "replace": "assert add(1, 2) == 2\n    assert add(2, 2) == 5"}]})
+        right = fence({"explanation": "add now multiplies", "changes": [
+            {"file": "tests/test_calc.py", "find": "assert add(1, 2) == 3", "replace": "assert add(1, 2) == 2"}]})
+        bend = fence({"explanation": "make it pass", "changes": [{"file": "calc.py", "find": "a * b", "replace": "5"}]})
+        caller = FakeCaller({"failure-adjudicator": [verdict], "test-steward": [over, right, NOTESTS], "writer": [bend], **reviewers_ok()})
+        _, final = run(repo, caller, "make add multiply its arguments")
+        assert final["outcome"] == "converged"
+        assert pathlib.Path("calc.py").read_text() == code_before
+        assert "writer" not in [r for r, _ in caller.log]
+        assert "== 5" not in pathlib.Path("tests/test_calc.py").read_text()
+        second = [u for r, u in caller.log if r == "test-steward"][1]
+        assert "FAILED against this change" in second
+
     def test_test_defect_without_a_quote_is_downgraded_and_the_code_is_fixed(self, repo):
         self.break_code()
         caller = FakeCaller({
