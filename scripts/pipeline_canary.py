@@ -54,8 +54,13 @@ def verdict_of(comments: list[dict], head_sha: str, trusted: set[str]) -> str:
     return ""
 
 
-def settled(verdict: str, checks: list[dict]) -> bool:
-    """Nothing more is coming for this commit: it has a verdict and none of its checks is still running."""
+def settled(verdict: str, checks: list[dict], required: tuple[str, ...] = ()) -> bool:
+    """Nothing more is coming for this commit: it has a verdict and none of its checks is still running.
+    The required checks must have appeared, too: right after a push the agent's own check can be finished
+    while the CI workflow has not even been created yet, and judging then reports them as missing."""
+    names = {c.get("name") for c in checks}
+    if verdict == "certified" and any(name not in names for name in required):
+        return False
     return bool(verdict) and bool(checks) and all(c.get("status") == "completed" for c in checks)
 
 
@@ -112,10 +117,15 @@ def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], capture_output=True, text=True, check=check)
 
 
+LAST_PUSH_ERROR = ""
+
+
 def push(refspec: str, token: str, *, delete: bool = False) -> bool:
+    global LAST_PUSH_ERROR
     header = base64.b64encode(f"x-access-token:{token}".encode()).decode()
     args = ["-c", f"http.https://github.com/.extraheader=AUTHORIZATION: basic {header}", "push", "--quiet", "origin"]
     done = git(*args, *(["--delete"] if delete else []), refspec, check=False)
+    LAST_PUSH_ERROR = done.stderr.replace(header, "***").replace(token, "***").strip()[:300]
     return done.returncode == 0
 
 
@@ -131,7 +141,7 @@ def open_scenario(repo: str, scenario: dict, base_branch: str, base_sha: str, ta
     git("add", "-A")
     git("-c", f"user.name={CANARY_AUTHOR}", "-c", "user.email=actions@github.com", "commit", "--quiet", "-m", variant["title"])
     if not push(f"HEAD:refs/heads/{branch}", token):
-        return {"name": scenario["name"], "problems": [f"could not push {branch}"]}
+        return {"name": scenario["name"], "problems": [f"could not push {branch}: {LAST_PUSH_ERROR}"]}
     body = variant.get("body", "") + "\n\n_Opened by the pipeline canary; it is checked and closed automatically and never merged._"
     # Opened with the job token (GH_TOKEN): the push token of the agents is not required to be able to open
     # pull requests. A pull request opened that way starts no workflow, so the workflows are started by the
@@ -198,7 +208,7 @@ def main() -> int:
             time.sleep(30)
             for r in pending:
                 r["state"] = state_of(args.repo, r["pr"], trusted)
-            pending = [r for r in pending if not settled(r["state"]["verdict"], r["state"]["checks"])]
+            pending = [r for r in pending if not settled(r["state"]["verdict"], r["state"]["checks"], required)]
         for r in results:
             if not r.get("pr"):
                 continue
