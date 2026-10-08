@@ -101,3 +101,12 @@ class TestVariants:
 def test_the_report_names_what_failed():
     text = c.render([{"name": "repair", "pr": 7, "problems": []}, {"name": "intent", "pr": 8, "problems": ["verdict is 'none'"]}])
     assert "repair: passed (PR #7)" in text and "intent: FAILED (PR #8)" in text and "verdict is 'none'" in text
+
+
+def test_a_commit_is_not_settled_before_its_required_checks_exist():
+    """First live run: the agent's own check was done 20 seconds after the push, the CI workflow had not been
+    created yet, and the scenario was judged with every required check 'missing'."""
+    only_agent = [{"name": "pull-request / change", "status": "completed", "conclusion": "success"}]
+    assert not c.settled("certified", only_agent, REQUIRED)
+    assert c.settled("certified", only_agent + GREEN, REQUIRED)
+    assert c.settled("abandoned", only_agent, REQUIRED)      # an abandonment does not wait for CI
