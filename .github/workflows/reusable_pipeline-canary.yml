@@ -1,0 +1,58 @@
+name: Reusable Pipeline Canary
+
+# Known changes through the real pipeline, with the outcome checked. For every scenario in the
+# repository's canary file a pull request is opened against a throwaway copy of the base branch, the
+# ordinary workflows run on it, and the result is compared with what the scenario expects (verdict,
+# required checks, which files changed, what they contain). Then everything is closed and deleted.
+# Red means the agent loop did something other than what it should. See scripts/pipeline_canary.py.
+
+on:
+  workflow_call:
+    inputs:
+      config:
+        description: 'Path of the canary file in the calling repository.'
+        required: false
+        type: string
+        default: '.github/canary.json'
+      only:
+        description: 'Comma-separated scenario names; empty = all.'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      agent_push_token:
+        description: 'The same token the agents push with: pull requests opened with the job token start no workflow.'
+        required: true
+
+permissions: {}
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: lorenzogirardi/ci-shared
+          ref: v2
+          path: .shared
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Open the scenarios, wait for the verdicts, check them, clean up
+        env:
+          AGENT_PUSH_TOKEN: ${{ secrets.agent_push_token }}
+          ONLY: ${{ inputs.only }}
+        run: |
+          git config --global --add safe.directory "$PWD"
+          echo ".shared/" >> .git/info/exclude
+          python3 .shared/scripts/pipeline_canary.py \
+            --repo "${{ github.repository }}" --config "${{ inputs.config }}" \
+            --tag "${{ github.run_id }}" --only "$ONLY"

@@ -392,3 +392,14 @@ class TestGuardDoesNotFightARepair:
         assert ap.cmd_main_guard(guard_args(dry_run=True)) == 0
         assert "would re-run the failed jobs" in capsys.readouterr().out
         assert calls.reruns == []
+
+
+def test_the_gate_only_merges_into_its_own_base_branch(monkeypatch):
+    """A pull request against another branch (the canary's throwaway base) is not this gate's to merge."""
+    pr = {"state": "open", "draft": False, "labels": [], "head": {"sha": "a" * 40, "repo": {"full_name": "o/r"}},
+          "base": {"ref": "canary/1-base"}}
+    monkeypatch.setattr(ap, "gh_json", lambda a: pr)
+    monkeypatch.setattr(ap, "try_merge", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not merge")))
+    args = type("A", (), {"repo": "o/r", "base_branch": "main", "trusted": "x", "max_reverts": 3, "required_checks": "",
+                          "merge_method": "squash", "poll_seconds": 0})()
+    assert "its base is canary/1-base" in ap.merge_one(args, 5)

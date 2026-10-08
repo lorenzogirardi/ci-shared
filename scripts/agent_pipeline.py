@@ -1230,6 +1230,10 @@ def merge_one(args: argparse.Namespace, number: int) -> str:
     head = pr["head"]["sha"]
     if ((pr["head"].get("repo") or {}).get("full_name")) != args.repo:
         return "not merging a PR from a fork"
+    if ((pr.get("base") or {}).get("ref") or args.base_branch) != args.base_branch:
+        # The gate guards one branch. A pull request against another one (the canary's throwaway base, a
+        # stacked branch) is not its to merge.
+        return f"not merging: its base is {pr['base']['ref']}, this gate merges into {args.base_branch}"
     comments = gh_json([f"repos/{args.repo}/issues/{number}/comments?per_page=100"]) or []
     trusted = {t.strip() for t in args.trusted.split(",") if t.strip()}
     certified = is_certified(comments, head, trusted)
