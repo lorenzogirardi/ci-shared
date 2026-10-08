@@ -636,7 +636,15 @@ def gather_evidence(nodeids: list[str], base_sha: str, *, repeats: int = 2, time
                     path = nid.split("::")[0]
                     exists = subprocess.run(["git", "cat-file", "-e", f"{base_sha}:{path}"], capture_output=True).returncode == 0
                     # A test file that does not exist on the base was added by this change.
-                    result[nid]["base"] = run_pytest([nid], tmp, timeout)[0] if exists else "absent"
+                    if not exists:
+                        result[nid]["base"] = "absent"
+                        continue
+                    outcome, output = run_pytest([nid], tmp, timeout)
+                    result[nid]["base"] = outcome
+                    if outcome != "pass":
+                        # Why it did not pass there: "it already failed before this change" is a strong claim
+                        # (it clears the change of blame), so what it rests on is kept and shown.
+                        result[nid]["base_output"] = output[-600:]
             finally:
                 subprocess.run(["git", "worktree", "remove", "--force", tmp], capture_output=True)
     for nid, ev in result.items():

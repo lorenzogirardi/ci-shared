@@ -4,7 +4,8 @@ name: Reusable Pipeline Health
 # silently stops. This check reads the GitHub API (no model, no repository code) and goes red when:
 #   - a commit is on the base branch and no build covers it (it then starts the build);
 #   - a pull request was certified although an agent could not do its job;
-#   - one of the agent workflows ended in failure.
+#   - one of the agent workflows ended in failure;
+#   - a pull request has no verdict on its head commit and nothing left to run (it is then abandoned).
 # See scripts/pipeline_health.py for the cases, all seen for real.
 
 on:
@@ -37,6 +38,16 @@ on:
         required: false
         type: boolean
         default: true
+      stuck_minutes:
+        description: 'A pull request with no verdict on its head commit and idle this long is stuck.'
+        required: false
+        type: number
+        default: 90
+      abandon_stuck:
+        description: 'Abandon stuck pull requests (label and marker) instead of only reporting them. Needs pull-requests: write in the caller.'
+        required: false
+        type: boolean
+        default: true
 
 permissions: {}
 
@@ -46,8 +57,8 @@ jobs:
     permissions:
       contents: read
       actions: write        # start the build workflow on the base branch when commits have none
-      pull-requests: read
-      issues: read
+      pull-requests: write  # abandon a pull request that has no verdict and nothing left to run
+      issues: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -68,4 +79,5 @@ jobs:
             --build-workflow "${{ inputs.build_workflow }}" \
             --agent-workflows "$AGENT_WORKFLOWS" \
             --hours ${{ inputs.hours }} --grace-minutes ${{ inputs.grace_minutes }} \
-            ${{ inputs.start_missing_build && '--start-missing-build' || '' }}
+            ${{ inputs.start_missing_build && '--start-missing-build' || '' }} \
+            --stuck-minutes ${{ inputs.stuck_minutes }} ${{ inputs.abandon_stuck && '--abandon-stuck' || '' }}

@@ -1014,6 +1014,7 @@ def cmd_guard_change(args: argparse.Namespace) -> int:
     author = git("log", "-1", "--format=%an").stdout.strip()
     subject = git("log", "-1", "--format=%s").stdout.strip()
     reason = ""
+    comments: list[dict] = []
     if getattr(args, "pr", 0) and args.mode in ("pr", "ci"):
         comments = gh_json([f"repos/{args.repo}/issues/{args.pr}/comments?per_page=100"]) or []
         if is_abandoned(comments, args.sha):
@@ -1028,7 +1029,18 @@ def cmd_guard_change(args: argparse.Namespace) -> int:
         if streak >= args.max_streak:
             reason = f"the last {streak} commits on this branch are the agent's own and CI still fails: stopping"
     elif author == AGENT_AUTHOR:
-        reason = "the head commit was written by this pipeline"
+        # The run that pushed this commit certifies it. If that verdict is missing (the run was cancelled or
+        # lost a race before it could post it) nobody else would ever look at this commit: review it, unless
+        # the agent has already answered itself too many times in a row.
+        authors = git("log", "-n", "20", "--format=%an").stdout.split("\n")
+        streak = next((i for i, a in enumerate(authors) if a != AGENT_AUTHOR), len(authors))
+        has_verdict = any(f"<!-- {CERT_MARKER}: {args.sha} -->" in (c.get("body") or "") for c in comments)
+        if args.mode != "pr" or has_verdict:
+            reason = "the head commit was written by this pipeline"
+        elif streak >= getattr(args, "max_streak", 3):
+            reason = f"the last {streak} commits are the agent's own and none carries a verdict: stopping"
+        else:
+            log("the head commit is the agent's own but carries no verdict: reviewing it")
     elif args.mode == "push":
         if _BOT_SUBJECT.match(subject):
             reason = "bookkeeping commit"
@@ -1143,6 +1155,18 @@ def build_change_comment(result: dict, pushed_ok: bool | None) -> str:
 def cmd_publish_pr(args: argparse.Namespace) -> int:
     result = json.loads((OUT_DIR / "result.json").read_text())
     pushed_ok: bool | None = None
+    # A verdict is about one commit. If the branch moved while this run worked (the author pushed, or
+    # another agent run did), what it has to say is about a commit that is no longer the head: saying it
+    # anyway once overwrote the certification of the newer commit and left the pull request open, green
+    # and uncertified, with nothing left to run. The newer commit has its own run.
+    try:
+        pull = gh_json([f"repos/{args.repo}/pulls/{args.pr}"])
+    except (subprocess.CalledProcessError, ValueError):
+        pull = None
+    current = ((pull if isinstance(pull, dict) else {}).get("head") or {}).get("sha", "")
+    if current and result.get("head_sha") and current != result["head_sha"]:
+        log(f"stale run: reviewed {result['head_sha'][:7]} but the head is now {current[:7]}; publishing nothing")
+        return 0
     if result["outcome"] == "converged" and result.get("commits"):
         token = os.environ.get("AGENT_PUSH_TOKEN", "")
         if not token:
@@ -1155,9 +1179,9 @@ def cmd_publish_pr(args: argparse.Namespace) -> int:
              "push", "--quiet", "origin", f"HEAD:refs/heads/{args.head_ref}"], capture_output=True, text=True)
         pushed_ok = pushed.returncode == 0
         if not pushed_ok:
-            result["notes"] = result.get("notes", []) + [
-                "the fixes could not be pushed (the branch moved while the agent worked): "
-                + pushed.stderr.replace(header, "***").strip()[:200]]
+            # Lost the race between the check above and the push: same thing, same answer.
+            log("stale run: the branch moved while pushing (" + pushed.stderr.replace(header, "***").strip()[:200] + "); publishing nothing")
+            return 0
     comments = gh_json([f"repos/{args.repo}/issues/{args.pr}/comments?per_page=100"]) or []
     existing = next((c for c in comments if "<!-- agent-pr -->" in (c.get("body") or "")), None)
     post_comment(args.repo, args.pr, build_change_comment(result, pushed_ok), existing)
