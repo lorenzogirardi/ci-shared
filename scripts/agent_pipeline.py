@@ -346,6 +346,19 @@ def _squash(text: str) -> str:
     return re.sub(r"\s+", " ", text.lower()).strip()
 
 
+def quote_stands(quote: str, intent: str) -> bool:
+    """Is `quote` really taken from the stated intent? Case and whitespace do not count. A model often joins
+    two passages with an ellipsis ("now rejects above 25 ... 30 is no longer allowed"); that is still a
+    quotation as long as EVERY piece is in the intent word for word, so each piece is checked on its own.
+    A paraphrase, however reasonable, is not a quote."""
+    whole = _squash(intent)
+    pieces = [p.strip(" \"'`") for p in re.split(r"\s*(?:\.{3,}|\u2026|\[\.\.\.\])\s*", _squash(quote))]
+    pieces = [p for p in pieces if p]
+    if not pieces or max(len(p) for p in pieces) < MIN_QUOTE or any(len(p) < 4 for p in pieces):
+        return False
+    return all(p in whole for p in pieces)
+
+
 def intent_text(plan: dict) -> str:
     """What the change says it is for: the only thing that can justify
     redefining behaviour a test checks."""
@@ -382,8 +395,7 @@ def apply_rules(verdicts: list[dict], tests: list[str], evidence: dict, intent: 
         elif hint == "preexisting":
             v["classification"], v["reason"] = "preexisting", v["reason"] + " [it already fails on the base commit]"
         elif v["classification"] == "test_defect":
-            quote = _squash(v.get("intent_evidence", ""))
-            if len(quote) < MIN_QUOTE or quote not in _squash(intent):
+            if not quote_stands(v.get("intent_evidence", ""), intent):
                 v["classification"] = "code_defect"
                 v["reason"] += " [downgraded: no verbatim quote of the stated intent justifies changing the test]"
         final.append(v)

@@ -147,6 +147,27 @@ class TestRules:
         out = ap.apply_rules([self.verdict(intent_evidence="make  ADD multiply\nits arguments")], ["t::a"], {}, self.INTENT)
         assert out[0]["classification"] == "test_defect"
 
+    SLEEP = ("feat: lower the sleep limit from 30 to 25 seconds\nIntentional behaviour change: `/api/sleep/{seconds}` now rejects "
+             "any value above 25 seconds with HTTP 400 and the message \"Sleep time too long, max 25 seconds\", instead of above 30. "
+             "The previous maximum of 30 seconds is no longer allowed.")
+
+    def test_a_quote_of_two_passages_joined_by_an_ellipsis_stands(self):
+        """flask-test-api PR #195: the model quoted two real passages with '...' between them; refused as not
+        verbatim, the run spent 27 model calls trying to change the code and was abandoned."""
+        quote = "now rejects any value above 25 seconds with HTTP 400 ... The previous maximum of 30 seconds is no longer allowed."
+        out = ap.apply_rules([self.verdict(intent_evidence=quote)], ["t::a"], {}, self.SLEEP)
+        assert out[0]["classification"] == "test_defect"
+
+    @pytest.mark.parametrize("quote", [
+        "now rejects any value above 25 seconds ... and tests must be relaxed",     # one piece is invented
+        "the limit is now lower \u2026 so the old test is wrong",                     # a paraphrase with an ellipsis
+        "... ...",
+        "30 ... 25 ... 400",                                                          # real words, no real passage
+    ])
+    def test_an_ellipsis_does_not_let_a_paraphrase_through(self, quote):
+        out = ap.apply_rules([self.verdict(intent_evidence=quote)], ["t::a"], {}, self.SLEEP)
+        assert out[0]["classification"] == "code_defect"
+
     def test_evidence_overrides_the_model(self):
         v = self.verdict(classification="code_defect")
         assert ap.apply_rules([v], ["t::a"], {"t::a": {"hint": "flaky"}}, "")[0]["classification"] == "environment"
