@@ -333,7 +333,30 @@ class TestProactiveSteward:
         caller = FakeCaller({"test-steward": [evil], **reviewers_ok()})
         _, final = run(repo, caller, "feat: add sub")
         assert pathlib.Path("tests/test_calc.py").read_text() == TEST
-        assert any("refused" in n for n in final["notes"])
+        # It tried twice, was refused twice: the tests of this change were never established, so no certification.
+        assert final["outcome"] != "converged"
+        assert any("weaken the tests" in n and "not certified" in n for n in final["notes"])
+
+    def test_a_steward_whose_first_reply_is_unusable_gets_told_why_and_tries_again(self, repo):
+        """flask-test-api PR #190: an anchor that is not in the file. It used to end as a note under a certification."""
+        pathlib.Path("calc.py").write_text(GOOD + "\n\ndef sub(a, b):\n    return a - b\n")
+        commit_all("feat: add sub")
+        bad = fence({"explanation": "x", "changes": [{"file": "tests/test_calc.py", "find": "not in the file", "replace": "y"}]})
+        good = fence({"explanation": "sub is tested", "changes": [{"file": "tests/test_sub.py",
+                      "content": "from calc import sub\n\n\ndef test_sub():\n    assert sub(3, 1) == 2\n"}]})
+        caller = FakeCaller({"test-steward": [bad, good], **reviewers_ok()})
+        _, final = run(repo, caller, "feat: add sub")
+        assert pathlib.Path("tests/test_sub.py").is_file()
+        second = [user for role, user in caller.log if role == "test-steward"][1]
+        assert "Your previous reply could not be used" in second and "appears 0 times" in second
+
+    def test_a_steward_that_never_answers_blocks_the_certification(self, repo):
+        pathlib.Path("calc.py").write_text(GOOD + "\n\ndef sub(a, b):\n    return a - b\n")
+        commit_all("feat: add sub")
+        caller = FakeCaller({"test-steward": ["not json at all"], **reviewers_ok()})
+        _, final = run(repo, caller, "feat: add sub")
+        assert final["outcome"] != "converged"
+        assert any("test steward could not produce a usable answer" in n for n in final["notes"])
 
 
 class TestGuardCi:
