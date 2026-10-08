@@ -916,17 +916,33 @@ def cmd_publish(args: argparse.Namespace) -> int:
     if pushed.returncode != 0:
         print(f"::error::push rejected: {pushed.stderr.replace(header, '***')[:300]}", file=sys.stderr)
         return 1
-    created = _gh("pr", "create", "--repo", args.repo, "--base", args.base_branch, "--head", result["branch"],
-                  "--title", result["title"], "--body-file", str(OUT_DIR / "pr-body.md"))
+    # The pull request is opened with the job's own token: the push token is only required to push (a
+    # fine-grained token with Contents alone cannot open one, and the fix then sat on a branch nobody saw).
+    # A pull request opened that way starts no workflow, so one more commit, pushed with the push token,
+    # starts the checks; the certification is for that commit, the head.
+    job_env = {**os.environ, "GH_TOKEN": os.environ.get("JOB_TOKEN") or os.environ.get("GH_TOKEN", "")}
+    created = subprocess.run(["gh", "pr", "create", "--repo", args.repo, "--base", args.base_branch, "--head", result["branch"],
+                              "--title", result["title"], "--body-file", str(OUT_DIR / "pr-body.md")],
+                             capture_output=True, text=True, env=job_env)
     if created.returncode != 0:
         print(f"::error::gh pr create failed: {created.stderr.strip()[:300]}", file=sys.stderr)
         return 1
     url = created.stdout.strip()
+    git("config", "user.name", AGENT_AUTHOR)
+    git("config", "user.email", "actions@github.com")
+    git("commit", "--quiet", "--allow-empty", "-m", "chore(agent): start the checks on this pull request")
+    started = subprocess.run(
+        ["git", "-c", f"http.https://github.com/.extraheader=AUTHORIZATION: basic {header}",
+         "push", "--quiet", "origin", f"HEAD:refs/heads/{result['branch']}"], capture_output=True, text=True)
+    if started.returncode != 0:
+        print(f"::error::could not push the commit that starts the checks: {started.stderr.replace(header, '***')[:300]}", file=sys.stderr)
+        return 1
+    head = git("rev-parse", "HEAD").stdout.strip()
     # Certification is bound to this exact commit: the merge gate accepts it only while
     # the PR head is still this sha, and only from a trusted author.
-    _gh("pr", "comment", url, "--repo", args.repo, "--body", certification_comment(
-        result.get("final_sha") or result.get("head_sha", ""), "the planned change was implemented; the checks, two independent "
-        "reviews and the final review passed"))
+    subprocess.run(["gh", "pr", "comment", url, "--repo", args.repo, "--body", certification_comment(
+        head, "the planned change was implemented; the checks, two independent reviews and the final review passed")],
+        capture_output=True, text=True, env=job_env)
     commit_comment()
     comment(f"Opened {url}. It merges automatically once its CI is green.")
     log(f"opened {url}")
@@ -1287,6 +1303,18 @@ def rerun_failed_jobs(repo: str, run_id: int) -> bool:
     return done.returncode == 0
 
 
+_FAILURE_LINE = re.compile(r"(\bFAILED\b|\bERROR\b|Error\b|##\[error\]|^E\s|\d+ failed)")
+_LOG_STAMP = re.compile(r"^(?:[^\t\n]*\t)*\d{4}-\d\d-\d\dT[\d:.]+Z\s?")
+
+
+def failure_digest(logs: str, limit: int = 4000) -> str:
+    """The lines of a failed job's log that say what failed. The tail of a log is mostly the runner cleaning
+    up; a report made of that tells the reader nothing (it once quoted the runner's own service messages)."""
+    lines = [_LOG_STAMP.sub("", line) for line in logs.splitlines()]
+    telling = [line for line in lines if _FAILURE_LINE.search(line)]
+    return "\n".join(telling or lines)[-limit:].strip()
+
+
 def cmd_main_guard(args: argparse.Namespace) -> int:
     """The base branch went red after a merge. If a code change plausibly caused
     it, take the change out at once (git revert, pushed with the agent token) and
@@ -1370,7 +1398,7 @@ def cmd_main_guard(args: argparse.Namespace) -> int:
         if attempt == 3:
             print(f"::error::revert push rejected: {pushed.stderr.replace(header, '***')[:300]}", file=sys.stderr)
             return 1
-    logs = collect_failure_logs(args.repo, sha, 6000) or "(no log excerpt available)"
+    logs = failure_digest(collect_failure_logs(args.repo, sha, 60000) or "") or "(no log excerpt available)"
     listing = "\n".join(f"- `{c[:7]}` {t}" for c, t in zip(suspects, subjects))
     body = (f"The pipeline on `{args.base_branch}` went red after `{sha[:7]}`, so the changes since the last green run were reverted "
             f"automatically:\n\n{listing}\n\nFailed jobs: {', '.join(failed)}.\n\n## Failure\n```\n{logs[-5000:]}\n```\n\n"
