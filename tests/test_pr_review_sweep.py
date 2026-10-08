@@ -761,3 +761,34 @@ class TestWorkflowPrsBelongToTheBot:
         for outcome in ("workflow-file",):
             for clean in (True, False):
                 assert "needs a human" not in comment_body("h", "x", "c" * 40, is_clean=clean, merge_outcome=outcome)
+
+
+class TestMergeStartsThePushWorkflows:
+    """A merge made with the job's own GITHUB_TOKEN starts no workflow on the base branch (no image build, no
+    deploy check, no changelog, a blind guard). Real incident: PRs #183, #185 and #186 of flask-test-api."""
+
+    def _merge(self, monkeypatch, update_token):
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"], seen["env"] = cmd, kwargs.get("env")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(pr_review_sweep, "run", fake_run)
+        monkeypatch.setattr(pr_review_sweep, "touches_workflow_files", lambda repo, number: False)
+        monkeypatch.setattr(pr_review_sweep, "checks_state", lambda *a, **k: ("green", "ok"))
+        monkeypatch.setenv("GH_TOKEN", "job-token")
+        if update_token:
+            monkeypatch.setenv("UPDATE_TOKEN", update_token)
+        else:
+            monkeypatch.delenv("UPDATE_TOKEN", raising=False)
+        assert try_merge("o/r", 1, "sha", "squash", ("checks",)) == "merged"
+        return seen
+
+    def test_merges_with_the_push_token(self, monkeypatch):
+        seen = self._merge(monkeypatch, "push-token")
+        assert seen["cmd"][:3] == ["gh", "pr", "merge"]
+        assert seen["env"]["GH_TOKEN"] == "push-token"
+
+    def test_without_a_push_token_the_job_token_is_used_as_before(self, monkeypatch):
+        assert self._merge(monkeypatch, "")["env"] is None
