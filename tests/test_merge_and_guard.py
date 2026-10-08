@@ -410,3 +410,47 @@ def test_the_gate_only_merges_into_its_own_base_branch(monkeypatch):
     args = type("A", (), {"repo": "o/r", "base_branch": "main", "trusted": "x", "max_reverts": 3, "required_checks": "",
                           "merge_method": "squash", "poll_seconds": 0})()
     assert "its base is canary/1-base" in ap.merge_one(args, 5)
+
+
+def test_a_fix_pull_request_is_opened_with_the_job_token_and_started_with_a_push(remote, monkeypatch):
+    """Live main-guard test on flask-test-api: the agent repaired a direct push and pushed its branch, but the
+    push token could not open a pull request ('Resource not accessible by personal access token'), so the fix
+    sat on a branch nobody saw. The job token opens it; one more pushed commit starts the checks."""
+    origin, _ = remote
+    out = pathlib.Path(".ai/agent-run")
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "pr-body.md").write_text("body")
+    (out / "result.json").write_text(json.dumps({"outcome": "converged", "branch": "agent/push-abc", "title": "fix(agent): x"}))
+    monkeypatch.setenv("AGENT_PUSH_TOKEN", "push-token")
+    monkeypatch.setenv("GH_TOKEN", "push-token")
+    monkeypatch.setenv("JOB_TOKEN", "job-token")
+    real, seen = subprocess.run, []
+
+    def fake(cmd, *a, **k):
+        if cmd[0] == "gh":
+            seen.append((cmd[1:3], (k.get("env") or {}).get("GH_TOKEN")))
+            return subprocess.CompletedProcess(cmd, 0, "https://github.com/o/r/pull/9\n", "")
+        return real(cmd, *a, **k)
+
+    monkeypatch.setattr(ap.subprocess, "run", fake)
+    before = git("rev-parse", "HEAD")
+    assert ap.cmd_publish(type("A", (), {"repo": "o/r", "issue": 0, "base_branch": "main", "commit_sha": ""})()) == 0
+    assert (["pr", "create"], "job-token") in seen
+    head = git("--git-dir", str(origin), "rev-parse", "agent/push-abc")
+    assert head != before and git("--git-dir", str(origin), "log", "-1", "--format=%an %s", "agent/push-abc").startswith(ap.AGENT_AUTHOR)
+    comment = next(c for c in seen if c[0] == ["pr", "comment"])
+    assert comment[1] == "job-token"
+
+
+def test_the_failure_report_quotes_what_failed_not_the_runner_cleaning_up():
+    """Live revert on flask-test-api: the comment quoted the runner's service messages instead of the test."""
+    log = ("2026-10-08T21:53:10.1Z tests/test_canary.py::test_the_limit_itself_is_allowed FAILED   [ 5%]\n"
+           "2026-10-08T21:53:12.1Z E       assert False\n"
+           "2026-10-08T21:53:12.2Z FAILED tests/test_canary.py::test_the_limit_itself_is_allowed - assert False\n"
+           "2026-10-08T21:53:12.3Z =========== 1 failed, 75 passed in 3.10s ===========\n"
+           "2026-10-08T21:53:15.9Z Oct 08 21:52:34 runner agentservice[2347]: INFO [LOCKDOWN] Runner.Worker PID set module=armour\n"
+           "2026-10-08T21:53:16.0Z Cleaning up orphan processes\n")
+    digest = ap.failure_digest(log)
+    assert "FAILED tests/test_canary.py::test_the_limit_itself_is_allowed - assert False" in digest
+    assert "1 failed, 75 passed" in digest and "LOCKDOWN" not in digest and "2026-10-08T" not in digest
+    assert ap.failure_digest("nothing recognisable\nat all") == "nothing recognisable\nat all"

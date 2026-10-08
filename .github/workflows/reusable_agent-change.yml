@@ -255,6 +255,7 @@ jobs:
         env:
           AGENT_PUSH_TOKEN: ${{ secrets.agent_push_token }}
           GH_TOKEN: ${{ secrets.agent_push_token }}
+          JOB_TOKEN: ${{ github.token }}     # opens the fix pull request; the push token only pushes
         run: |
           python3 .shared/scripts/agent_pipeline.py publish \
             --repo "${{ github.repository }}" --base-branch "${{ inputs.base_branch }}" \
