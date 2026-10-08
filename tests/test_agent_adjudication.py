@@ -350,6 +350,38 @@ class TestProactiveSteward:
         second = [user for role, user in caller.log if role == "test-steward"][1]
         assert "Your previous reply could not be used" in second and "appears 0 times" in second
 
+    def test_a_failing_test_the_steward_just_wrote_never_changes_the_application(self, repo):
+        """flask-test-api PR #193: the steward asserted a response field the app did not return; the test was
+        treated as the specification and the writer changed the app-wide error handler to satisfy it."""
+        pathlib.Path("calc.py").write_text(GOOD + "\n\ndef sub(a, b):\n    return a - b\n")
+        commit_all("feat: add sub")
+        code_before = pathlib.Path("calc.py").read_text()
+        wrong = fence({"explanation": "x", "changes": [{"file": "tests/test_sub.py",
+                       "content": "from calc import sub\n\n\ndef test_sub():\n    assert sub(3, 1) == 99\n"}]})
+        right = fence({"explanation": "sub is tested", "changes": [{"file": "tests/test_sub.py",
+                       "content": "from calc import sub\n\n\ndef test_sub():\n    assert sub(3, 1) == 2\n"}]})
+        bend = fence({"explanation": "make the test pass", "changes": [{"file": "calc.py", "find": "return a - b", "replace": "return 99"}]})
+        caller = FakeCaller({"test-steward": [wrong, right], "writer": [bend], **reviewers_ok()})
+        _, final = run(repo, caller, "feat: add sub")
+        assert pathlib.Path("calc.py").read_text() == code_before
+        assert "writer" not in [role for role, _ in caller.log]
+        assert "== 2" in pathlib.Path("tests/test_sub.py").read_text()
+        second = [user for role, user in caller.log if role == "test-steward"][1]
+        assert "FAILED against this change" in second
+
+    def test_steward_tests_that_fail_twice_block_the_certification_and_leave_the_code_alone(self, repo):
+        pathlib.Path("calc.py").write_text(GOOD + "\n\ndef sub(a, b):\n    return a - b\n")
+        commit_all("feat: add sub")
+        code_before = pathlib.Path("calc.py").read_text()
+        wrong = fence({"explanation": "x", "changes": [{"file": "tests/test_sub.py",
+                       "content": "from calc import sub\n\n\ndef test_sub():\n    assert sub(3, 1) == 99\n"}]})
+        caller = FakeCaller({"test-steward": [wrong], **reviewers_ok()})
+        _, final = run(repo, caller, "feat: add sub")
+        assert final["outcome"] != "converged"
+        assert pathlib.Path("calc.py").read_text() == code_before
+        assert not pathlib.Path("tests/test_sub.py").exists()
+        assert any("not certified" in n for n in final["notes"])
+
     def test_a_steward_that_never_answers_blocks_the_certification(self, repo):
         pathlib.Path("calc.py").write_text(GOOD + "\n\ndef sub(a, b):\n    return a - b\n")
         commit_all("feat: add sub")
