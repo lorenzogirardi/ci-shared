@@ -246,11 +246,18 @@ class RunState(TypedDict, total=False):
     adjudications: list
     tests_done: int
     applied_kind: str
+    own_tests: bool          # the change under verification is tests the steward has just written
+    own_tests_attempts: int
+    tests_feedback: str
 
 
 def is_doc_path(path: str) -> bool:
     name = pathlib.PurePosixPath(path).name
-    if name.upper().startswith("CHANGELOG") or path.startswith((".github/", ".shared/", ".ai/")):
+    if name.upper().startswith("CHANGELOG") or path.startswith((".github/", ".shared/", ".ai/", ".claude/")):
+        return False
+    # Instructions for coding agents are the project's rules, not documentation of the change: an agent
+    # that rewrites them to match what it has just done has changed the rules to fit the result.
+    if name in ("CLAUDE.md", "AGENTS.md", "GEMINI.md", ".cursorrules"):
         return False
     return path.lower().endswith((".md", ".rst", ".txt")) or name == ".env.example"
 
@@ -404,7 +411,7 @@ def build_graph(rt: Runtime):
             reportable = state.get("committed") or state.get("rounds")
             return stop(state, "escalated" if reportable else "failed", f"writer: {text}")
         return {"route": "verify", "applied": {"edited": applied.edited, "created": applied.created},
-                "explanation": text}
+                "explanation": text, "applied_kind": None, "own_tests": False}
 
     def adjudicate(state: RunState, output: str):
         """(verdicts, evidence) for the failing tests in `output`, or None when
@@ -479,7 +486,19 @@ def build_graph(rt: Runtime):
             needs_tests = rt.write_tests and state.get("tests_done") != state["iteration"]
             return {"route": "tests" if needs_tests else "review",
                     "committed": bool(applied) or state.get("committed", False),
-                    "verify_attempts": 0, "applied": None, "applied_kind": None}
+                    "verify_attempts": 0, "applied": None, "applied_kind": None, "own_tests": False}
+        if state.get("own_tests") and applied:
+            # The checks passed before the steward added these tests, so the tests are what is wrong: they
+            # assert something the code does not do. A test written a minute ago by a model is not the
+            # specification, and the application is never changed to satisfy it.
+            lib.revert(applied)
+            tries = state.get("own_tests_attempts", 0) + 1
+            if tries >= 2:
+                return stop(state, "escalated", "the tests the steward wrote for this change do not pass against it, twice, "
+                                                 "so its tests were not evaluated and it is not certified")
+            return {"route": "tests", "applied": None, "applied_kind": None, "own_tests": False, "own_tests_attempts": tries,
+                    "tests_feedback": output[-3000:],
+                    "notes": state.get("notes", []) + ["the steward's new tests failed against the change and were discarded; it was asked again"]}
         return handle_failure(state, output, applied)
 
     def n_ci_failure(state: RunState) -> dict:
@@ -523,7 +542,7 @@ def build_graph(rt: Runtime):
             lib.revert(applied)
             return back_to_code(state, current, "the test change weakens the tests: " + "; ".join(violations))
         base_explanation = state.get("explanation", "")
-        return {"route": "verify", "applied": merged(state, applied), "applied_kind": "test",
+        return {"route": "verify", "applied": merged(state, applied), "applied_kind": "test", "own_tests": False,
                 "explanation": f"{base_explanation}; tests updated: {explanation}".strip("; "),
                 "notes": state.get("notes", []) + [f"tests updated to the stated intent: {', '.join(applied.files)}"]}
 
@@ -565,6 +584,10 @@ def build_graph(rt: Runtime):
             return base
         user = (f"## Mode\nPROACTIVE: decide whether the tests cover this change.\n\n## Stated intent\n{intent_text(state['plan'])}"
                 f"\n\n## Existing tests\n{lib.test_inventory()}\n\n## How tests are written in this repository\n{lib.test_conventions()}\n\n## Diff\n{diff_since_base(rt.base_sha)[:40000]}")
+        if state.get("tests_feedback"):
+            user += ("\n\n## The tests you wrote last time FAILED against this change and were discarded\n"
+                     "The application is right and is not going to change. Assert only what this output shows the code "
+                     f"really does:\n{state['tests_feedback']}")
         def not_weaker(_applied):
             violations = lib.weakened_tests("HEAD")
             return ("The changes weaken the tests, which is never allowed: " + "; ".join(violations)) if violations else None
@@ -581,7 +604,7 @@ def build_graph(rt: Runtime):
         if found is not None and found[0] == 0:
             notes.append("the new tests also pass without the change, so they may not test it")
         return {"tests_done": state["iteration"], "route": "verify", "applied": {"edited": applied.edited, "created": applied.created},
-                "applied_kind": "test", "explanation": f"tests: {explanation}", "notes": notes + [f"tests added/updated: {', '.join(applied.files)}"]}
+                "applied_kind": "test", "own_tests": True, "explanation": f"tests: {explanation}", "notes": notes + [f"tests added/updated: {', '.join(applied.files)}"]}
 
     def after_review(state: RunState, findings: list[lib.Finding], dropped, label: str) -> dict:
         in_scope = [f for f in findings if lib.finding_in_scope(f, state["plan"])]

@@ -518,3 +518,10 @@ class TestPublishPr:
         args = type("A", (), {"repo": "o/r", "issue": 0, "base_branch": "main", "commit_sha": "abc"})()
         assert ap.cmd_publish(args) == 0
         assert calls and calls[0][1] == "repos/o/r/commits/abc/comments"
+
+
+def test_instructions_for_coding_agents_are_not_documentation():
+    """flask-test-api PR #193: the documentation reviewer rewrote a convention in CLAUDE.md to match the change."""
+    for path in ("CLAUDE.md", "AGENTS.md", "sub/CLAUDE.md", ".claude/skills/x/SKILL.md"):
+        assert not ap.is_doc_path(path), path
+    assert ap.is_doc_path("README.md") and ap.is_doc_path("docs/13-agent-pipeline.md")
