@@ -31,12 +31,13 @@ BOOKKEEPING = re.compile(r"^(Done\s+by Github Actions|docs\(changelog\))", re.IG
 # What the engine writes in its report when an agent could not do its job. The engine and this check use
 # the same list (agent_pipeline imports it), so a new wording cannot go unnoticed here.
 DEGRADED_NOTES = (
+    "could not produce a usable answer",
+    "could not be identified, so no verdict was given",
+    # Wording of engine versions before an agent's failure blocked the certification.
     "returned no usable reply",
     "were not applicable",
-    "was not evaluated",
-    "were not checked",
-    "could not be identified, so no verdict was given",
 )
+LEGACY_NOTES = ("returned no usable reply", "were not applicable")
 CERTIFIED_RE = re.compile(r"<!--\s*agent-certified:\s*[0-9a-f]{7,40}\s*-->")
 AGENT_COMMENT = "<!-- agent-pr -->"
 

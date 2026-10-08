@@ -51,7 +51,9 @@ class FakeCaller:
         self.log.append((role, user))
         queue = self.replies.get(role)
         if not queue:
-            return None
+            # A test that says nothing about the steward is not about the steward: it finds the tests fine.
+            # (A steward that really returns nothing blocks the certification; see TestAgentFailureBlocks.)
+            return fence({"explanation": "the existing tests cover this change", "changes": []}) if role == "test-steward" else None
         return queue.pop(0) if len(queue) > 1 else queue[0]
 
     def total_cost_usd(self):
@@ -169,9 +171,22 @@ class TestLoop:
             "doc-reviewer": [fence({"explanation": "x", "changes": [{"file": "greet.py", "find": "hello", "replace": "bye"}]})],
         })
         _, final = run_graph(caller)
-        assert final["outcome"] == "converged"
+        # An agent that cannot produce a usable answer is not an agent that found nothing: no certification.
+        assert final["outcome"] != "converged"
         assert "hello" in pathlib.Path("greet.py").read_text()
-        assert any("documentation reviewer returned no usable reply" in n for n in final["notes"])
+        assert any("documentation reviewer could not produce a usable answer" in n for n in final["notes"])
+
+    def test_doc_reviewer_gets_a_second_try_and_is_told_what_was_wrong(self, repo):
+        bad = fence({"explanation": "x", "changes": [{"file": "README.md", "find": "text that is not there", "replace": "y"}]})
+        good = fence({"explanation": "nothing needed", "changes": []})
+        caller = FakeCaller({
+            "writer": [write_change()], "reviewer-correctness": [no_findings()], "reviewer-security": [no_findings()],
+            "final-reviewer": [no_findings()], "doc-reviewer": [bad, good],
+        })
+        _, final = run_graph(caller)
+        assert final["outcome"] == "converged"
+        second = [user for role, user in caller.log if role == "doc-reviewer"][1]
+        assert "Your previous reply could not be used" in second and "could not be applied" in second
 
 
 class TestPlanner:

@@ -527,6 +527,37 @@ def build_graph(rt: Runtime):
                 "explanation": f"{base_explanation}; tests updated: {explanation}".strip("; "),
                 "notes": state.get("notes", []) + [f"tests updated to the stated intent: {', '.join(applied.files)}"]}
 
+    def usable_changes(role: str, user: str, allowed, check=None):
+        """Ask `role` for changes until they can actually be used, at most twice. Returns
+        (applied, explanation, None) for an applied change, (None, explanation, None) when the agent says
+        none is needed, and (None, "", why) when it could not produce a usable one. The second attempt is
+        told exactly what was wrong with the first: an agent that fails is not the same as an agent that
+        found nothing to do, and must not be reported as one."""
+        why = ""
+        for attempt in (1, 2):
+            prompt = user if attempt == 1 else (
+                f"{user}\n\n## Your previous reply could not be used\n{why}\n"
+                "Reply again with changes that avoid exactly that problem. Copy every `find` anchor character for "
+                "character from the text you were given; if you cannot, create a new file with `content` instead.")
+            parsed = lib.ask_json(rt.caller, role, lib.load_prompt(role), prompt, lambda d: lib.parse_changes(d, allowed=allowed))
+            if parsed is None:
+                why = "It was not one valid JSON object matching the schema, or it named a file this role may not change."
+                continue
+            changes, explanation = parsed
+            if not changes:
+                return None, explanation, None
+            applied = lib.apply_changes(changes)
+            if applied.error:
+                why = f"The changes could not be applied: {applied.error}"
+                continue
+            problem = check(applied) if check else None
+            if problem:
+                lib.revert(applied)
+                why = problem
+                continue
+            return applied, explanation, None
+        return None, "", why
+
     def n_tests(state: RunState) -> dict:
         """Proactive: does the change to application code have the tests it needs?"""
         base = {"tests_done": state["iteration"], "route": "review"}
@@ -534,21 +565,18 @@ def build_graph(rt: Runtime):
             return base
         user = (f"## Mode\nPROACTIVE: decide whether the tests cover this change.\n\n## Stated intent\n{intent_text(state['plan'])}"
                 f"\n\n## Existing tests\n{lib.test_inventory()}\n\n## How tests are written in this repository\n{lib.test_conventions()}\n\n## Diff\n{diff_since_base(rt.base_sha)[:40000]}")
-        parsed = lib.ask_json(rt.caller, "test-steward", lib.load_prompt("test-steward"), user,
-                              lambda d: lib.parse_changes(d, allowed=lib.is_test_path))
+        def not_weaker(_applied):
+            violations = lib.weakened_tests("HEAD")
+            return ("The changes weaken the tests, which is never allowed: " + "; ".join(violations)) if violations else None
+
         notes = list(state.get("notes", []))
-        if parsed is None:
-            return {**base, "notes": notes + ["test steward returned no usable reply; test coverage of the change was not evaluated"]}
-        changes, explanation = parsed
-        if not changes:
+        applied, explanation, failure = usable_changes("test-steward", user, lib.is_test_path, not_weaker)
+        if failure:
+            # Not certifiable: whether this change has the tests it needs was never established.
+            return stop(state, "escalated", f"the test steward could not produce a usable answer ({failure}), so the "
+                                             "tests of this change were not evaluated and it is not certified")
+        if applied is None:
             return {**base, "notes": notes + [f"tests: {explanation or 'the existing tests already cover this change'}"]}
-        applied = lib.apply_changes(changes)
-        if applied.error:
-            return {**base, "notes": notes + [f"test steward changes were not applicable: {applied.error}"]}
-        violations = lib.weakened_tests("HEAD")
-        if violations:
-            lib.revert(applied)
-            return {**base, "notes": notes + ["test steward changes refused (they weaken the tests): " + "; ".join(violations)]}
         found = lib.discriminating(rt.base_sha, [f for f in applied.files if f.endswith(".py")])
         if found is not None and found[0] == 0:
             notes.append("the new tests also pass without the change, so they may not test it")
@@ -607,25 +635,20 @@ def build_graph(rt: Runtime):
         def validate(data: dict):
             return lib.parse_changes(data, allowed=is_doc_path)
 
-        parsed = lib.ask_json(rt.caller, "doc-reviewer", lib.load_prompt("doc-reviewer"), user, validate)
-        if parsed is None:
-            notes.append("documentation reviewer returned no usable reply; docs were not checked")
+        applied, explanation, failure = usable_changes("doc-reviewer", user, is_doc_path)
+        if failure:
+            return stop(state, "escalated", f"the documentation reviewer could not produce a usable answer ({failure}), "
+                                             "so the documentation was not checked and the change is not certified")
+        if applied is None:
+            notes.append(f"docs: {explanation or 'no documentation change needed'}")
         else:
-            changes, explanation = parsed
-            if changes:
-                applied = lib.apply_changes(changes)
-                if applied.error:
-                    notes.append(f"documentation edits were not applicable: {applied.error}")
-                else:
-                    ok, output = lib.run_verify_isolated(rt.verify_command, rt.verify_timeout)
-                    if ok:
-                        commit_round(f"docs(agent): {explanation[:120]}")
-                        notes.append(f"docs updated: {', '.join(applied.files)}")
-                    else:
-                        lib.revert(applied)
-                        notes.append(f"documentation edits broke the checks and were reverted:\n{output[-800:]}")
+            ok, output = lib.run_verify_isolated(rt.verify_command, rt.verify_timeout)
+            if ok:
+                commit_round(f"docs(agent): {explanation[:120]}")
+                notes.append(f"docs updated: {', '.join(applied.files)}")
             else:
-                notes.append(f"docs: {explanation or 'no documentation change needed'}")
+                lib.revert(applied)
+                notes.append(f"documentation edits broke the checks and were reverted:\n{output[-800:]}")
         # Changelog: deterministic, so it cannot silently go missing.
         if rt.changelog_path and rt.changelog_path not in changed_files(rt.base_sha):
             path = pathlib.Path(rt.changelog_path)
@@ -650,7 +673,7 @@ def build_graph(rt: Runtime):
     graph.add_conditional_edges("start", route, {"write": "write", "verify": "verify", "review": "review", "ci": "ci_failure"})
     graph.add_conditional_edges("ci_failure", route, {"write": "write", "steward": "steward", "verify": "verify", "end": END})
     graph.add_conditional_edges("steward", route, {"verify": "verify", "write": "write", "end": END})
-    graph.add_conditional_edges("tests", route, {"verify": "verify", "review": "review"})
+    graph.add_conditional_edges("tests", route, {"verify": "verify", "review": "review", "end": END})
     graph.add_conditional_edges("write", route, {"verify": "verify", "end": END})
     graph.add_conditional_edges("verify", route, {"review": "review", "tests": "tests", "write": "write", "steward": "steward",
                                                   "verify": "verify", "end": END})
