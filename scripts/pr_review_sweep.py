@@ -48,8 +48,20 @@ DIFF_EXCLUDES = [
 ]
 
 
-def run(cmd: list[str], *, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, check=check, capture_output=capture, text=True)
+def run(cmd: list[str], *, check: bool = True, capture: bool = True,
+        env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=check, capture_output=capture, text=True, env=env)
+
+
+def push_token_env() -> dict[str, str] | None:
+    """The environment for an action that must start the workflows of the branch it lands on.
+
+    GitHub does not start workflows for events made with the job's own GITHUB_TOKEN, so a merge made
+    with it produces a commit on the base branch that no push workflow ever sees: no image build, no
+    deploy check, no changelog, and the guard on that branch stays blind. The push token (a PAT or
+    app token) does not have that limit. Without one, the job token is used, as before."""
+    token = os.environ.get("UPDATE_TOKEN")
+    return {**os.environ, "GH_TOKEN": token} if token else None
 
 
 def gh_json(args: list[str]) -> object:
@@ -1024,7 +1036,7 @@ def try_merge(repo: str, number: int, head_sha: str, method: str,
                 "pending": "checks pending",
                 "none": "no checks"}[state]
 
-    done = run(["gh", "pr", "merge", str(number), f"--{method}", "--repo", repo], check=False)
+    done = run(["gh", "pr", "merge", str(number), f"--{method}", "--repo", repo], check=False, env=push_token_env())
     if done.returncode == 0:
         print(f"Merged PR #{number} ({detail}).")
         return "merged"
