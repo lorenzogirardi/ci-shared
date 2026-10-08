@@ -32,6 +32,7 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
+      pull-requests: write   # open and close the canary pull requests (the push token only pushes)
     steps:
       - uses: actions/checkout@v4
         with:
@@ -49,6 +50,7 @@ jobs:
       - name: Open the scenarios, wait for the verdicts, check them, clean up
         env:
           AGENT_PUSH_TOKEN: ${{ secrets.agent_push_token }}
+          GH_TOKEN: ${{ github.token }}
           ONLY: ${{ inputs.only }}
         run: |
           git config --global --add safe.directory "$PWD"
