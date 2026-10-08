@@ -50,3 +50,24 @@ def test_conventions_show_the_shared_fixtures_and_one_test_module(tmp_path, monk
     text = lib.test_conventions()
     assert "async def client" in text
     assert "@pytest.mark.anyio" in text
+
+
+def test_failed_tests_are_found_in_a_ci_log_with_timestamps():
+    """Real incident (flask-test-api PR #191): the CI log has a timestamp before every line, the pattern wanted
+    FAILED at the start of the line, so no failing test was found and the adjudicator never ran."""
+    log = (
+        "2026-10-08T16:13:10.3410767Z tests/test_api.py::test_sleep_up_to_30_seconds_allowed[asyncio] FAILED   [ 39%]\n"
+        "2026-10-08T16:13:12.1041702Z FAILED tests/test_api.py::test_sleep_up_to_30_seconds_allowed[asyncio] - assert 400 == 200\n"
+        "2026-10-08T16:13:12.1043014Z =================== 1 failed, 71 passed, 25 skipped in 3.10s ===================\n"
+    )
+    assert lib.parse_failed_tests(log) == ["tests/test_api.py::test_sleep_up_to_30_seconds_allowed[asyncio]"]
+
+
+def test_failed_tests_are_found_with_job_and_step_prefixes():
+    log = "checks\tTests\t2026-10-08T16:13:12.1Z FAILED tests/test_a.py::test_x - boom\n"
+    assert lib.parse_failed_tests(log) == ["tests/test_a.py::test_x"]
+
+
+def test_plain_output_still_parses():
+    assert lib.parse_failed_tests("FAILED tests/test_a.py::test_x - boom\nERROR tests/test_b.py::test_y\n") == [
+        "tests/test_a.py::test_x", "tests/test_b.py::test_y"]

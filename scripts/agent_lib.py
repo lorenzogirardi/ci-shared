@@ -523,7 +523,9 @@ def run_verify_isolated(command: str, timeout: int) -> tuple[bool, str]:
 
 # Only real test ids (with `::`): a collection error such as `ERROR tests/x.py - SyntaxError` is
 # a broken file, not a failing test, and has nothing to adjudicate.
-_NODEID_RE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+\.py::\S+)", re.MULTILINE)
+# CI logs read through the API put a timestamp (and sometimes the job and step names) before every line.
+_LOG_PREFIX = r"(?:[^\t\n]*\t)*(?:\d{4}-\d\d-\d\dT[\d:.]+Z\s+)?"
+_NODEID_RE = re.compile(r"^" + _LOG_PREFIX + r"(?:FAILED|ERROR)\s+(\S+\.py::\S+)", re.MULTILINE)
 SOURCE_SUFFIXES = (".py", ".js", ".ts", ".go", ".rs", ".java", ".rb", ".php", ".cs", ".c", ".cpp", ".h")
 
 
