@@ -143,6 +143,9 @@ def guard_env(monkeypatch, sha, *, subject="feat: bad change (#4)", jobs=("build
         if url.endswith("/actions/runs/9"):
             return {"head_sha": sha, "head_branch": "main", "conclusion": conclusion, "workflow_id": 7, "run_number": 12,
                     "run_attempt": attempt}
+        if url.endswith("/pulls"):
+            # only the change that carries a PR number in its subject came from a pull request
+            return [{"number": 4}] if f"/commits/{sha}/pulls" in url and "(#4)" in subject else []
         if f"/commits/{sha}" in url and "?" not in url:
             return {"commit": {"message": subject + "\n\nbody"}}
         if url.endswith("/runs/9/jobs?per_page=100"):
@@ -175,7 +178,7 @@ def guard_args(**over):
 
 
 class TestMainGuard:
-    def test_a_code_change_that_turned_main_red_is_reverted_and_queued_to_be_redone(self, remote, monkeypatch):
+    def test_a_code_change_that_turned_main_red_is_reverted_and_its_pull_request_is_told(self, remote, monkeypatch):
         origin, sha = remote
         calls = guard_env(monkeypatch, sha)
         assert ap.cmd_main_guard(guard_args()) == 0
@@ -183,8 +186,11 @@ class TestMainGuard:
         assert subjects[0].startswith(f"{ap.REVERT_PREFIX}: feat: bad change (#4)") and "pipeline red" in subjects[0]
         assert git("--git-dir", str(origin), "show", "main:x") == "1"                    # the bad change is out
         assert git("--git-dir", str(origin), "log", "-1", "--format=%an", "main") == ap.AGENT_AUTHOR
-        issue = next(c for c in calls if c[:2] == ("issue", "create"))
-        assert "agent" in issue and "Redo: feat: bad change (#4)" in issue
+        # Reverted is where it ends: said on the pull request it came from, with the failure. No issue.
+        assert not any(c[:2] == ("issue", "create") for c in calls)
+        said = [c for c in calls if any("/issues/4/comments" in x for x in c)]
+        assert said and any("reverted" in x and "FAILED tests/integration" in x for x in said[0])
+        assert any("/issues/4/labels" in x for c in calls for x in c) and any(f"labels[]={ap.REVERTED_LABEL}" in c for c in calls)
 
     def test_several_commits_between_runs_all_go_back_to_the_last_green_state(self, remote, monkeypatch):
         origin, _ = remote
@@ -205,8 +211,9 @@ class TestMainGuard:
             git("--git-dir", str(origin), "show", "main:z")                           # second change reverted
         subject = git("--git-dir", str(origin), "log", "-1", "--format=%s", "main")
         assert subject.startswith(f"{ap.REVERT_PREFIX}: 2 commits since the last green run")
-        issue = next(c for c in calls if c[:2] == ("issue", "create"))
-        assert "Redo: 2 reverted changes" in issue
+        assert not any(c[:2] == ("issue", "create") for c in calls)
+        # neither commit of this test came from a pull request: each is told on the commit itself
+        assert sum(1 for c in calls if any("/comments" in x and "/commits/" in x for x in c) and any("reverted" in x for x in c)) == 2
 
     def test_only_bookkeeping_since_the_last_green_run_is_not_reverted(self, remote, monkeypatch):
         origin, sha = remote

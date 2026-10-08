@@ -8,7 +8,7 @@ Subcommands
              Commits to a local branch only; holds NO push credential.
   publish    push that branch and open the PR. The only step with a write token.
   merge-gate    merge a PR whose head commit is certified and whose CI is green
-  main-guard    the base branch went red: revert the culprit, open a redo issue
+  main-guard    the base branch went red: revert the culprit and say so on its pull request
   guard-change / change / publish-pr
              the same engine on a change that already exists: a pull request
              (fixes are pushed to its branch) or a push straight to main (a fix
@@ -1201,6 +1201,7 @@ def cmd_publish_pr(args: argparse.Namespace) -> int:
 
 CODE_JOBS = ("build", "quality-gate", "k8s-check", "docker")   # failures a code change can cause
 REVERT_PREFIX = "revert(agent)"
+REVERTED_LABEL = "agent-reverted"
 
 
 def recent_reverts(repo: str, branch: str, hours: int = 24) -> int:
@@ -1289,8 +1290,8 @@ def rerun_failed_jobs(repo: str, run_id: int) -> bool:
 def cmd_main_guard(args: argparse.Namespace) -> int:
     """The base branch went red after a merge. If a code change plausibly caused
     it, take the change out at once (git revert, pushed with the agent token) and
-    open an issue labelled `agent` so the whole pipeline redoes it, this time
-    knowing why it broke. Never reverts a revert, and stops at the breaker."""
+    say so, with the failure, on the pull request it came from. Reverted is a terminal
+    state: no issue, no hand-off. Never reverts a revert, and stops at the breaker."""
     run = gh_json([f"repos/{args.repo}/actions/runs/{args.run_id}"]) or {}
     sha = run.get("head_sha", "")
     if run.get("head_branch") != args.base_branch or run.get("conclusion") != "failure" or not sha:
@@ -1350,9 +1351,9 @@ def cmd_main_guard(args: argparse.Namespace) -> int:
     label = subjects[-1] if len(suspects) == 1 else f"{len(suspects)} commits since the last green run"
     if args.dry_run:
         return note(f"would revert {len(suspects)} change(s) since the last green run: " + "; ".join(subjects)
-                    + f" (failed jobs: {', '.join(failed)}) and open an issue to redo them")
+                    + f" (failed jobs: {', '.join(failed)}) and say so on their pull requests")
     message = (f"{REVERT_PREFIX}: {label} (pipeline red)\n\nReverts: " + "; ".join(f"{c[:7]} {t}" for c, t in zip(suspects, subjects))
-               + f".\nFailed jobs: {', '.join(failed)}.\nAn issue labelled `agent` redoes the change.")
+               + f".\nFailed jobs: {', '.join(failed)}.")
     for attempt in range(1, 4):
         git("fetch", "--quiet", "origin", args.base_branch)
         git("checkout", "--quiet", "-B", args.base_branch, f"origin/{args.base_branch}")
@@ -1371,15 +1372,24 @@ def cmd_main_guard(args: argparse.Namespace) -> int:
             return 1
     logs = collect_failure_logs(args.repo, sha, 6000) or "(no log excerpt available)"
     listing = "\n".join(f"- `{c[:7]}` {t}" for c, t in zip(suspects, subjects))
-    body = (f"The pipeline went red after `{sha[:7]}`, so the changes since the last green run were reverted automatically:\n\n{listing}\n\n"
-            f"Failed jobs: {', '.join(failed)}.\n\n## Failure\n```\n{logs[-5000:]}\n```\n\n"
-            "Implement these changes again. They must not break the failing checks above.")
-    title = f"Redo: {subjects[-1]}" if len(suspects) == 1 else f"Redo: {len(suspects)} reverted changes"
-    created = _gh("issue", "create", "--repo", args.repo, "--title", title[:200], "--body", body, "--label", "agent")
-    if created.returncode != 0:     # the label may not exist yet: still record the work to redo
-        created = _gh("issue", "create", "--repo", args.repo, "--title", title[:200], "--body", body)
-    log(f"reverted {len(suspects)} change(s) since the last green run; redo issue: "
-        f"{created.stdout.strip() or created.stderr.strip()[:200]}")
+    body = (f"The pipeline on `{args.base_branch}` went red after `{sha[:7]}`, so the changes since the last green run were reverted "
+            f"automatically:\n\n{listing}\n\nFailed jobs: {', '.join(failed)}.\n\n## Failure\n```\n{logs[-5000:]}\n```\n\n"
+            "Reverted is where this change ends: nothing waits for anyone. To try again, open a new pull request with the "
+            "change and what the failure above needs; it goes through the same pipeline.")
+    # Said where the change came from: on its pull request, or on the commit when it had none. No issue is
+    # opened: an issue is a hand-off, and a redo that does not know more than the first attempt fails the same way.
+    told = []
+    for commit in suspects:
+        pulls = gh_json([f"repos/{args.repo}/commits/{commit}/pulls"]) or []
+        if pulls:
+            number = pulls[0]["number"]
+            _gh("api", "-X", "POST", f"repos/{args.repo}/issues/{number}/comments", "-f", f"body={body}", "--silent")
+            _gh("api", "-X", "POST", f"repos/{args.repo}/issues/{number}/labels", "-f", f"labels[]={REVERTED_LABEL}", "--silent")
+            told.append(f"#{number}")
+        else:
+            _gh("api", "-X", "POST", f"repos/{args.repo}/commits/{commit}/comments", "-f", f"body={body}", "--silent")
+            told.append(commit[:7])
+    log(f"reverted {len(suspects)} change(s) since the last green run; said so on: {', '.join(told)}")
     return 0
 
 
@@ -1656,7 +1666,7 @@ def main() -> int:
     mg.add_argument("--max-reverts", type=int, default=3)
     mg.set_defaults(fn=cmd_merge_gate)
 
-    mgd = sub.add_parser("main-guard", help="revert the commit that turned the base branch red, and open a redo issue")
+    mgd = sub.add_parser("main-guard", help="revert the commit that turned the base branch red, and say so on its pull request")
     mgd.add_argument("--repo", required=True)
     mgd.add_argument("--run-id", type=int, required=True)
     mgd.add_argument("--base-branch", default="main")
