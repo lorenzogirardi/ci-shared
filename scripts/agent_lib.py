@@ -138,10 +138,14 @@ def ask_json(caller: ModelCaller, role: str, system: str, user: str,
             return parsed
         if attempt == retries:
             return None
+        # Show the model its own reply: asked to start over it tends to write something different (an
+        # invented anchor, another file) instead of repairing the format of what it had.
         reply = caller.call(
             role, system,
-            user + "\n\nYour previous reply was not one valid JSON object matching the required "
-                   "schema. Reply again with ONE fenced json block that matches it exactly, nothing else.",
+            user + "\n\nYour previous reply was not one valid JSON object matching the required schema:\n\n"
+                   + reply[:12000] + "\n\nReply again with ONE fenced json block that matches the schema exactly, "
+                   "keeping the same content and fixing only the format (escape line breaks and quotes inside strings). "
+                   "Nothing else.",
         )
     return None
 
@@ -673,6 +677,20 @@ def test_inventory(max_files: int = 60) -> str:
         names = re.findall(r"^\s*(?:async\s+)?def\s+(test_\w+)", pathlib.Path(f).read_text(errors="replace"), re.MULTILINE)
         lines.append(f"{f}: " + ", ".join(names[:40]))
     return "\n".join(lines) or "(no test files)"
+
+
+def test_conventions(max_chars: int = 3500) -> str:
+    """How tests are written here: the shared fixtures and the head of one existing test module. A steward
+    that only sees test names writes plausible tests that do not fit the project (sync tests for an async
+    client, a fixture that does not exist) and the round is wasted."""
+    files = [f for f in subprocess.run(["git", "ls-files"], capture_output=True, text=True).stdout.split("\n")
+             if f.endswith(".py") and is_test_path(f)]
+    parts = []
+    for f in [x for x in files if x.endswith("conftest.py") and x.count("/") <= 1][:1]:
+        parts.append(f"### {f}\n" + pathlib.Path(f).read_text(errors="replace")[:max_chars])
+    for f in [x for x in files if "integration" not in x and not x.endswith("conftest.py") and x.count("/") <= 1][:1]:
+        parts.append(f"### {f} (head)\n" + "\n".join(pathlib.Path(f).read_text(errors="replace").splitlines()[:30]))
+    return "\n\n".join(parts) or "(none)"
 
 
 # ---------------------------------------------------------------------------

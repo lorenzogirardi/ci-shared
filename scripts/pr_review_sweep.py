@@ -289,7 +289,9 @@ def _parse_json_reply(text: str) -> dict | None:
     matches = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     blob = matches[-1] if matches else text.strip()
     try:
-        data = json.loads(blob)
+        # strict=False: a model that writes a whole file into a JSON string almost always leaves the
+        # line breaks in it raw. The content is intact; refusing it throws away a correct answer.
+        data = json.loads(blob, strict=False)
     except (json.JSONDecodeError, TypeError):
         return None
     return data if isinstance(data, dict) else None
