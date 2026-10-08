@@ -24,6 +24,8 @@ Rules, enforced in code (breaking one discards your reply):
 - Assert only what you have SEEN the code do. Do not assert on the text of an error body, a header or a log
   line unless the diff or the failing output shows the code producing exactly that. A wrong assertion in a
   test you wrote fails the run and wastes a round.
+- Follow the conventions shown under "How tests are written in this repository": same fixtures, same
+  sync or async style, same markers. Do not invent a fixture.
 - Tests must be fast: never sleep or wait for real time (mock the clock or the sleep function), never call
   the network.
 

@@ -529,7 +529,7 @@ def build_graph(rt: Runtime):
         if not any(lib.is_source_path(f) for f in changed_files(rt.base_sha)):
             return base
         user = (f"## Mode\nPROACTIVE: decide whether the tests cover this change.\n\n## Stated intent\n{intent_text(state['plan'])}"
-                f"\n\n## Existing tests\n{lib.test_inventory()}\n\n## Diff\n{diff_since_base(rt.base_sha)[:40000]}")
+                f"\n\n## Existing tests\n{lib.test_inventory()}\n\n## How tests are written in this repository\n{lib.test_conventions()}\n\n## Diff\n{diff_since_base(rt.base_sha)[:40000]}")
         parsed = lib.ask_json(rt.caller, "test-steward", lib.load_prompt("test-steward"), user,
                               lambda d: lib.parse_changes(d, allowed=lib.is_test_path))
         notes = list(state.get("notes", []))
