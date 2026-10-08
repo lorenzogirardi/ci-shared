@@ -450,6 +450,10 @@ def build_graph(rt: Runtime):
                 return {"route": "verify", "verify_attempts": attempts, "notes": notes, "adjudications": history}
             verdict_text = ("\n\nADJUDICATION. Tests are the specification, so the code must satisfy them. "
                             "Verdicts:\n" + json.dumps([v for v in verdicts if v["classification"] != "environment"], indent=2))
+        elif re.search(r"\b\d+ failed\b", output):
+            # Tests failed but none could be named, so nobody judged whether the code or the test is wrong.
+            # Said out loud: the health check looks for this sentence.
+            notes.append("tests failed but the failing tests could not be identified, so no verdict was given")
         if applied:
             lib.revert(applied)
             what = "your previous change (reverted)"

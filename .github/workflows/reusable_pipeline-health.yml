@@ -1,0 +1,71 @@
+name: Reusable Pipeline Health
+
+# Does the pipeline itself still work? With no person in the loop, nobody notices when a piece of it
+# silently stops. This check reads the GitHub API (no model, no repository code) and goes red when:
+#   - a commit is on the base branch and no build covers it (it then starts the build);
+#   - a pull request was certified although an agent could not do its job;
+#   - one of the agent workflows ended in failure.
+# See scripts/pipeline_health.py for the cases, all seen for real.
+
+on:
+  workflow_call:
+    inputs:
+      base_branch:
+        required: false
+        type: string
+        default: 'main'
+      build_workflow:
+        description: 'File name of the workflow that builds the base branch (it must accept workflow_dispatch), e.g. pipeline.yml'
+        required: true
+        type: string
+      agent_workflows:
+        description: 'Comma-separated NAMES of the agent workflows whose failed runs are reported.'
+        required: false
+        type: string
+        default: ''
+      hours:
+        description: 'How far back to look.'
+        required: false
+        type: number
+        default: 48
+      grace_minutes:
+        description: 'A commit younger than this is left alone: its build may not have been created yet.'
+        required: false
+        type: number
+        default: 20
+      start_missing_build:
+        required: false
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write        # start the build workflow on the base branch when commits have none
+      pull-requests: read
+      issues: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: lorenzogirardi/ci-shared
+          ref: v2
+          path: .shared
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check the pipeline
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AGENT_WORKFLOWS: ${{ inputs.agent_workflows }}
+        run: |
+          python3 .shared/scripts/pipeline_health.py \
+            --repo "${{ github.repository }}" --branch "${{ inputs.base_branch }}" \
+            --build-workflow "${{ inputs.build_workflow }}" \
+            --agent-workflows "$AGENT_WORKFLOWS" \
+            --hours ${{ inputs.hours }} --grace-minutes ${{ inputs.grace_minutes }} \
+            ${{ inputs.start_missing_build && '--start-missing-build' || '' }}

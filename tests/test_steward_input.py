@@ -6,7 +6,11 @@ line breaks; it was refused as invalid, and the retry started from scratch and i
 
 import subprocess
 
-import agent_lib as lib
+import sys
+
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1] / "scripts"))
+
+import agent_lib as lib  # noqa: E402
 from pr_review_sweep import _parse_json_reply
 
 
