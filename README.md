@@ -36,6 +36,12 @@ consumers; a breaking change instead gets a new `v2` tag (and its own
 `ref: v2` literal) so existing `@v1` consumers are unaffected until they bump
 on purpose.
 
+`v2` is not moved by hand. `release-tag.yml` moves it to a commit of `main`
+after `Test scripts` has passed on that exact commit, forwards only, so a red
+`main` never reaches a consumer. A consumer whose workflow grants fewer
+permissions than a reusable workflow asks for does not start at all: when a
+change needs a new permission, update the callers first, then merge here.
+
 ## v2: role-based agents
 
 `v2` adds the agents below on top of everything `v1` does; `v1` stays frozen
@@ -47,6 +53,10 @@ for repos that have not moved. All reusable workflows in `v2` check out
 | `reusable_agent-pipeline.yml` | planner -> writer -> deterministic checks -> reviewer A (correctness/design) + reviewer B (security/operability) -> dedup/validation -> bounded fix loop -> final reviewer -> documentation reviewer -> changelog | opens a PR certified at its head commit; retried once with twice the budget, then abandoned (commented, nothing pushed); never merges itself |
 | `reusable_agent-change.yml` | the same engine on a change that already exists, no planner: `mode: pr` (any PR: checks, reviewers A+B, fixes pushed to the PR branch, final reviewer, docs) or `mode: push` (a push straight to the default branch: review, then a fix PR if something blocks) | fix commits on the PR branch, or a PR from `agent/push-<sha>`; never merges; ignores its own commits |
 | `reusable_agent-review.yml` | reviewers A and B on any PR diff | one comment |
+| `reusable_agent-merge.yml` | none (deterministic): the merge gate | squash-merges a pull request whose head commit is certified and whose required checks succeeded on that same commit; only into its own base branch; stops at the circuit breaker |
+| `reusable_agent-main-guard.yml` | none (deterministic): the guard on the base branch | re-runs the failed jobs once, then reverts to the last green state and says so on the pull request the change came from (label `agent-reverted`). Opens no issue |
+| `reusable_pipeline-health.yml` | none (deterministic): the loop checks itself | starts the build for a commit that has none; abandons a pull request that has no verdict and nothing left to run; goes red on a certification given while an agent could not do its job, and on an agent workflow that is failing now |
+| `reusable_pipeline-canary.yml` | none of its own: sends known changes through the real loop | opens the scenarios of the consumer's `.github/canary.json` as pull requests against a throwaway copy of the base branch, checks the outcome (verdict, required checks, files changed, contents), closes them. Never merges |
 | `reusable_changelog.yml` | none (deterministic) | one `docs(changelog)` commit per push to the default branch |
 | `reusable_docs-architect.yml` | documentation architect (Diataxis) | **nothing**: a proposal, optionally as an issue |
 
@@ -65,6 +75,18 @@ How it fits together:
 - `reusable_pr-review-sweep.yml` gained `skip_head_prefixes` so the sweep
   leaves `agent/` branches to the pipeline that certifies them.
 - Cost per role is recorded (`.ai/agents/*.usage.json`) and shown in the PR.
+- Every change ends merged, abandoned or reverted; none waits for a person.
+  The rules that make that safe are code, not prompt: tests are the
+  specification (a test is changed only when the change's own description says
+  so, quoted word for word); a test an agent has just written is not the
+  specification, so the application is never changed to satisfy it; an agent
+  that cannot produce a usable answer blocks the certification; a verdict is
+  bound to one commit, and a run whose commit is no longer the head publishes
+  nothing; documentation edits never touch `CLAUDE.md`, `AGENTS.md` or
+  `.claude/`.
+- With nobody in the loop, nobody notices when a piece of it silently stops.
+  `reusable_pipeline-health.yml` (every 30 minutes) and
+  `reusable_pipeline-canary.yml` (every night) are what notices. Wire both.
 
 ## Workflows
 
@@ -241,6 +263,17 @@ Each consumer repo needs, in *Settings → Secrets and variables → Actions*:
 - Variable `OPENROUTER_MODEL`, `OPENROUTER_ENDPOINT` (optional — defaults in
   the script), `OPENROUTER_SITE_URL`, `OPENROUTER_APP_NAME` (optional)
 - Secret `OPENROUTER_API_KEY`
+- Secret `AUTOFIX_PUSH_TOKEN` (the agent workflows): a fine-grained token with
+  *Contents: read and write* on the repository, never the `workflow` scope. It
+  pushes fixes and merges, so that the workflows of the branch it lands on
+  start. It does not need to open pull requests: those are opened with the
+  job's own token.
+- *Settings → Actions → General → Workflow permissions*: **Allow GitHub
+  Actions to create and approve pull requests**, for the canary and for the
+  fix pull request after a direct push.
+- For the canary: a small module nothing imports, its tests, and
+  `.github/canary.json` describing the scenarios (edits to make, and what must
+  be true afterwards).
 
 Nothing needs to be configured in this repo per consumer — it's stateless.
 
@@ -250,7 +283,7 @@ Nothing needs to be configured in this repo per consumer — it's stateless.
 pytest tests/ -v
 ```
 
-300+ tests, no network, no real `gh` calls — `checks_state`, verdict parsing,
+430+ tests, no network, no real `gh` calls — `checks_state`, verdict parsing,
 the engine's graph against real throwaway git repositories and a scripted
 model, failure adjudication, the weakening guard, the merge gate and the main
 guard (with a local bare remote), terminal states, and `auto_merge_authors`
