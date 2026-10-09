@@ -1,5 +1,10 @@
 # ci-shared — Architecture
 
+> **What this document covers.** The review workflows of `v1` (the diff review, the dependency sweep) and the
+> reasons behind them, including designs that were tried and removed. The agent pipeline of `v2` (the engine,
+> the merge gate, the guard, the health check, the canary, how `v2` is released) is described in the
+> [README](../README.md); where the two disagree, the README is current.
+
 This repo centralizes reusable GitHub Actions workflows and their Python
 scripts, so consumer repos (`flask-test-api`, and later others) stop
 duplicating the same AI-review logic byte-for-byte. It was extracted after
@@ -36,11 +41,18 @@ ci-shared/
 ├── .github/workflows/
 │   ├── reusable_pr-diff-review.yml    review + comment only, contents: read
 │   ├── reusable_pr-review-sweep.yml   scheduled sweep: review, merge, self-repair
-│   ├── reusable_agent-*.yml           the agent engine's workflows (pipeline, change, merge, main guard, ...)
+│   ├── reusable_agent-*.yml           the agent engine's workflows (pipeline, change, review, merge, main guard)
+│   ├── reusable_pipeline-health.yml   the loop checks itself (no model)
+│   ├── reusable_pipeline-canary.yml   known changes through the real loop, outcome checked
+│   ├── reusable_changelog.yml         deterministic changelog entry
+│   ├── reusable_docs-architect.yml    documentation proposal (plan only)
 │   ├── reusable_ci-analysis.yml       post-pipeline informative report
+│   ├── agent-change.yml, agent-ci-failure.yml, agent-merge.yml   this repository under its own pipeline
+│   ├── release-tag.yml                moves v2 after the tests and the consumer's canary pass
 │   └── test.yml                       CI for this repo's own scripts
 ├── prompts/
-│   └── pr-review-system.md            shared review prompt template, one source of truth
+│   ├── pr-review-system.md            shared review prompt template, one source of truth
+│   └── agents/*.md                    one prompt per agent role
 ├── scripts/
 │   ├── openrouter_ai.py    minimal OpenAI-compatible chat-completions client
 │   ├── ai_sanitize.py      redact secrets / cap size before sending to the model
@@ -49,12 +61,17 @@ ci-shared/
 │   ├── pr_review_sweep.py  the sweep's own logic — review, merge gate, triage, autofix
 │   ├── agent_pipeline.py   the langgraph engine (replaced autofix_core.py): see README 'v2'
 │   ├── agent_lib.py        strict parsing, evidence, the weakening guard, isolated verify
+│   ├── pipeline_health.py  the health check
+│   ├── pipeline_canary.py  the canary
+│   ├── changelog_update.py the changelog entry
 │   └── requirements-autofix.txt   the one non-stdlib dependency (langgraph), autofix-only
 ├── tests/
 │   ├── test_openrouter_ai.py     13 tests, mocked HTTP server, no network calls
 │   ├── test_pr_review_sweep.py   91 tests — verdict parsing, checks_state, autofix guardrails, auto_merge_authors
 │   ├── test_agent_pipeline.py    the engine's graph against real throwaway git repos
-│   └── test_merge_and_guard.py   merge gate and main guard (local bare remote)
+│   ├── test_agent_adjudication.py  who is wrong, the code or the test: rules and routing
+│   ├── test_merge_and_guard.py   merge gate and main guard (local bare remote)
+│   └── test_pipeline_health.py, test_pipeline_canary.py
 ├── README.md               quick-start / inputs reference
 └── docs/architecture.md    this file
 ```
@@ -705,6 +722,9 @@ see its case study), fixed after shipping the graph rather than before:
 
 ## File: `.github/workflows/reusable_main-autofix.yml` + `scripts/main_autofix.py`
 
+> **Removed.** Neither file exists any more: a red base branch is re-run once and then reverted by
+> `reusable_agent-main-guard.yml`. The section is kept for the reasoning.
+
 The autofix loop above only ever runs inside the PR sweep — it has no
 opinion on a push straight to a protected branch (typically `main`) that
 breaks CI, because there is no PR to look failures up through or push a fix
@@ -781,23 +801,24 @@ ai-analysis:
 
 ```
 .github/workflows/
-├── pr-checks.yml            pull_request         deterministic gate: resolve deps, lint,
-│                                                  pytest, boot+curl smoke test, actionlint
-├── ai-review.yml            pull_request         → reusable_pr-diff-review.yml
-│                                                  (skips renovate[bot])
-├── ai-review-sweep.yml      schedule+dispatch    → reusable_pr-review-sweep.yml
-│                                                  (renovate[bot] only: review, merge,
-│                                                   triage, autofix)
-├── pipeline.yml (ai-analysis job) push/dispatch  → reusable_ci-analysis.yml
-├── release-notes.yml        pull_request(closed) → calls .shared/scripts/openrouter_ai.py directly
-└── issue-triage.yml         issues(opened)       → calls .shared/scripts/openrouter_ai.py directly
+├── pr-checks.yml          pull_request            deterministic gate: checks, integration, image, workflows
+├── agent-change.yml       pull_request, push      → reusable_agent-change.yml (review, repair, certify)
+├── agent-ci-failure.yml   PR Checks failed        → reusable_agent-change.yml, mode ci
+├── agent-merge.yml        PR Checks ended, push, cron → reusable_agent-merge.yml
+├── agent-main-guard.yml   pipeline on main failed → reusable_agent-main-guard.yml
+├── ai-review-sweep.yml    PR Checks ended, push, cron → reusable_pr-review-sweep.yml (renovate[bot] only)
+├── pipeline-health.yml    cron                    → reusable_pipeline-health.yml
+├── pipeline-canary.yml    cron, repository_dispatch → reusable_pipeline-canary.yml
+├── changelog.yml          push to main            → reusable_changelog.yml
+├── docs-architect.yml     manual                  → reusable_docs-architect.yml
+├── pipeline.yml (ai-analysis job) push/dispatch   → reusable_ci-analysis.yml
+└── release-notes.yml      pull_request(closed)    → calls .shared/scripts/openrouter_ai.py directly
 ```
 
-`release-notes.yml` and `issue-triage.yml` don't fit either reusable-workflow
-shape (one reacts to a merged PR to write release notes, the other reacts to
-a new issue to triage it) — they just check out `ci-shared@v1` into
-`.shared` and invoke the script path directly, same dedup benefit without
-forcing them into an unrelated abstraction.
+`release-notes.yml` does not fit a reusable-workflow shape (it reacts to a merged PR to write release
+notes): it checks out `ci-shared` into `.shared` and invokes the script path directly. `ai-review.yml`
+and `issue-triage.yml`, mentioned further down, no longer exist: every pull request that is not Renovate's
+goes through `agent-change.yml`, and there is no issue-driven flow.
 
 `pr-checks.yml` is not part of `ci-shared` at all — it's plain,
 repo-specific CI (no model call) that exists *because* of what this repo's
