@@ -291,7 +291,8 @@ Nothing needs to be configured in this repo per consumer — it's stateless.
 
 Pull requests here go through the same loop they define: `agent-change.yml` and `agent-ci-failure.yml`
 review and repair them, `agent-merge.yml` merges a certified pull request once `Test scripts` is green on
-the same commit, and `release-tag.yml` then moves `v2`. The agents run at the published tag, never at the
+the same commit, and `release-tag.yml` then moves `v2`, once the canary of the consumer repository has
+passed against the merged commit. The agents run at the published tag, never at the
 pull request's own code, so a change that breaks a reviewer is still judged by the reviewer that works.
 
 Two things stay with a person: a pull request that touches `.github/workflows/` (no agent may edit or merge
