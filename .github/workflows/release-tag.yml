@@ -19,10 +19,10 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
-      probe:
-        description: 'Only check that the gate can reach the consumer repository (sends an event nothing listens to)'
-        type: boolean
-        default: true
+      consumer:
+        description: 'owner/repo to probe: checks that the gate can start something there (sends an event nothing listens to)'
+        type: string
+        required: true
 
 permissions: {}
 
@@ -38,10 +38,11 @@ jobs:
       - name: Can the gate start something in the consumer repository?
         env:
           GH_TOKEN: ${{ secrets.AUTOFIX_PUSH_TOKEN }}
-          CONSUMER: ${{ vars.ENGINE_GATE_REPO || 'lorenzogirardi/flask-test-api' }}
+          CONSUMER: ${{ inputs.consumer }}
         run: |
           set -euo pipefail
           gh api -X POST "repos/$CONSUMER/dispatches" -f event_type=engine-probe
+          gh api "repos/$CONSUMER/actions/workflows" --jq '.total_count' > /dev/null
           echo "### The gate can reach $CONSUMER" >> "$GITHUB_STEP_SUMMARY"
 
   move:
@@ -83,18 +84,26 @@ jobs:
           TESTED: ${{ github.event.workflow_run.head_sha }}
           CONSUMER: ${{ vars.ENGINE_GATE_REPO }}
           CANARY_WORKFLOW: ${{ vars.ENGINE_GATE_WORKFLOW || 'pipeline-canary.yml' }}
-          DISPATCH_TOKEN: ${{ secrets.AUTOFIX_PUSH_TOKEN }}
-          GH_TOKEN: ${{ github.token }}
+          # The same token starts the canary and reads its result: the job's own token is scoped to this
+          # repository and cannot see the consumer's runs.
+          GH_TOKEN: ${{ secrets.AUTOFIX_PUSH_TOKEN }}
         run: |
           set -euo pipefail
           git push --force origin "$TESTED:refs/tags/v2-next"
-          GH_TOKEN="$DISPATCH_TOKEN" gh api -X POST "repos/$CONSUMER/dispatches" \
-            -f event_type=engine-candidate -f "client_payload[sha]=$TESTED"
+          gh api -X POST "repos/$CONSUMER/dispatches" -f event_type=engine-candidate -f "client_payload[sha]=$TESTED"
           echo "candidate $TESTED published as v2-next; waiting for the canary of $CONSUMER"
+          errors=0
           for i in $(seq 1 120); do
             sleep 30
-            line="$(gh api "repos/$CONSUMER/actions/workflows/$CANARY_WORKFLOW/runs?event=repository_dispatch&per_page=20" \
-              --jq "[.workflow_runs[] | select(.display_title | contains(\"$TESTED\"))][0] | \"\(.status) \(.conclusion) \(.html_url)\"" 2>/dev/null || true)"
+            if ! line="$(gh api "repos/$CONSUMER/actions/workflows/$CANARY_WORKFLOW/runs?event=repository_dispatch&per_page=20" \
+              --jq "[.workflow_runs[] | select(.display_title | contains(\"$TESTED\"))][0] | \"\(.status) \(.conclusion) \(.html_url)\"" 2>&1)"; then
+              # A permission problem must not look like a canary that is slow: say what the API said.
+              errors=$((errors + 1))
+              echo "::warning::could not read the canary runs of $CONSUMER ($errors): $line"
+              if [ "$errors" -ge 4 ]; then echo "::error::cannot read the canary result: $line"; exit 1; fi
+              continue
+            fi
+            errors=0
             set -- $line
             status="${1:-}"; conclusion="${2:-}"; url="${3:-}"
             if [ "$status" = "completed" ]; then
