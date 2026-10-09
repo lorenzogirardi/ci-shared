@@ -16,7 +16,7 @@ override via `OPENROUTER_MODEL` — `flask-test-api` currently runs `hy3-free`.
 
 ## Versioning
 
-Consumers pin `@v1` (a moving tag on `main`), never `@main` directly. Every
+Consumers pin a moving tag on `main`, never `@main` directly: `@v1` for the review workflows, `@v2` for the agent workflows (`reusable_agent-change`, `reusable_agent-merge`). Every
 `Checkout shared scripts` step inside the reusable workflows uses a
 **literal** `ref: v1` — not a dynamically resolved ref. `github.workflow_ref`
 inside a called reusable workflow resolves to the **caller's** ref (observed:
