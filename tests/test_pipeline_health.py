@@ -139,3 +139,13 @@ def test_a_run_that_never_started_because_the_job_token_opened_the_pull_request_
     pushed = {"name": "Agent Change", "conclusion": "failure", "event": "push", "triggering_actor": {"login": "github-actions[bot]"}}
     assert [f["url"] for f in h.failing_agent_workflows([phantom, real], ("Agent Change",))] == ["u"]
     assert len(h.failing_agent_workflows([pushed], ("Agent Change",))) == 1
+
+
+def test_a_workflow_that_failed_and_has_passed_since_is_not_failing():
+    """The health check stayed red for a day over three canary runs that failed while the canary was being set up,
+    although every run after them had passed."""
+    failed = {"name": "Pipeline Canary", "workflow_id": 7, "conclusion": "failure", "created_at": "2026-10-08T21:28:09Z",
+              "html_url": "u", "event": "workflow_dispatch"}
+    assert h.failing_agent_workflows([failed], ("Pipeline Canary",), {7: "2026-10-09T09:17:00Z"}) == []
+    assert len(h.failing_agent_workflows([failed], ("Pipeline Canary",), {7: "2026-10-08T20:00:00Z"})) == 1   # success was before
+    assert len(h.failing_agent_workflows([failed], ("Pipeline Canary",), {})) == 1                             # never passed
