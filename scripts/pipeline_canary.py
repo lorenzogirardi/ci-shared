@@ -65,7 +65,7 @@ def settled(verdict: str, checks: list[dict], required: tuple[str, ...] = ()) ->
 
 
 def evaluate(expect: dict, *, verdict: str, checks: list[dict], files: list[str], authors: list[str],
-             content_of, required_checks: tuple[str, ...]) -> list[str]:
+             content_of, required_checks: tuple[str, ...], report: str = "") -> list[str]:
     """Every way the outcome differs from what the scenario expects, in words. Empty = it passed."""
     problems = []
     want = expect.get("verdict", "certified")
@@ -95,6 +95,14 @@ def evaluate(expect: dict, *, verdict: str, checks: list[dict], files: list[str]
     for item in expect.get("contains") or []:
         if item["text"] not in (content_of(item["file"]) or ""):
             problems.append(f"{item['file']} does not contain {item['text']!r}")
+    # How it got there, not only where it ended: the same files can be reached by the wrong road (a verdict
+    # that the code is wrong, followed by a writer that rewrites the test anyway).
+    for text in expect.get("report_contains") or []:
+        if text not in report:
+            problems.append(f"the agents' report does not say {text!r}")
+    for text in expect.get("report_not_contains") or []:
+        if text in report:
+            problems.append(f"the agents' report says {text!r}, and must not")
     for item in expect.get("not_contains") or []:
         if item["text"] in (content_of(item["file"]) or ""):
             problems.append(f"{item['file']} contains {item['text']!r}, and must not")
@@ -164,7 +172,9 @@ def state_of(repo: str, number: int, trusted: set[str]) -> dict:
     head = (pr.get("head") or {}).get("sha", "")
     comments = gh_json([f"repos/{repo}/issues/{number}/comments?per_page=100"]) or []
     checks = (gh_json([f"repos/{repo}/commits/{head}/check-runs?per_page=100"]) or {}).get("check_runs", []) if head else []
-    return {"head": head, "verdict": verdict_of(comments, head, trusted), "checks": checks}
+    report = "\n".join(c.get("body") or "" for c in comments
+                       if "<!-- agent-pr -->" in (c.get("body") or "") and (c.get("user") or {}).get("login") in trusted)
+    return {"head": head, "verdict": verdict_of(comments, head, trusted), "checks": checks, "report": report}
 
 
 def content_at(repo: str, ref: str, path: str) -> str | None:
@@ -221,7 +231,8 @@ def main() -> int:
                 r["expect"], verdict=state["verdict"], checks=state["checks"],
                 files=[f["filename"] for f in compare.get("files", [])],
                 authors=[((c.get("commit") or {}).get("author") or {}).get("name", "") for c in commits],
-                content_of=lambda path, ref=r["branch"]: content_at(args.repo, ref, path), required_checks=required)
+                content_of=lambda path, ref=r["branch"]: content_at(args.repo, ref, path), required_checks=required,
+                report=state.get("report", ""))
     finally:
         for r in results:
             if r.get("pr"):

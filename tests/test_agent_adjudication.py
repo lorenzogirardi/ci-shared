@@ -244,6 +244,35 @@ class TestLoopRouting:
         assert "ADJUDICATION" in writer_prompt and "Tests are the specification" in writer_prompt
         assert pathlib.Path("tests/test_calc.py").read_text() == TEST     # the test was never touched
 
+    CODE_DEFECT = fence({"verdicts": [{"test": "tests/test_calc.py::test_add", "classification": "code_defect",
+                                         "confidence": "high", "intent_evidence": "", "reason": "sum expected"}]})
+    REWRITE_TEST = fence({"explanation": "make the test agree", "changes": [
+        {"file": "tests/test_calc.py", "find": "assert add(1, 2) == 3", "replace": "assert add(1, 2) == 2"}]})
+
+    def test_the_writer_may_not_rewrite_a_test_the_verdict_found_right(self, repo):
+        """Canary run against a deliberately defective engine (flask-test-api PR #220): the verdict was code_defect,
+        the writer changed the expected value in the test instead, the weakening guard saw the same number of
+        assertions, and the pull request ended exactly where a correct engine would have taken it."""
+        self.break_code()
+        caller = FakeCaller({"failure-adjudicator": [self.CODE_DEFECT], "writer": [self.REWRITE_TEST, self.fix_code()],
+                             "test-steward": [NOTESTS], **reviewers_ok()})
+        _, final = run(repo, caller, "feat: change add")
+        assert final["outcome"] == "converged"
+        assert pathlib.Path("tests/test_calc.py").read_text() == TEST          # the specification is untouched
+        assert "a + b" in pathlib.Path("calc.py").read_text()                  # the code is what changed
+        second = [u for r, u in caller.log if r == "writer"][1]
+        assert "REFUSED" in second and "tests/test_calc.py" in second
+        assert any("was refused" in n for n in final["notes"])
+
+    def test_a_writer_that_only_ever_rewrites_the_test_is_not_certified(self, repo):
+        self.break_code()
+        caller = FakeCaller({"failure-adjudicator": [self.CODE_DEFECT], "writer": [self.REWRITE_TEST],
+                             "test-steward": [NOTESTS], **reviewers_ok()})
+        _, final = run(repo, caller, "feat: change add")
+        assert final["outcome"] != "converged"
+        assert pathlib.Path("tests/test_calc.py").read_text() == TEST
+        assert any("those tests are the specification" in n for n in final["notes"])
+
     def test_test_defect_with_a_quote_updates_the_test_and_keeps_the_code(self, repo):
         self.break_code()
         title = "make add multiply its arguments"
