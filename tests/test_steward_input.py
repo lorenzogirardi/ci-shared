@@ -133,3 +133,23 @@ def test_a_passage_deep_in_a_long_document_is_found_and_the_rest_is_left_out():
 def test_excerpts_keep_the_lines_verbatim_so_an_edit_can_be_anchored_on_them():
     doc = "a\nb\n| `/api/sleep/{seconds}` | max 30 seconds |\nc\nd"
     assert "| `/api/sleep/{seconds}` | max 30 seconds |" in lib.excerpts(doc, {"/api/sleep"}, around=1)
+
+
+class TestEvidenceNeedsAPytestThatRan:
+    """flask-test-api PR #197: entered from a failed CI run, the job had no pytest yet. `python -m pytest` then
+    exits 1, which was read as 'the test fails', on the head and on the base commit alike, so a test that passes
+    on the base was declared 'already failing before this change' and that evidence overruled a correct verdict."""
+
+    def fake(self, monkeypatch, returncode, text):
+        monkeypatch.setattr(lib.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, returncode, "", text))
+
+    def test_an_interpreter_without_pytest_is_an_error_not_a_failure(self, monkeypatch):
+        self.fake(monkeypatch, 1, "/usr/bin/python3: No module named pytest")
+        assert lib.run_pytest(["tests/test_x.py::test_y"], ".")[0] == "error"
+
+    def test_a_real_failure_is_still_a_failure(self, monkeypatch):
+        self.fake(monkeypatch, 1, "FAILED tests/test_x.py::test_y - assert 1 == 2\n1 failed in 0.02s")
+        assert lib.run_pytest(["tests/test_x.py::test_y"], ".")[0] == "fail"
+
+    def test_so_the_hint_is_unreproducible_and_never_preexisting(self):
+        assert lib.evidence_hint({"head": ["error", "error"], "base": "error"}) == "unreproducible"

@@ -110,3 +110,36 @@ def test_a_commit_is_not_settled_before_its_required_checks_exist():
     assert not c.settled("certified", only_agent, REQUIRED)
     assert c.settled("certified", only_agent + GREEN, REQUIRED)
     assert c.settled("abandoned", only_agent, REQUIRED)      # an abandonment does not wait for CI
+
+
+def test_the_road_is_checked_too_not_only_where_it_ended():
+    """A defective engine reached the expected files by a verdict of code_defect and a writer that rewrote the test.
+    The scenario passed, because nothing looked at the verdict."""
+    expect = {**INTENT, "report_contains": ["**test_defect**"], "report_not_contains": ["**code_defect**"]}
+    good = "- `tests/test_canary.py::test_the_limit_is_ten`: **test_defect** (high): the stated intent redefines it"
+    bad = "- `tests/test_canary.py::test_the_limit_is_ten`: **code_defect** (high): ... [downgraded: no verbatim quote]"
+    assert judge(expect, report=good) == []
+    problems = judge(expect, report=bad)
+    assert any("does not say '**test_defect**'" in p for p in problems) and any("says '**code_defect**'" in p for p in problems)
+
+
+def test_the_report_is_taken_from_the_engines_comment_and_only_from_a_trusted_account(monkeypatch):
+    """Where the road check gets its words: the comment the engine posted, and only from an account we trust,
+    so a drive-by comment cannot claim a road the run never took."""
+    comments = [
+        {"user": {"login": "drive-by"}, "body": "<!-- agent-pr -->\nI took the right road"},
+        {"user": {"login": "the-bot"}, "body": "<!-- agent-pr -->\nthe road it really took"},
+    ]
+
+    def fake_gh(call, *a, **k):
+        path = " ".join(call) if isinstance(call, (list, tuple)) else str(call)
+        if "comments" in path:
+            return comments
+        if "pulls" in path:
+            return {"number": 7, "head": {"sha": "abc"}}
+        return {"check_runs": []}
+
+    monkeypatch.setattr(c, "gh_json", fake_gh)
+    state = c.state_of("owner/repo", 7, {"the-bot"})
+    assert "the road it really took" in state["report"]
+    assert "I took the right road" not in state["report"]

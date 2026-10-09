@@ -249,6 +249,8 @@ class RunState(TypedDict, total=False):
     own_tests: str           # "tests" or "steward": the change under verification is tests that node has just written
     own_tests_attempts: int
     tests_feedback: str
+    spec_tests: list         # test files the writer may not edit: a verdict said the CODE is wrong there
+    spec_violations: int
 
 
 def is_doc_path(path: str) -> bool:
@@ -422,6 +424,21 @@ def build_graph(rt: Runtime):
         if applied is None:
             reportable = state.get("committed") or state.get("rounds")
             return stop(state, "escalated" if reportable else "failed", f"writer: {text}")
+        rewritten = sorted(set(applied.files) & set(state.get("spec_tests") or []))
+        if rewritten:
+            # The verdict was that the code is wrong and these tests are right. Changing what they assert makes
+            # the failure go away without fixing anything, and the weakening guard does not see it (same number
+            # of tests and assertions, a different expected value). Tests are the specification for the writer too.
+            lib.revert(applied)
+            again = state.get("spec_violations", 0) + 1
+            if again >= 2:
+                return stop(state, "escalated", "the writer changed the failing tests instead of the code, twice ("
+                            + ", ".join(rewritten) + "); those tests are the specification, so the change is not certified")
+            return {"route": "write", "applied": None, "spec_violations": again,
+                    "notes": state.get("notes", []) + ["the writer edited a test the verdict had found right; the change was refused: " + ", ".join(rewritten)],
+                    "feedback": state.get("feedback", "") + "\n\nREFUSED: your change edited " + ", ".join(rewritten)
+                                + ". The verdict is that the CODE is wrong and those tests are right: they are the specification. "
+                                "Change the application code so they pass as they are. New tests go in a new file."}
         return {"route": "verify", "applied": {"edited": applied.edited, "created": applied.created},
                 "explanation": text, "applied_kind": None, "own_tests": ""}
 
@@ -432,6 +449,12 @@ def build_graph(rt: Runtime):
         if not tests:
             return None
         evidence = lib.gather_evidence(tests, rt.base_sha)
+        if rt.verify_command and all(lib.evidence_hint(e) == "unreproducible" for e in evidence.values()):
+            # Entered from a failed CI run, nothing has prepared this job yet: the project's dependencies are
+            # installed by the verify command. Run it once (its own result does not matter here) and look again,
+            # so that a test this job CAN run is judged on evidence instead of on the log alone.
+            lib.run_verify_isolated(rt.verify_command, rt.verify_timeout)
+            evidence = lib.gather_evidence(tests, rt.base_sha)
         intent = intent_text(state["plan"])
         sources = "\n\n".join(
             f"### {path}\n{pathlib.Path(path).read_text(errors='replace')[:4000]}"
@@ -455,6 +478,7 @@ def build_graph(rt: Runtime):
         notes = list(state.get("notes", []))
         history = list(state.get("adjudications", []))
         verdict_text = ""
+        spec_tests: list[str] = []
         result = adjudicate(state, output)
         if result:
             verdicts, _ = result
@@ -467,6 +491,7 @@ def build_graph(rt: Runtime):
                         "verdicts": verdicts, "notes": notes, "adjudications": history}
             if classes == {"environment"} and not over:
                 return {"route": "verify", "verify_attempts": attempts, "notes": notes, "adjudications": history}
+            spec_tests = sorted({v["test"].split("::")[0] for v in verdicts if v["classification"] == "code_defect"})
             verdict_text = ("\n\nADJUDICATION. Tests are the specification, so the code must satisfy them. "
                             "Verdicts:\n" + json.dumps([v for v in verdicts if v["classification"] != "environment"], indent=2))
         elif re.search(r"\b\d+ failed\b", output):
@@ -484,6 +509,7 @@ def build_graph(rt: Runtime):
                     "notes": notes + [f"deterministic checks still failing after {attempts} attempts:\n{output[-1500:]}"],
                     "adjudications": history}
         return {"route": "write", "verify_attempts": attempts, "applied": None, "notes": notes, "adjudications": history,
+                "spec_tests": spec_tests,
                 "feedback": f"FAILED VERIFICATION of {what}. Fix this:\n{output}{verdict_text}"}
 
     def n_verify(state: RunState) -> dict:
@@ -498,7 +524,7 @@ def build_graph(rt: Runtime):
             needs_tests = rt.write_tests and state.get("tests_done") != state["iteration"]
             return {"route": "tests" if needs_tests else "review",
                     "committed": bool(applied) or state.get("committed", False),
-                    "verify_attempts": 0, "applied": None, "applied_kind": None, "own_tests": ""}
+                    "verify_attempts": 0, "applied": None, "applied_kind": None, "own_tests": "", "spec_tests": []}
         if state.get("own_tests") and applied:
             # The steward has just written or rewritten these tests and they fail: they assert something the
             # code does not do. A test written a minute ago by a model is not the specification, and the
@@ -714,7 +740,7 @@ def build_graph(rt: Runtime):
     graph.add_conditional_edges("ci_failure", route, {"write": "write", "steward": "steward", "verify": "verify", "end": END})
     graph.add_conditional_edges("steward", route, {"verify": "verify", "write": "write", "end": END})
     graph.add_conditional_edges("tests", route, {"verify": "verify", "review": "review", "end": END})
-    graph.add_conditional_edges("write", route, {"verify": "verify", "end": END})
+    graph.add_conditional_edges("write", route, {"verify": "verify", "write": "write", "end": END})
     graph.add_conditional_edges("verify", route, {"review": "review", "tests": "tests", "write": "write", "steward": "steward",
                                                   "verify": "verify", "end": END})
     graph.add_conditional_edges("review", route, {"final": "final", "docs": "docs", "write": "write", "end": END})
