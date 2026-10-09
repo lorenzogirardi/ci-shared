@@ -1,0 +1,46 @@
+name: Agent CI Failure
+run-name: "Agent CI Failure · ${{ github.event.workflow_run.display_title || github.ref_name }}"
+
+# When the tests fail on a pull request of this repository, the agents start from the real logs of the
+# failed run. Same concurrency group as agent-change.yml: one agent at a time on a pull request.
+
+on:
+  workflow_run:
+    workflows: ["Test scripts"]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  repair:
+    if: >-
+      vars.AI_ENABLED == 'true' &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.pull_requests[0] != null
+    concurrency:
+      group: agent-change-pr-${{ github.event.workflow_run.pull_requests[0].number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      pull-requests: write
+      actions: write
+    uses: lorenzogirardi/ci-shared/.github/workflows/reusable_agent-change.yml@v2
+    with:
+      mode: ci
+      base_branch: main
+      required_checks: 'test'
+      max_ci_attempts: 3
+      python_version: "3.13"
+      verify_command: |
+        set -euo pipefail
+        pip install -q pytest -r scripts/requirements-autofix.txt
+        pytest tests/ -q
+      openrouter_model: ${{ vars.OPENROUTER_MODEL }}
+      openrouter_endpoint: ${{ vars.OPENROUTER_ENDPOINT }}
+      openrouter_site_url: ${{ vars.OPENROUTER_SITE_URL }}
+      openrouter_app_name: ${{ vars.OPENROUTER_APP_NAME }}
+    secrets:
+      openrouter_api_key: ${{ secrets.OPENROUTER_API_KEY }}
+      agent_push_token: ${{ secrets.AUTOFIX_PUSH_TOKEN }}

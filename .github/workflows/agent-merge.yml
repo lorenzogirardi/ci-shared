@@ -1,0 +1,38 @@
+name: Agent Merge
+run-name: "Agent Merge · ${{ github.event_name }} · ${{ github.event.workflow_run.display_title || github.ref_name }}"
+
+# Merges a pull request of this repository whose head commit is certified and whose tests succeeded on
+# that same commit. After the merge, release-tag.yml moves v2 once the tests pass on main.
+
+on:
+  workflow_run:
+    workflows: ["Test scripts"]
+    types: [completed]
+  push:
+    branches: [main]
+  schedule:
+    - cron: '11,41 * * * *'
+
+permissions: {}
+
+jobs:
+  merge:
+    if: >-
+      vars.AI_ENABLED == 'true' &&
+      (github.event_name != 'workflow_run' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'pull_request' &&
+        github.event.workflow_run.head_repository.full_name == github.repository))
+    concurrency:
+      group: agent-merge
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    uses: lorenzogirardi/ci-shared/.github/workflows/reusable_agent-merge.yml@v2
+    with:
+      pr_number: 0
+      base_branch: main
+      required_checks: 'test'
+      max_reverts: 3
+    secrets:
+      agent_push_token: ${{ secrets.AUTOFIX_PUSH_TOKEN }}
