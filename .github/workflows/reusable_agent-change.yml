@@ -125,7 +125,10 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: lorenzogirardi/ci-shared
-          ref: v2
+          # v2, except for the canary's candidate run: a pull request whose base branch is canary/next-*
+          # is judged by the scripts and prompts about to become v2 (the tag v2-next), so a defect in a
+          # new engine shows on the canary before the tag moves and any real pull request meets it.
+          ref: ${{ (startsWith(github.base_ref, 'canary/next-') || startsWith(github.event.workflow_run.pull_requests[0].base.ref, 'canary/next-')) && 'v2-next' || 'v2' }}
           path: .shared
           persist-credentials: false
 

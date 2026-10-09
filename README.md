@@ -36,9 +36,15 @@ consumers; a breaking change instead gets a new `v2` tag (and its own
 `ref: v2` literal) so existing `@v1` consumers are unaffected until they bump
 on purpose.
 
-`v2` is not moved by hand. `release-tag.yml` moves it to a commit of `main`
-after `Test scripts` has passed on that exact commit, forwards only, so a red
-`main` never reaches a consumer. A consumer whose workflow grants fewer
+`v2` is not moved by hand. `release-tag.yml` moves it to a commit of `main`,
+forwards only, after two things: `Test scripts` has passed on that exact
+commit, and the consumer's canary has passed against it. For the second, the
+commit is published as `v2-next` and the canary of the repository named in the
+variable `ENGINE_GATE_REPO` is started in candidate mode: its pull requests
+target a base branch named `canary/next-*`, and for those the agent workflows
+check out the scripts and prompts at `v2-next`. If a scenario does not hold,
+`v2` stays where it is and the run is red. Unit tests do not see what a model
+does with a real pull request; this does. A consumer whose workflow grants fewer
 permissions than a reusable workflow asks for does not start at all: when a
 change needs a new permission, update the callers first, then merge here.
 
