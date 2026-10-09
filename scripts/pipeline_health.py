@@ -91,7 +91,15 @@ def degraded_certifications(comments: list[dict]) -> list[dict]:
 def failing_agent_workflows(runs: list[dict], names: tuple[str, ...]) -> list[dict]:
     """Runs of the agent workflows themselves that ended in failure: what they own did not happen."""
     return [{"name": r.get("name", ""), "url": r.get("html_url", ""), "created": r.get("created_at", "")}
-            for r in runs if r.get("conclusion") == "failure" and r.get("name") in names]
+            for r in runs if r.get("conclusion") == "failure" and r.get("name") in names and not never_started(r)]
+
+
+def never_started(run_: dict) -> bool:
+    """A pull request opened with the job token (the canary's, the agent's own fix) makes GitHub record a run
+    that fails at once without a single job; the real run is the one started by the push that follows. That
+    phantom is not an agent workflow failing."""
+    return (run_.get("event") == "pull_request"
+            and ((run_.get("triggering_actor") or run_.get("actor") or {}).get("login") == "github-actions[bot]"))
 
 
 def stuck_pull_requests(pulls: list[dict], comments_of, checks_of, now: dt.datetime, minutes: int,

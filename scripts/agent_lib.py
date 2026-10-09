@@ -689,6 +689,80 @@ def test_inventory(max_files: int = 60) -> str:
     return "\n".join(lines) or "(no test files)"
 
 
+_DIFF_FILE = re.compile(r"^\+\+\+ b/(.+)$")
+_URL = re.compile(r"/[A-Za-z0-9_\-{}]+(?:/[A-Za-z0-9_\-{}]+)+")
+_ENV_NAME = re.compile(r"\b[A-Z][A-Z0-9]*_[A-Z0-9_]+\b")
+_DEFINED = re.compile(r"\b(?:def|class)\s+([A-Za-z_]\w{3,})")
+
+
+def diff_terms(diff: str) -> set[str]:
+    """What a diff is about, as strings a document would have to contain to be describing it: URL paths and
+    ENV_STYLE names on the changed lines, the functions and classes it defines (never those of test files:
+    a test's name is in no document), and the path of a file only when the file is added
+    or removed. The path of a file that is merely edited is in every architecture overview and says nothing
+    about what changed in it."""
+    terms: set[str] = set()
+    current, structural = "", False
+    for line in diff.splitlines():
+        if line.startswith("diff --git"):
+            structural = False
+        elif line.startswith(("new file mode", "deleted file mode", "rename from", "rename to")):
+            structural = True
+        elif (m := _DIFF_FILE.match(line)):
+            current = m.group(1)
+            if structural:
+                terms.add(current)
+        elif line[:1] in "+-" and not line.startswith(("+++", "---")):
+            for url in _URL.findall(line):
+                terms.add(url)
+                # /api/sleep/30 and /api/sleep/{seconds} are the same endpoint: also the part before the parameter
+                parts = url.split("/")
+                while len(parts) > 2 and (parts[-1].isdigit() or parts[-1].startswith("{")):
+                    parts.pop()
+                terms.add("/".join(parts))
+            terms.update(_ENV_NAME.findall(line))
+            if not is_test_path(current):
+                terms.update(_DEFINED.findall(line))
+    return {t for t in terms if len(t) >= 4}
+
+
+def excerpts(text: str, terms: set[str], *, around: int = 8, limit: int = 4000) -> str:
+    """The parts of a document that mention any of `terms`, each with a few lines of context, in order. The
+    lines are verbatim, so an edit can be anchored on them; `[...]` marks what was left out."""
+    lines = text.splitlines()
+    keep: set[int] = set()
+    for i, line in enumerate(lines):
+        if any(term in line for term in terms):
+            keep.update(range(max(0, i - around), min(len(lines), i + around + 1)))
+    out, last = [], -1
+    for i in sorted(keep):
+        if i != last + 1:
+            out.append("[...]")
+        out.append(lines[i])
+        last = i
+    if last != len(lines) - 1:
+        out.append("[...]")
+    return "\n".join(out)[:limit]
+
+
+def relevant_docs(diff: str, paths: list[str], *, read=None, total: int = 24_000) -> str:
+    """The documentation a reviewer needs for this diff: from each file that mentions something the diff
+    touches, the passages that mention it. Handing over the head of every document cost 12,000 tokens on a
+    two-line change and still hid the part of a long file that mattered. When nothing mentions the change, the
+    head of the first document is given (a new feature has to be described somewhere) with the list of the others."""
+    read = read or (lambda p: pathlib.Path(p).read_text(errors="replace"))
+    terms = diff_terms(diff)
+    texts = {p: read(p) for p in paths}
+    chosen = [p for p in paths if any(term in texts[p] for term in terms)]
+    if not chosen:
+        if not paths:
+            return "(no documentation files)"
+        return ("No document mentions what this diff changes. Other documents: " + ", ".join(paths[1:40])
+                + f"\n\n### {paths[0]}\n{texts[paths[0]][:6000]}")[:total]
+    return ("Passages that mention what the diff changes; `[...]` marks omitted text. Copy `find` anchors from these "
+            "lines exactly.\n\n" + "\n\n".join(f"### {p}\n{excerpts(texts[p], terms)}" for p in chosen))[:total]
+
+
 def test_conventions(max_chars: int = 3500) -> str:
     """How tests are written here: the shared fixtures and the head of one existing test module. A steward
     that only sees test names writes plausible tests that do not fit the project (sync tests for an async
