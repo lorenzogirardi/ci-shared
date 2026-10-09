@@ -143,3 +143,29 @@ def test_the_report_is_taken_from_the_engines_comment_and_only_from_a_trusted_ac
     state = c.state_of("owner/repo", 7, {"the-bot"})
     assert "the road it really took" in state["report"]
     assert "I took the right road" not in state["report"]
+
+
+class TestPushIsRetried:
+    """A candidate engine was not released because the third scenario's branch was answered with
+    'remote rejected ... (failed)': the canary reported a failure that no agent had anything to do with."""
+
+    def answers(self, monkeypatch, codes):
+        calls = []
+
+        def fake(*args, check=True):
+            calls.append(args)
+            code = codes[min(len(calls), len(codes)) - 1]
+            return c.subprocess.CompletedProcess(args, code, "", "" if code == 0 else " ! [remote rejected] HEAD -> x (failed)")
+
+        monkeypatch.setattr(c, "git", fake)
+        monkeypatch.setattr(c.time, "sleep", lambda s: None)
+        return calls
+
+    def test_a_refused_push_is_tried_again_and_succeeds(self, monkeypatch):
+        calls = self.answers(monkeypatch, [1, 1, 0])
+        assert c.push("HEAD:refs/heads/x", "tok") is True and len(calls) == 3
+
+    def test_it_gives_up_after_a_few_attempts_and_keeps_the_reason(self, monkeypatch):
+        calls = self.answers(monkeypatch, [1])
+        assert c.push("HEAD:refs/heads/x", "tok") is False and len(calls) == c.PUSH_ATTEMPTS
+        assert "remote rejected" in c.LAST_PUSH_ERROR and "tok" not in c.LAST_PUSH_ERROR

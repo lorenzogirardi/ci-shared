@@ -128,13 +128,24 @@ def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
 LAST_PUSH_ERROR = ""
 
 
-def push(refspec: str, token: str, *, delete: bool = False) -> bool:
+PUSH_ATTEMPTS = 4
+
+
+def push(refspec: str, token: str, *, delete: bool = False, pause: float = 5.0) -> bool:
+    """Push, trying again when the remote refuses. Several branches pushed a few seconds apart are now and
+    then answered with "remote rejected ... (failed)", which has nothing to do with the change: it once kept
+    a release from happening because a scenario could not even be opened."""
     global LAST_PUSH_ERROR
     header = base64.b64encode(f"x-access-token:{token}".encode()).decode()
     args = ["-c", f"http.https://github.com/.extraheader=AUTHORIZATION: basic {header}", "push", "--quiet", "origin"]
-    done = git(*args, *(["--delete"] if delete else []), refspec, check=False)
-    LAST_PUSH_ERROR = done.stderr.replace(header, "***").replace(token, "***").strip()[:300]
-    return done.returncode == 0
+    for attempt in range(1, PUSH_ATTEMPTS + 1):
+        done = git(*args, *(["--delete"] if delete else []), refspec, check=False)
+        LAST_PUSH_ERROR = done.stderr.replace(header, "***").replace(token, "***").strip()[:300]
+        if done.returncode == 0:
+            return True
+        if attempt < PUSH_ATTEMPTS:
+            time.sleep(pause * attempt)
+    return False
 
 
 def open_scenario(repo: str, scenario: dict, base_branch: str, base_sha: str, tag: str, token: str) -> dict:
