@@ -43,7 +43,11 @@ commit is published as `v2-next` and the canary of the repository named in the
 variable `ENGINE_GATE_REPO` is started in candidate mode: its pull requests
 target a base branch named `canary/next-*`, and for those the agent workflows
 check out the scripts and prompts at `v2-next`. If a scenario does not hold,
-`v2` stays where it is and the run is red. Unit tests do not see what a model
+`v2` stays where it is and the run is red. Until `ENGINE_GATE_REPO` is set
+(`owner/repo`; `ENGINE_GATE_WORKFLOW` names the canary workflow, default
+`pipeline-canary.yml`) that second step is skipped and the tag moves after the
+tests alone; a manual run of `release-tag.yml` with the `consumer` input checks
+that the gate can reach a given repository. Unit tests do not see what a model
 does with a real pull request; this does. A consumer whose workflow grants fewer
 permissions than a reusable workflow asks for does not start at all: when a
 change needs a new permission, update the callers first, then merge here.
