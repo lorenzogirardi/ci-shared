@@ -174,7 +174,7 @@ the NEW dependency version is installed and its source can be read. The push
 token is taken out of `.git/config` while the PR's code runs and put back only
 for the push. There used to be a separate `autofix_core.py` graph and a
 `reusable_main-autofix.yml` for a red base branch; both are gone: a red base
-branch is handled by `reusable_agent-main-guard.yml` (revert, then redo).
+branch is handled by `reusable_agent-main-guard.yml` (re-run once, then revert).
 
 ### `reusable_ci-analysis.yml`
 
@@ -244,10 +244,11 @@ jobs:
       openrouter_api_key: ${{ secrets.OPENROUTER_API_KEY }}
 ```
 
-See `flask-test-api/.github/workflows/ai-review.yml`, `ai-review-sweep.yml`,
-and `pipeline.yml`'s `ai-analysis` job for the real wrappers.
-`release-notes.yml` and `issue-triage.yml` don't fit either reusable shape —
-they check this repo out at `.shared` and call
+See `flask-test-api/.github/workflows/` for the real wrappers: `agent-change.yml`,
+`agent-ci-failure.yml`, `agent-merge.yml`, `agent-main-guard.yml`,
+`ai-review-sweep.yml`, `pipeline-health.yml`, `pipeline-canary.yml` and
+`pipeline.yml`'s `ai-analysis` job. Its `release-notes.yml` does not fit a
+reusable shape: it checks this repo out at `.shared` and calls
 `.shared/scripts/openrouter_ai.py` directly.
 
 ## Why the dependency-bot path evolved the way it did
