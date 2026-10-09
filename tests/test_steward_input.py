@@ -75,3 +75,61 @@ def test_failed_tests_are_found_with_job_and_step_prefixes():
 def test_plain_output_still_parses():
     assert lib.parse_failed_tests("FAILED tests/test_a.py::test_x - boom\nERROR tests/test_b.py::test_y\n") == [
         "tests/test_a.py::test_x", "tests/test_b.py::test_y"]
+
+
+DIFF = '''diff --git a/app/routers/api.py b/app/routers/api.py
+--- a/app/routers/api.py
++++ b/app/routers/api.py
+@@ -90,4 +90,4 @@ async def sleep_endpoint(seconds: int):
+-    if seconds > 30:
++    if seconds > 25:
++        limit = os.environ.get("SLEEP_MAX_SECONDS")
++@router.get("/api/sleep/{seconds}")
+'''
+DOCS = {"README.md": "# App\nGET /api/sleep/{seconds} delays the response.\n", "docs/01-intro.md": "History of the project.\n",
+        "docs/02-config.md": "Set SLEEP_MAX_SECONDS to change the limit.\n", "docs/03-other.md": "Unrelated.\n"}
+
+
+def test_the_terms_of_a_diff_are_what_a_document_would_have_to_mention():
+    terms = lib.diff_terms(DIFF)
+    assert {"/api/sleep/{seconds}", "/api/sleep", "SLEEP_MAX_SECONDS"} <= terms
+    assert "sleep_endpoint" not in terms      # the hunk header names a nearby function, often the wrong one
+    # the path of a file that is only edited is in every architecture overview: it is not a term
+    assert "app/routers/api.py" not in terms
+
+
+def test_a_test_file_gives_urls_but_not_its_test_names_and_a_new_file_gives_its_path():
+    diff = ("diff --git a/tests/test_api.py b/tests/test_api.py\n--- a/tests/test_api.py\n+++ b/tests/test_api.py\n"
+            "@@ -1 +1 @@ async def test_sleep_too_long(client):\n-    resp = await client.get(\"/api/sleep/31\")\n"
+            "+async def test_sleep_up_to_25_seconds_allowed(client):\n"
+            "diff --git a/app/canary.py b/app/canary.py\nnew file mode 100644\n--- /dev/null\n+++ b/app/canary.py\n"
+            "@@ -0,0 +1 @@\n+def within_limit(value):\n")
+    terms = lib.diff_terms(diff)
+    assert {"/api/sleep/31", "/api/sleep", "app/canary.py", "within_limit"} <= terms
+    assert not any(t.startswith("test_") for t in terms) and "tests/test_api.py" not in terms
+
+
+def test_only_the_documents_that_mention_the_change_are_handed_over():
+    text = lib.relevant_docs(DIFF, list(DOCS), read=DOCS.get)
+    assert "### README.md" in text and "### docs/02-config.md" in text
+    assert "docs/01-intro.md" not in text and "docs/03-other.md" not in text
+
+
+def test_when_nothing_mentions_the_change_the_first_document_and_the_list_of_the_others_are_given():
+    diff = "+++ b/app/new_thing.py\n+def brand_new_feature():\n"
+    text = lib.relevant_docs(diff, list(DOCS), read=DOCS.get)
+    assert text.startswith("No document mentions") and "### README.md" in text and "docs/02-config.md" in text
+    assert "History of the project" not in text
+
+
+def test_a_passage_deep_in_a_long_document_is_found_and_the_rest_is_left_out():
+    filler = "\n".join(f"line {i} about something else" for i in range(400))
+    long = {"README.md": filler + "\nGET /api/sleep/{seconds} delays the response.\n" + filler}
+    text = lib.relevant_docs(DIFF, ["README.md"], read=long.get)
+    assert "GET /api/sleep/{seconds} delays the response." in text and "[...]" in text
+    assert "line 200 about" not in text and len(text) < 1500
+
+
+def test_excerpts_keep_the_lines_verbatim_so_an_edit_can_be_anchored_on_them():
+    doc = "a\nb\n| `/api/sleep/{seconds}` | max 30 seconds |\nc\nd"
+    assert "| `/api/sleep/{seconds}` | max 30 seconds |" in lib.excerpts(doc, {"/api/sleep"}, around=1)

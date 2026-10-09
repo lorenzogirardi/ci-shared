@@ -128,3 +128,14 @@ class TestStuckPullRequests:
         assert self.find([self.pr(draft=True)]) == []
         assert self.find([self.pr(user={"login": "renovate[bot]"})]) == []
         assert self.find([self.pr(head={"sha": self.SHA, "repo": {"full_name": "someone/fork"}})]) == []
+
+
+def test_a_run_that_never_started_because_the_job_token_opened_the_pull_request_is_not_a_failure():
+    """Every canary pull request left one of these, and the health check counted five in one evening."""
+    phantom = {"name": "Agent Change", "conclusion": "failure", "event": "pull_request",
+               "triggering_actor": {"login": "github-actions[bot]"}}
+    real = {"name": "Agent Change", "conclusion": "failure", "event": "pull_request", "triggering_actor": {"login": "someone"},
+            "html_url": "u", "created_at": "t"}
+    pushed = {"name": "Agent Change", "conclusion": "failure", "event": "push", "triggering_actor": {"login": "github-actions[bot]"}}
+    assert [f["url"] for f in h.failing_agent_workflows([phantom, real], ("Agent Change",))] == ["u"]
+    assert len(h.failing_agent_workflows([pushed], ("Agent Change",))) == 1

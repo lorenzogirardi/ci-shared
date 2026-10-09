@@ -665,12 +665,12 @@ def build_graph(rt: Runtime):
 
     def n_docs(state: RunState) -> dict:
         notes = list(state.get("notes", []))
-        docs = "\n\n".join(
-            f"### {p}\n{pathlib.Path(p).read_text(errors='replace')[:5000]}"
-            for p in lib.repo_tree(2000).split("\n") if p and is_doc_path(p) and pathlib.Path(p).is_file()
-        )[:40_000]
-        user = (f"## Plan\n{json.dumps(state['plan'], indent=2)}\n\n## Diff\n{diff_since_base(rt.base_sha)}\n\n"
-                f"## Documentation files\n{docs}")
+        diff = diff_since_base(rt.base_sha)
+        doc_paths = [p for p in lib.repo_tree(2000).split("\n") if p and is_doc_path(p) and pathlib.Path(p).is_file()]
+        # README first: when nothing mentions the change it is the document handed over.
+        doc_paths.sort(key=lambda p: (not p.lower().startswith("readme"), p))
+        user = (f"## Plan\n{json.dumps(state['plan'], indent=2)}\n\n## Diff\n{diff}\n\n"
+                f"## Documentation files\n{lib.relevant_docs(diff, doc_paths)}")
 
         def validate(data: dict):
             return lib.parse_changes(data, allowed=is_doc_path)
