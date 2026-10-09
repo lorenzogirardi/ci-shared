@@ -1,0 +1,51 @@
+name: Release tag
+
+# The consumers of this repository call its workflows at the tag `v2`, and those workflows check the
+# scripts out at the same tag. Until now the tag was moved by hand after every merge, which made every
+# change to the engine wait for a person. It now follows main by itself, and only after the tests of
+# that exact commit have passed: a red main never reaches a consumer.
+# A change that breaks callers still becomes a new tag (v3) by hand; that is a decision, not a routine.
+
+on:
+  workflow_run:
+    workflows: ["Test scripts"]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: release-tag
+  cancel-in-progress: false
+
+jobs:
+  move:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Move v2 to the tested commit, unless main has moved on to an untested one
+        env:
+          TESTED: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          # Only ever forwards: the tested commit must be on main and must contain the current tag.
+          git fetch --quiet --tags --force origin
+          if ! git merge-base --is-ancestor "$TESTED" origin/main; then
+            echo "::notice::$TESTED is not on main any more; nothing to do"; exit 0
+          fi
+          current="$(git rev-parse -q --verify refs/tags/v2 || true)"
+          if [ -n "$current" ] && ! git merge-base --is-ancestor "$current" "$TESTED"; then
+            echo "::notice::v2 ($current) is already ahead of $TESTED; nothing to do"; exit 0
+          fi
+          if [ "$current" = "$TESTED" ]; then echo "v2 is already at $TESTED"; exit 0; fi
+          git push --force origin "$TESTED:refs/tags/v2"
+          echo "### v2 moved to \`${TESTED:0:7}\`" >> "$GITHUB_STEP_SUMMARY"
