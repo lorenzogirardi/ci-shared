@@ -85,7 +85,7 @@ jobs:
         # ref) or pull_request_target (default checks out the BASE branch,
         # not the PR at all - checking out the head SHA is the only ref that
         # is correct for both).
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
@@ -96,7 +96,7 @@ jobs:
         # is no context that reflects that. Pin literally instead: this line is
         # part of the v1 tag's own content, so bumping the tag and bumping this
         # ref happen in the same commit by construction.
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: lorenzogirardi/ci-shared
           ref: v2

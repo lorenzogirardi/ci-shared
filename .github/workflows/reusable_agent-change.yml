@@ -115,21 +115,21 @@ jobs:
       actions: write      # re-run a CI job that failed in the runner, not in the code (mode ci)
     steps:
       - name: Checkout the change (no credentials kept)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.mode == 'pr' && github.event.pull_request.head.sha || inputs.mode == 'ci' && github.event.workflow_run.head_sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Checkout shared scripts
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: lorenzogirardi/ci-shared
           ref: v2
           path: .shared
           persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ inputs.python_version }}
 
@@ -263,7 +263,7 @@ jobs:
 
       - name: Upload the run record (prompts, replies, findings, costs)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: agent-change-${{ inputs.mode }}-${{ github.run_id }}
           path: |

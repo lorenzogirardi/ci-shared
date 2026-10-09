@@ -39,18 +39,18 @@ jobs:
       actions: write      # re-run the failed jobs once, to rule out a flake, before reverting
     steps:
       - name: Checkout the base branch (full history, no credentials kept)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.base_branch }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: lorenzogirardi/ci-shared
           ref: v2
           path: .shared
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - run: pip install -q -r .shared/scripts/requirements-autofix.txt

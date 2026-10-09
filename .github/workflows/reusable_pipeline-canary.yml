@@ -34,17 +34,17 @@ jobs:
       contents: read
       pull-requests: write   # open and close the canary pull requests (the push token only pushes)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: lorenzogirardi/ci-shared
           ref: v2
           path: .shared
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Open the scenarios, wait for the verdicts, check them, clean up
