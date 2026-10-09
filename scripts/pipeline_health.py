@@ -88,10 +88,21 @@ def degraded_certifications(comments: list[dict]) -> list[dict]:
     return found
 
 
-def failing_agent_workflows(runs: list[dict], names: tuple[str, ...]) -> list[dict]:
-    """Runs of the agent workflows themselves that ended in failure: what they own did not happen."""
-    return [{"name": r.get("name", ""), "url": r.get("html_url", ""), "created": r.get("created_at", "")}
-            for r in runs if r.get("conclusion") == "failure" and r.get("name") in names and not never_started(r)]
+def failing_agent_workflows(runs: list[dict], names: tuple[str, ...], last_success: dict | None = None) -> list[dict]:
+    """Agent workflows that are failing NOW: a failed run with no successful run of the same workflow after
+    it. A workflow that failed yesterday and has passed since is working; reporting it for two more days
+    only teaches the reader to ignore a red health check. `last_success` maps a workflow id to the creation
+    time of its latest successful run."""
+    last_success = last_success or {}
+    failing = []
+    for r in runs:
+        if r.get("conclusion") != "failure" or r.get("name") not in names or never_started(r):
+            continue
+        recovered = last_success.get(r.get("workflow_id"))
+        if recovered and recovered > (r.get("created_at") or ""):
+            continue
+        failing.append({"name": r.get("name", ""), "url": r.get("html_url", ""), "created": r.get("created_at", "")})
+    return failing
 
 
 def never_started(run_: dict) -> bool:
@@ -187,8 +198,15 @@ def main() -> int:
     names = tuple(n.strip() for n in args.agent_workflows.split(",") if n.strip())
 
     unbuilt = unbuilt_commits(commits, builds, now, args.grace_minutes)
-    degraded = degraded_certifications(comments)
-    failing = failing_agent_workflows(recent, names)
+    # Reported for a day: it cannot be repaired after the fact, only noticed.
+    day = (now - dt.timedelta(hours=min(args.hours, 24))).strftime("%Y-%m-%dT%H:%M:%SZ")
+    degraded = degraded_certifications([c for c in comments if (c.get("updated_at") or c.get("created_at") or day) >= day])
+    last_success = {}
+    for workflow_id in {r.get("workflow_id") for r in recent if r.get("conclusion") == "failure" and r.get("name") in names}:
+        latest = (gh_json([f"repos/{args.repo}/actions/workflows/{workflow_id}/runs?status=success&per_page=1"]) or {}).get("workflow_runs", [])
+        if latest:
+            last_success[workflow_id] = latest[0].get("created_at", "")
+    failing = failing_agent_workflows(recent, names, last_success)
 
     pulls = gh_json([f"repos/{args.repo}/pulls?state=open&base={args.branch}&per_page=100"]) or []
     stuck = stuck_pull_requests(
