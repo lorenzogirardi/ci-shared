@@ -1,9 +1,15 @@
 name: Release tag
 
 # The consumers of this repository call its workflows at the tag `v2`, and those workflows check the
-# scripts out at the same tag. Until now the tag was moved by hand after every merge, which made every
-# change to the engine wait for a person. It now follows main by itself, and only after the tests of
-# that exact commit have passed: a red main never reaches a consumer.
+# scripts out at the same tag. The tag follows main by itself, in two steps:
+#   1. the tests of that exact commit have passed (this workflow starts from that);
+#   2. the canary of the consumer repository has passed AGAINST THAT COMMIT. The commit is published as
+#      `v2-next`, the consumer's canary is started in candidate mode (its pull requests are then judged by
+#      the scripts and prompts at v2-next), and only if every scenario holds does `v2` move.
+# Step 2 exists because unit tests do not see what a model does with a real pull request: an engine that
+# passed every test once rewrote application code to satisfy a test it had just written.
+# Step 2 is on when the repository variable ENGINE_GATE_REPO names the consumer (owner/repo); without it
+# the tag moves after step 1 alone.
 # A change that breaks callers still becomes a new tag (v3) by hand; that is a decision, not a routine.
 
 on:
@@ -11,6 +17,12 @@ on:
     workflows: ["Test scripts"]
     types: [completed]
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      consumer:
+        description: 'owner/repo to probe: checks that the gate can start something there (sends an event nothing listens to)'
+        type: string
+        required: true
 
 permissions: {}
 
@@ -19,12 +31,28 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  probe:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Can the gate start something in the consumer repository?
+        env:
+          GH_TOKEN: ${{ secrets.AUTOFIX_PUSH_TOKEN }}
+          CONSUMER: ${{ inputs.consumer }}
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/$CONSUMER/dispatches" -f event_type=engine-probe
+          gh api "repos/$CONSUMER/actions/workflows" --jq '.total_count' > /dev/null
+          echo "### The gate can reach $CONSUMER" >> "$GITHUB_STEP_SUMMARY"
+
   move:
     if: >-
+      github.event_name == 'workflow_run' &&
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.head_branch == 'main'
     runs-on: ubuntu-latest
+    timeout-minutes: 75
     permissions:
       contents: write
     steps:
@@ -32,7 +60,8 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
-      - name: Move v2 to the tested commit, unless main has moved on to an untested one
+      - name: Is there anything to release?
+        id: plan
         env:
           TESTED: ${{ github.event.workflow_run.head_sha }}
         run: |
@@ -47,5 +76,55 @@ jobs:
             echo "::notice::v2 ($current) is already ahead of $TESTED; nothing to do"; exit 0
           fi
           if [ "$current" = "$TESTED" ]; then echo "v2 is already at $TESTED"; exit 0; fi
+          echo "release=true" >> "$GITHUB_OUTPUT"
+
+      - name: The consumer's canary, against this commit
+        if: steps.plan.outputs.release == 'true' && vars.ENGINE_GATE_REPO != ''
+        env:
+          TESTED: ${{ github.event.workflow_run.head_sha }}
+          CONSUMER: ${{ vars.ENGINE_GATE_REPO }}
+          CANARY_WORKFLOW: ${{ vars.ENGINE_GATE_WORKFLOW || 'pipeline-canary.yml' }}
+          # The same token starts the canary and reads its result: the job's own token is scoped to this
+          # repository and cannot see the consumer's runs.
+          GH_TOKEN: ${{ secrets.AUTOFIX_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          git push --force origin "$TESTED:refs/tags/v2-next"
+          gh api -X POST "repos/$CONSUMER/dispatches" -f event_type=engine-candidate -f "client_payload[sha]=$TESTED"
+          echo "candidate $TESTED published as v2-next; waiting for the canary of $CONSUMER"
+          errors=0
+          for i in $(seq 1 120); do
+            sleep 30
+            if ! line="$(gh api "repos/$CONSUMER/actions/workflows/$CANARY_WORKFLOW/runs?event=repository_dispatch&per_page=20" \
+              --jq "[.workflow_runs[] | select(.display_title | contains(\"$TESTED\"))][0] | \"\(.status) \(.conclusion) \(.html_url)\"" 2>&1)"; then
+              # A permission problem must not look like a canary that is slow: say what the API said.
+              errors=$((errors + 1))
+              echo "::warning::could not read the canary runs of $CONSUMER ($errors): $line"
+              if [ "$errors" -ge 4 ]; then echo "::error::cannot read the canary result: $line"; exit 1; fi
+              continue
+            fi
+            errors=0
+            set -- $line
+            status="${1:-}"; conclusion="${2:-}"; url="${3:-}"
+            if [ "$status" = "completed" ]; then
+              echo "canary: $conclusion $url"
+              if [ "$conclusion" = "success" ]; then
+                echo "### Canary passed against \`${TESTED:0:7}\` ($url)" >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              echo "### Canary FAILED against \`${TESTED:0:7}\`: v2 stays where it is ($url)" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::the canary did not pass against $TESTED; v2 is not moved"
+              exit 1
+            fi
+          done
+          echo "::error::no canary result for $TESTED after 60 minutes; v2 is not moved"
+          exit 1
+
+      - name: Move v2
+        if: steps.plan.outputs.release == 'true'
+        env:
+          TESTED: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
           git push --force origin "$TESTED:refs/tags/v2"
           echo "### v2 moved to \`${TESTED:0:7}\`" >> "$GITHUB_STEP_SUMMARY"

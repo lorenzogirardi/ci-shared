@@ -19,6 +19,11 @@ on:
         required: false
         type: string
         default: ''
+      candidate:
+        description: 'Run the scenarios against the engine about to be released (tag v2-next) instead of v2. The pull requests are then opened against a base branch named canary/next-*, which is what makes the agent workflows pick the candidate.'
+        required: false
+        type: boolean
+        default: false
     secrets:
       agent_push_token:
         description: 'The same token the agents push with: pull requests opened with the job token start no workflow.'
@@ -57,4 +62,4 @@ jobs:
           echo ".shared/" >> .git/info/exclude
           python3 .shared/scripts/pipeline_canary.py \
             --repo "${{ github.repository }}" --config "${{ inputs.config }}" \
-            --tag "${{ github.run_id }}" --only "$ONLY"
+            --tag "${{ inputs.candidate && 'next-' || '' }}${{ github.run_id }}" --only "$ONLY"
