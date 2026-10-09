@@ -432,6 +432,12 @@ def build_graph(rt: Runtime):
         if not tests:
             return None
         evidence = lib.gather_evidence(tests, rt.base_sha)
+        if rt.verify_command and all(lib.evidence_hint(e) == "unreproducible" for e in evidence.values()):
+            # Entered from a failed CI run, nothing has prepared this job yet: the project's dependencies are
+            # installed by the verify command. Run it once (its own result does not matter here) and look again,
+            # so that a test this job CAN run is judged on evidence instead of on the log alone.
+            lib.run_verify_isolated(rt.verify_command, rt.verify_timeout)
+            evidence = lib.gather_evidence(tests, rt.base_sha)
         intent = intent_text(state["plan"])
         sources = "\n\n".join(
             f"### {path}\n{pathlib.Path(path).read_text(errors='replace')[:4000]}"

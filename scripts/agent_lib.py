@@ -602,7 +602,16 @@ def run_pytest(args: list[str], cwd: str | pathlib.Path, timeout: int = 300) -> 
     out = (proc.stdout + "\n" + proc.stderr).strip()
     if proc.returncode == 0:
         return ("skipped" if "skipped" in out and "passed" not in out else "pass"), out[-1500:]
+    if proc.returncode == 1 and not _PYTEST_RAN.search(out):
+        # Exit code 1 is also what `python -m pytest` returns when pytest is not installed, or when the
+        # interpreter cannot start it. That is an environment that cannot run the test, not a test that
+        # failed: read as a failure it made every test "already failing on the base commit".
+        return "error", out[-1500:]
     return {1: "fail", 5: "absent"}.get(proc.returncode, "error"), out[-1500:]
+
+
+# A pytest that really ran a test says how many failed or errored.
+_PYTEST_RAN = re.compile(r"\b\d+ (?:failed|error|errors)\b")
 
 
 def evidence_hint(evidence: dict) -> str:
