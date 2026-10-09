@@ -1,0 +1,45 @@
+name: Agent Change
+
+# This repository under its own pipeline: every pull request here is reviewed, repaired and certified by
+# the agents it defines. They run at the published tag (v2), never at the pull request's own code, so a
+# change that breaks a reviewer is still judged by the reviewer that works.
+# Workflow files are outside the agents' reach, here as everywhere: a pull request that touches
+# .github/workflows/ is reviewed but merged by a person.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions: {}
+
+jobs:
+  pull-request:
+    if: >-
+      vars.AI_ENABLED == 'true' &&
+      github.event.pull_request.head.repo.fork == false &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.user.login != 'renovate[bot]'
+    concurrency:
+      group: agent-change-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      pull-requests: write
+      actions: write
+    uses: lorenzogirardi/ci-shared/.github/workflows/reusable_agent-change.yml@v2
+    with:
+      mode: pr
+      base_branch: main
+      required_checks: 'test'
+      python_version: "3.13"
+      verify_command: |
+        set -euo pipefail
+        pip install -q pytest -r scripts/requirements-autofix.txt
+        pytest tests/ -q
+      openrouter_model: ${{ vars.OPENROUTER_MODEL }}
+      openrouter_endpoint: ${{ vars.OPENROUTER_ENDPOINT }}
+      openrouter_site_url: ${{ vars.OPENROUTER_SITE_URL }}
+      openrouter_app_name: ${{ vars.OPENROUTER_APP_NAME }}
+    secrets:
+      openrouter_api_key: ${{ secrets.OPENROUTER_API_KEY }}
+      agent_push_token: ${{ secrets.AUTOFIX_PUSH_TOKEN }}
