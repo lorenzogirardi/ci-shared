@@ -181,7 +181,7 @@ jobs:
       UPDATE_TOKEN: ${{ secrets.autofix_push_token }}
     steps:
       - name: Checkout caller repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           # Falls back to GITHUB_TOKEN when the secret isn't set -- same
@@ -190,7 +190,7 @@ jobs:
           token: ${{ secrets.autofix_push_token || github.token }}
 
       - name: Checkout shared prompts and scripts
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: lorenzogirardi/ci-shared
           ref: v2
@@ -207,7 +207,7 @@ jobs:
       - name: Set up Python for verify_command
         # Matches the interpreter pr-checks.yml verifies against — see the
         # python_version input description for why that match matters.
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ inputs.python_version }}
 
