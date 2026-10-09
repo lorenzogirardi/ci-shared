@@ -229,3 +229,41 @@ def test_openrouter_slug_of_the_configured_model_is_priced():
     import openrouter_ai
 
     assert openrouter_ai._model_price("deepseek/deepseek-v4.1-flash") == (0.30, 1.20)
+
+
+def test_the_thinking_gets_its_own_allowance_and_the_answer_keeps_its_budget(mock_server):
+    """One review spent 51,854 output tokens on a 700-token answer: the model's reasoning had no limit of its own."""
+    result = run_script("--endpoint", mock_server, "--max-tokens", "1000", env={"STDIN": "hi"})
+    assert result.returncode == 0
+    body = MockHandler.requests[-1]["body"]
+    assert body["reasoning"] == {"max_tokens": 6000}
+    assert body["max_tokens"] == 7000
+
+
+def test_the_allowance_can_be_set_or_switched_off(mock_server):
+    run_script("--endpoint", mock_server, "--max-tokens", "1000", env={"STDIN": "hi", "OPENROUTER_REASONING_TOKENS": "1500"})
+    assert MockHandler.requests[-1]["body"]["reasoning"] == {"max_tokens": 1500}
+    run_script("--endpoint", mock_server, "--max-tokens", "1000", "--reasoning-tokens", "0", env={"STDIN": "hi"})
+    body = MockHandler.requests[-1]["body"]
+    assert "reasoning" not in body and body["max_tokens"] == 1000
+
+
+def test_empty_attempts_are_counted_in_the_cost_and_the_retry_budget_is_capped(mock_server, tmp_path):
+    """The attempts that came back with thinking and no answer were paid for and never reported; and each
+    retry doubled the budget, up to 65,536 tokens."""
+    MockHandler.response_body = (b'{"choices":[{"message":{"content":"","reasoning_content":"thinking..."}}],'
+                                 b'"usage":{"prompt_tokens":10,"completion_tokens":100,"total_tokens":110}}')
+    usage_file = tmp_path / "usage.json"
+    result = run_script("--endpoint", mock_server, "--max-tokens", "1000", "--reasoning-tokens", "0",
+                        "--usage-file", str(usage_file), env={"STDIN": "hi"})
+    assert result.returncode == 0                       # falls back to the reasoning text, as before
+    budgets = [r["body"]["max_tokens"] for r in MockHandler.requests]
+    assert budgets == [1000, 2000, 4000, 4000]          # doubled, then capped at four times the first
+    usage = json.loads(usage_file.read_text())
+    assert usage["completion_tokens"] == 400 and usage["prompt_tokens"] == 40    # four attempts, all counted
+
+
+def test_usage_adds_up_every_attempt(mock_server, tmp_path):
+    usage_file = tmp_path / "usage.json"
+    result = run_script("--endpoint", mock_server, "--usage-file", str(usage_file), env={"STDIN": "hi"})
+    assert result.returncode == 0 and json.loads(usage_file.read_text())["completion_tokens"] == 2

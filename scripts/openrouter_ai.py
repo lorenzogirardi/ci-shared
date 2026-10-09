@@ -45,6 +45,12 @@ DEFAULT_MODEL = "deepseek-v4-flash-free"
 DEFAULT_MAX_CHARS = 120_000
 DEFAULT_TIMEOUT = 120
 DEFAULT_MAX_TOKENS = 8192
+# How much a reasoning model may think before it answers. Without a limit of its own the thinking is taken
+# out of max_tokens: one review once spent 51,854 output tokens on a 700-token answer, after three earlier
+# attempts had used their whole budget thinking and returned nothing. 0 sends no limit (the old behaviour).
+DEFAULT_REASONING_TOKENS = 6000
+# An empty reply is retried with a larger answer budget, but never past this multiple of the first one.
+MAX_RETRY_BUDGET_FACTOR = 4
 # Output-token ceiling (deepseek-v4-flash-free advertises 128k max output). Retries
 # double the budget but must never exceed the model's real cap, or the provider
 # rejects the request.
@@ -201,6 +207,7 @@ def _request(
     max_tokens: int,
     temperature: float | None,
     timeout: int,
+    reasoning_tokens: int = 0,
 ) -> tuple[str, str, dict]:
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -225,6 +232,11 @@ def _request(
         "messages": messages,
         "max_tokens": max_tokens,
     }
+    if reasoning_tokens > 0:
+        # The thinking gets its own allowance and the answer keeps all of max_tokens: the two used to share
+        # one number, so a long chain of thought left nothing for the reply.
+        payload["reasoning"] = {"max_tokens": reasoning_tokens}
+        payload["max_tokens"] = max_tokens + reasoning_tokens
     if temperature is not None:
         payload["temperature"] = temperature
 
@@ -281,6 +293,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--endpoint", help="API endpoint (env OPENROUTER_ENDPOINT overrides)")
     parser.add_argument("--max-chars", type=int, default=DEFAULT_MAX_CHARS, help="Max prompt chars")
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS, help="Max output tokens")
+    parser.add_argument("--reasoning-tokens", type=int, default=None,
+                        help="Tokens a reasoning model may spend thinking, on top of --max-tokens "
+                             f"(env OPENROUTER_REASONING_TOKENS; default {DEFAULT_REASONING_TOKENS}; 0 = no limit sent)")
     parser.add_argument("--temperature", type=float, default=None, help="Sampling temperature")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="Request timeout (s)")
     parser.add_argument("--usage-file", help="Write token usage + estimated cost (JSON) to this file")
@@ -322,6 +337,17 @@ def main(argv: list[str] | None = None) -> int:
     system = _truncate(system, args.max_chars)
 
     timeout = args.timeout
+    reasoning_tokens = args.reasoning_tokens
+    if reasoning_tokens is None:
+        raw = _read_env_secret("OPENROUTER_REASONING_TOKENS")
+        reasoning_tokens = int(raw) if raw and raw.strip().isdigit() else DEFAULT_REASONING_TOKENS
+    spent = {"prompt_tokens": 0, "completion_tokens": 0}
+
+    def count(one: dict) -> None:
+        # Every attempt is paid for, the empty ones too: reporting only the last one hid most of the cost.
+        spent["prompt_tokens"] += int((one or {}).get("prompt_tokens") or 0)
+        spent["completion_tokens"] += int((one or {}).get("completion_tokens") or 0)
+
     try:
         content, reasoning, usage = _request(
             api_key=api_key,
@@ -332,10 +358,12 @@ def main(argv: list[str] | None = None) -> int:
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             timeout=timeout,
+            reasoning_tokens=reasoning_tokens,
         )
     except OpenRouterError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    count(usage)
 
     # Hard guarantee: if the first attempt came back with a blank `content`
     # (reasoning models can blow the whole token budget on chain-of-thought),
@@ -343,7 +371,7 @@ def main(argv: list[str] | None = None) -> int:
     # falling back to the raw reasoning text. Only if BOTH stay empty we fail.
     if not content.strip():
         for attempt in range(1, args.retries + 1):
-            budget = min(args.max_tokens * (2 ** attempt), MODEL_MAX_OUTPUT_TOKENS)
+            budget = min(args.max_tokens * (2 ** attempt), args.max_tokens * MAX_RETRY_BUDGET_FACTOR, MODEL_MAX_OUTPUT_TOKENS)
             print(
                 f"warning: empty reply, retrying (attempt {attempt}/{args.retries}) with "
                 f"max_tokens={budget}",
@@ -364,10 +392,12 @@ def main(argv: list[str] | None = None) -> int:
                     max_tokens=budget,
                     temperature=args.temperature,
                     timeout=timeout,
+                    reasoning_tokens=reasoning_tokens,
                 )
             except OpenRouterError as exc2:
                 print(f"error: {exc2}", file=sys.stderr)
                 return 1
+            count(usage)
             if content.strip():
                 break
 
@@ -384,7 +414,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.usage_file:
         try:
-            _, usage_detail = _estimate_cost(model, usage)
+            _, usage_detail = _estimate_cost(model, spent)
             usage_detail["model"] = model
             with open(args.usage_file, "w", encoding="utf-8") as fh:
                 json.dump(usage_detail, fh, indent=2)
