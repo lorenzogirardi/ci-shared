@@ -78,12 +78,8 @@ flowchart TD
     C -->|code is wrong| W
     C -->|test is wrong| ST
     C -->|environment| V
-    R -->|blocking findings, first time| W
-    R -->|findings left after the one fix| D
-    R -->|clean, nothing changed| D[docs]
-    R -->|clean, agent changed code| F[final]
-    F -->|blocking findings, first time| W
-    F -->|clean| D
+    R -->|the second developer found a defect, first time| W
+    R -->|nothing to send back, or the fix has been reread| D[docs]
     D --> E([END])
 ```
 
@@ -95,19 +91,21 @@ flowchart TD
 | `steward` | The test steward updates tests a verdict found wrong | Tests only |
 | `tests` | The test steward checks that changed code is covered | Tests only |
 | `review` | Four independent roles in parallel, validated and deduplicated: developer (`reviewer-correctness`), security, SRE and architect. Security and SRE are also shown what the pipeline's tools reported for the commit (artifacts named `ai-context-*`, downloaded once, after a bounded wait for the commit's other runs) and report it as awareness: a note in the comment, never a finding. The architect is shown the project's context files | Nothing |
-| `final` | Checks the earlier findings are fixed, looks for regressions | Nothing |
 | `docs` | Documentation reviewer, then a deterministic changelog entry | Documentation and changelog |
 
-Every node writes a `route` into the state. The graph runs once; if it does not converge it runs once
-more with twice the budget (`RETRY_BOOST`), continuing from what the first attempt committed. After
-that the outcome is `abandoned`. A second attempt that follows a review left without an answer starts at the
-review, not at the checks, and asks only the reviewers that gave none. Loops are bounded by `max_verify_retries` and
+Every node writes a `route` into the state. On a pull request or a push the graph runs once; the
+issue flow and the dependency sweep still run it a second time with twice the budget
+(`invoke_with_retry`) when it does not converge. Loops are bounded by `max_verify_retries` and
 `writer_rounds`.
 
-**A reviewer asks once and never ends a change.** A critical or high finding goes to the developer agent one
-time. What the reviewers still find after that fix, or when the developer agent could write none, is
-reported in the comment with its severity and the change goes on to be certified: what ends a change is
-checks that fail. A reviewer that gives no usable answer still stops the certification.
+**One loop, and one role that can start it.** Of the four reviewers only the second developer
+(`reviewer-correctness`) sends a change back: a critical or high finding of its own goes to the developer
+agent, one time. The other roles inform: what they find is reported with the severity they gave it. After
+the fix the checks run, and the second developer alone rereads the fix alone (stage `fix` in the comment);
+what it still finds, or what the developer agent could not fix, is reported and the change goes on to be
+certified. What ends a change is checks that fail. The test steward judges a change once. Without an
+answer from the second developer nothing is certified; a role that only informs and gives none is said so
+in the comment.
 
 ### How an agent's reply is used
 
@@ -313,7 +311,7 @@ These are the reasons behind choices that otherwise look arbitrary.
   model's reply. It redacts the key and secret-shaped strings from everything it prints, truncates
   oversized prompts with a marker, gives a reasoning model's thinking its own allowance
   (`reasoning.max_tokens`, 6,000 by default) so the answer keeps its budget, or none at all with
-  `--no-reasoning` (the roles in `ModelCaller.NO_REASONING`: the correctness and security reviewers), asks again once, with the same
+  `--no-reasoning` (which the agents' `ModelCaller` passes for every role), asks again once, with the same
   budget, when a reply comes back empty, and writes the tokens and estimated cost of every attempt to
   `--usage-file`.
 - **`ai_sanitize.py`**: bundles files into a prompt with secrets redacted and a size cap, or masks

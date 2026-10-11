@@ -27,8 +27,9 @@ merged · abandoned · reverted        + warnings and every role's verdict visib
 
 | Thing | State |
 |---|---|
-| `ci-shared` `main` and `v2` (what every consumer runs) | `8e562d6` (#57), equal at 18:30 UTC on 2026-10-11 |
-| ci-shared #50 `feat/risk-level` | open, certified at `7880445`, **not to be merged as it is**: once the owner puts `risk-confirmed` on a pull request, every later commit merges without asking again (the label is never removed). Step 4 of the plan |
+| `ci-shared` `main` | `d48989c` (#59) at 19:15 UTC on 2026-10-11 |
+| `ci-shared` `v2` (what every consumer runs) | `d48989c` at the same time |
+| ci-shared #50 `feat/risk-level` | **closed by accident** on 2026-10-11 (the commit message of #58 said "resolved (#50": GitHub took it as a closing word). The branch is there. Not to be merged as it is: once the owner puts `risk-confirmed` on a pull request, every later commit merges without asking again. Step 4 of the plan |
 | flask-test-api | `main` green, no open pull request |
 
 ## Next actions, in order
@@ -109,6 +110,12 @@ Outside the plan, each for a defect seen in a real run:
 
 Hence: that reviewer answers with no thinking and decides severity last; and a reviewer asks for a fix
 once and never ends a change whose checks pass, so a wrong `high` costs one round, not the change.
+
+Then the wait moved to the next role that thinks (security 132 seconds, the test steward over 180), so the
+owner had every role answer with no thinking, "for now": measured for the correctness and security
+reviewers and the test steward (1 to 10 seconds, the missing tests still written), not for the writer, the
+SRE, the architect or the documentation reviewer. And the graph lost what repeated itself: only the second
+developer sends a change back and rereads the fix; no final reviewer; no second attempt on a pull request.
 
 ## How to work on this (the other machine has no memory)
 

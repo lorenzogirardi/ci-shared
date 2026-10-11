@@ -51,13 +51,23 @@ class TestParallelReviewers:
         assert len(found) == 1                                                   # same place, same topic: merged
         assert found[0].reviewers == list(ap.REVIEWERS)                          # declared order, not finishing order
 
-    def test_one_unusable_reviewer_still_fails_closed(self):
+    def test_without_the_second_developer_there_is_no_verdict(self):
+        class Caller:
+            max_chars = 1000
+
+            def call(self, role, system, user):
+                return "garbage" if role == "reviewer-correctness" else fence({"findings": []})
+        assert ap.review_diff(Caller(), DIFF, None) is None
+
+    def test_a_role_that_only_informs_and_gives_no_answer_is_said_and_the_review_goes_on(self):
         class Caller:
             max_chars = 1000
 
             def call(self, role, system, user):
                 return "garbage" if role == "reviewer-security" else fence({"findings": []})
-        assert ap.review_diff(Caller(), DIFF, None) is None
+        said: list = []
+        assert ap.review_diff(Caller(), DIFF, None, awareness=said) == ([], [])
+        assert said == ["reviewer-security gave no usable answer: its view of this change is missing"]
 
     def test_the_caller_counts_calls_and_costs_correctly_under_concurrency(self, tmp_path):
         script = tmp_path / "ai.py"
@@ -192,32 +202,15 @@ def test_the_writer_is_shown_the_code_a_finding_points_at(tmp_path, monkeypatch)
     assert "line_1339 " not in text and "gone.py" in text          # a missing file is still reported, without code
 
 
-def test_the_architect_informs_and_never_sends_a_change_back():
+def test_only_the_second_developer_sends_a_change_back_and_the_others_keep_their_judgement():
     class Caller:
         max_chars = 1000
 
         def call(self, role, system, user):
-            if role == "reviewer-architect":                # two findings: the rule holds for each, not for the first
-                return fence({"findings": [finding(severity="low", problem="naming"), finding(file="c.py", severity="high", problem="layering")]})
+            if role in ("reviewer-architect", "reviewer-security"):
+                return fence({"findings": [finding(file="c.py" if role == "reviewer-architect" else "d.py", severity="high", problem=f"by {role}")]})
             return fence({"findings": [finding(file="b.py", problem="wrong result")] if role == "reviewer-correctness" else []})
-    diff = DIFF + DIFF.replace("a.py", "b.py") + DIFF.replace("a.py", "c.py")
+    diff = "".join(DIFF.replace("a.py", name) for name in ("b.py", "c.py", "d.py"))
     found, _ = ap.review_diff(Caller(), diff, None)
-    assert {f.file: f.severity for f in found} == {"a.py": "low", "b.py": "high", "c.py": "medium"}
-    assert [f.file for f in found if f.blocking] == ["b.py"]      # the other roles still send a change back
-
-
-def test_a_repeated_review_asks_only_the_reviewer_that_gave_no_answer():
-    class Caller:
-        max_chars = 1000
-        asked: list = []
-        silent = True
-
-        def call(self, role, system, user):
-            self.asked.append(role)
-            return None if role == "reviewer-correctness" and self.silent else fence({"findings": []})
-    caller, answered = Caller(), {}
-    assert ap.review_diff(caller, DIFF, None, answered=answered) is None      # one reviewer is silent: no verdict
-    caller.asked.clear()
-    caller.silent = False
-    assert ap.review_diff(caller, DIFF, None, answered=answered) == ([], [])
-    assert caller.asked == ["reviewer-correctness"]                            # the other three were not asked again
+    assert {f.file: f.severity for f in found} == {"b.py": "high", "c.py": "high", "d.py": "high"}   # reported as judged
+    assert [f.file for f in found if ap.sends_back(f)] == ["b.py"]

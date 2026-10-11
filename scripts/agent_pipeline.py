@@ -57,6 +57,13 @@ BRANCH_PREFIX = "agent/issue-"
 # security, the SRE and the architect. The QA tester and the doc writer are nodes of their own.
 REVIEWERS = ("reviewer-correctness", "reviewer-security", "reviewer-sre", "reviewer-architect")
 REVIEW_FEEDBACK = "REVIEW FINDINGS"      # how the writer is told its task comes from the review
+# The second developer: the one reviewer whose finding sends a change back, and whose answer a review
+# cannot do without. The other roles inform.
+SECOND_DEVELOPER = REVIEWERS[0]
+
+
+def sends_back(finding: lib.Finding) -> bool:
+    return finding.blocking and SECOND_DEVELOPER in finding.reviewers
 # Roles that are shown what the pipeline's tools reported (scans, deploy), next to the diff.
 EVIDENCE_ROLES = frozenset({"reviewer-security", "reviewer-sre"})
 PLANNER_ROUNDS = 6
@@ -144,18 +151,15 @@ def run_planner(caller: lib.ModelCaller, title: str, body: str, context: str) ->
 
 def review_diff(caller: lib.ModelCaller, diff: str, plan: dict | None,
                 reviewers: tuple[str, ...] = REVIEWERS, guidance: str = "", *,
-                evidence: str = "", awareness: list[str] | None = None, context: str = "",
-                answered: dict | None = None):
+                evidence: str = "", awareness: list[str] | None = None, context: str = ""):
     """Run the independent reviewers on `diff`. Returns (findings, dropped)
-    after validation against the diff and dedup, or None if a reviewer could
-    not produce a usable reply (fail closed: the change cannot be certified).
+    after validation against the diff and dedup, or None if the second developer
+    gave no usable reply (fail closed: the change cannot be certified). A role
+    that only informs and gives none is said so in `awareness`, and the review goes on.
 
     `evidence` is what the pipeline's tools reported for the commit; the roles in EVIDENCE_ROLES read
     it. What they want known about it comes back as notes, appended to `awareness`: reported, and
-    never a finding, so the tools inform a change without being able to send it back.
-
-    `answered` keeps each reviewer's answer to what it was shown. A review repeated on the same diff
-    asks only the reviewers that gave none: one silent reviewer once had the other three asked again."""
+    never a finding, so the tools inform a change without being able to send it back."""
     ranges = lib.diff_ranges(diff)
     user = (
         f"## Plan\n{json.dumps(plan, indent=2) if plan else 'No plan was provided; judge the diff on its own.'}\n\n"
@@ -175,26 +179,20 @@ def review_diff(caller: lib.ModelCaller, diff: str, plan: dict | None,
             found = lib.parse_findings(data, n)
             return None if found is None else (found, lib.parse_awareness(data))
         extra = shown if name in EVIDENCE_ROLES else design if name == "reviewer-architect" else ""
-        if answered is not None and (name, user + extra) in answered:
-            print(f"{name}: not asked again, its answer to this same diff is kept", flush=True)
-            return answered[(name, user + extra)]
-        reply = lib.ask_json(caller, name, lib.load_prompt(name), user + extra, validate)
-        if answered is not None and reply is not None:
-            answered[(name, user + extra)] = reply
-        return reply
+        return lib.ask_json(caller, name, lib.load_prompt(name), user + extra, validate)
 
     # Independent reviewers share nothing, so they run at the same time. Results are read back in the
     # declared order, so the deduplication (and the report) do not depend on who finished first.
     with ThreadPoolExecutor(max_workers=max(1, len(reviewers))) as pool:
         results = list(pool.map(one, reviewers))
     for name, reply in zip(reviewers, results):
+        if reply is None and name != SECOND_DEVELOPER:
+            if awareness is not None:
+                awareness.append(f"{name} gave no usable answer: its view of this change is missing")
+            continue
         if reply is None:
             return None
         found, notes = reply
-        if name == "reviewer-architect":
-            # The architect informs. Twice in its first hours it sent a change back over a rule of the
-            # project that the change was entitled to touch, and the change ended abandoned.
-            found = [dataclasses.replace(f, severity="medium") if f.blocking else f for f in found]
         if awareness is not None:
             awareness += [n for n in notes if n not in awareness]
         kept, dropped = lib.validate_findings(found, ranges)
@@ -218,29 +216,12 @@ def structured_review(caller: lib.ModelCaller, diff: str, title: str, body: str,
     if result is None:
         return None
     findings, dropped = result
-    blocking = sum(1 for f in findings if f.blocking)
+    blocking = sum(1 for f in findings if sends_back(f))
     text = ("Developer (correctness), security, SRE and architect, independent, deduplicated: "
             f"{len(findings)} finding(s), {blocking} blocking"
             + (f", {len(dropped)} dropped (not on a changed line)" if dropped else "")
             + f".\n\n{lib.render_findings_md(findings)}")
     return blocking == 0, text
-
-
-def final_review(caller: lib.ModelCaller, diff: str, plan: dict, prior: list[dict], guidance: str = ""):
-    ranges = lib.diff_ranges(diff)
-    user = (
-        f"## Plan\n{json.dumps(plan, indent=2)}\n\n## Earlier findings (blocking, from previous rounds)\n"
-        f"{json.dumps(prior, indent=2) if prior else '[]'}\n\n"
-        f"## Current diff (lines are prefixed `L<number>|` with their line number in the new file)\n"
-        f"{lib.annotate_diff(diff)}"
-        + (f"\n\n## Guidance from the maintainers of this repository\n{guidance}" if guidance.strip() else "")
-    )
-    found = lib.ask_json(caller, "final-reviewer", lib.load_prompt("final-reviewer"), user,
-                         lambda d: lib.parse_findings(d, "final-reviewer"))
-    if found is None:
-        return None
-    kept, dropped = lib.validate_findings(found, ranges)
-    return lib.dedup_findings(kept), dropped
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +245,6 @@ class Runtime:
     write_tests: bool = True  # the test steward evaluates changes to application code
     guidance: str = ""        # project-specific review guidance, shown to the reviewers
     evidence: object = None   # callable returning what the pipeline's tools reported for the commit, or None
-    answered: dict = dataclasses.field(default_factory=dict)   # reviewers' answers of this run, kept for a second attempt
 
 
 class RunState(TypedDict, total=False):
@@ -275,7 +255,6 @@ class RunState(TypedDict, total=False):
     applied: dict
     explanation: str
     committed: bool
-    prior_blocking: list
     rounds: list
     notes: list
     route: str
@@ -291,8 +270,8 @@ class RunState(TypedDict, total=False):
     spec_tests: list         # test files the writer may not edit: a verdict said the CODE is wrong there
     spec_violations: int
     awareness: list          # what the roles noted about the tools' evidence: reported, never acted on
-    resume: str              # the node a second attempt starts from, when the first one ended there
-    code_committed: bool     # an agent committed something other than tests
+    fix_from: str            # the commit the developer agent's one fix starts from
+    asked: list              # what the second developer asked it to fix
 
 
 def is_doc_path(path: str) -> bool:
@@ -567,13 +546,12 @@ def build_graph(rt: Runtime):
         raw = state.get("applied")
         applied = lib.Applied(raw["edited"], raw["created"]) if raw else None
         if ok:
-            kind = state.get("applied_kind") or (rt.fix_kind if state["iteration"] == 1 else "fix")
             if applied:
+                kind = state.get("applied_kind") or (rt.fix_kind if state["iteration"] == 1 else "fix")
                 commit_round(f"{kind}(agent): {state['explanation'][:120]}\n\nIteration {state['iteration']} of the agent pipeline.")
-            needs_tests = rt.write_tests and state.get("tests_done") != state["iteration"]
+            needs_tests = rt.write_tests and not state.get("tests_done")      # the test steward judges a change once
             return {"route": "tests" if needs_tests else "review",
                     "committed": bool(applied) or state.get("committed", False),
-                    "code_committed": (bool(applied) and kind != "test") or state.get("code_committed", False),
                     "verify_attempts": 0, "applied": None, "applied_kind": None, "own_tests": "", "spec_tests": []}
         if state.get("own_tests") and applied:
             # The steward has just written or rewritten these tests and they fail: they assert something the
@@ -703,7 +681,7 @@ def build_graph(rt: Runtime):
         in_scope = [f for f in findings if lib.finding_in_scope(f, state["plan"])]
         out_of_scope = len(findings) - len(in_scope)
         findings = in_scope
-        blocking = [f for f in findings if f.blocking]
+        blocking = [f for f in findings if sends_back(f)]
         scope_note = ([f"{out_of_scope} finding(s) concern files the plan declared out of scope and were not acted on"]
                       if out_of_scope else [])
         rounds = state.get("rounds", []) + [{
@@ -716,16 +694,10 @@ def build_graph(rt: Runtime):
             # checks passed were abandoned over findings the developer agent had not resolved.
             left = ([f"{len(blocking)} finding(s) of the review remain after the developer agent's one fix; the checks "
                      "pass, so they are reported and the change goes on"] if blocking else [])
-            # A final review certifies the agent's own changes to the code; if it made none (a clean PR
-            # or push), the first review already was the verdict. Tests the steward added are not a reason
-            # for it: they are in the diff the four reviewers have just read, and the checks ran them. A
-            # final review of such a change once took 271 seconds to read it a second time.
-            skip_final = label == "final" or not state.get("code_committed")
-            return {"route": "docs" if skip_final else "final", "rounds": rounds,
-                    "notes": state.get("notes", []) + scope_note + left}
+            return {"route": "docs", "rounds": rounds, "notes": state.get("notes", []) + scope_note + left}
         return {
             "route": "write", "rounds": rounds, "iteration": state["iteration"] + 1,
-            "prior_blocking": state.get("prior_blocking", []) + [f.to_dict() for f in blocking],
+            "fix_from": git("rev-parse", "HEAD").stdout.strip(), "asked": [f.to_dict() for f in blocking],
             "notes": state.get("notes", []) + scope_note,
             "feedback": REVIEW_FEEDBACK + " to fix (each is blocking; fix exactly these, minimally):\n"
                         + lib.findings_for_writer(blocking),
@@ -742,19 +714,28 @@ def build_graph(rt: Runtime):
 
     def n_review(state: RunState) -> dict:
         notes: list[str] = list(state.get("awareness", []))
-        result = review_diff(rt.caller, diff_since_base(rt.base_sha), state["plan"], guidance=rt.guidance,
-                             evidence=evidence(), awareness=notes, context=rt.context, answered=rt.answered)
+        if state.get("fix_from"):
+            # The developer agent has made its one fix. The second developer, who asked for it, reads the
+            # fix and nothing else: the other roles asked for nothing, and the rest of the change they have
+            # read already. All four reading everything again, then a final reviewer reading it once more,
+            # was five model calls (one of 271 seconds) to check a correction of a few lines.
+            path = OUT_DIR / "fix.diff"
+            build_diff(state["fix_from"], "HEAD", path)
+            if not path.read_text().strip():
+                return {"route": "docs"}
+            result = review_diff(rt.caller, path.read_text(), state["plan"], (SECOND_DEVELOPER,),
+                                 (rt.guidance + "\n\n" if rt.guidance.strip() else "")
+                                 + "This diff is the correction made for the findings below, and nothing else of the "
+                                 "change. Judge whether it resolves them and whether it breaks anything.\n"
+                                 + json.dumps(state.get("asked", []), indent=2))
+            label = "fix"
+        else:
+            result = review_diff(rt.caller, diff_since_base(rt.base_sha), state["plan"], guidance=rt.guidance,
+                                 evidence=evidence(), awareness=notes, context=rt.context)
+            label = "review"
         if result is None:
-            # A second attempt takes up the review again: the checks passed and the tests were judged.
-            return {**stop(state, "escalated", "a reviewer did not return a usable reply, so the change could not be certified"),
-                    "resume": "review"}
-        return {**after_review(state, *result, "review"), "awareness": notes}
-
-    def n_final(state: RunState) -> dict:
-        result = final_review(rt.caller, diff_since_base(rt.base_sha), state["plan"], state.get("prior_blocking", []), rt.guidance)
-        if result is None:
-            return stop(state, "escalated", "the final reviewer did not return a usable reply")
-        return after_review(state, *result, "final")
+            return stop(state, "escalated", "the second developer did not return a usable reply, so the change could not be certified")
+        return {**after_review(state, *result, label), "awareness": notes}
 
     def n_docs(state: RunState) -> dict:
         notes = list(state.get("notes", []))
@@ -799,7 +780,7 @@ def build_graph(rt: Runtime):
     graph = StateGraph(RunState)
     for name, fn in (("start", n_start), ("write", n_write), ("verify", n_verify), ("review", n_review),
                      ("ci_failure", n_ci_failure), ("steward", n_steward), ("tests", n_tests),
-                     ("final", n_final), ("docs", n_docs)):
+                     ("docs", n_docs)):
         graph.add_node(name, fn)
     graph.set_entry_point("start")
     route = lambda s: s["route"]  # noqa: E731
@@ -810,8 +791,7 @@ def build_graph(rt: Runtime):
     graph.add_conditional_edges("write", route, {"verify": "verify", "write": "write", "docs": "docs", "end": END})
     graph.add_conditional_edges("verify", route, {"review": "review", "tests": "tests", "write": "write", "steward": "steward",
                                                   "verify": "verify", "end": END})
-    graph.add_conditional_edges("review", route, {"final": "final", "docs": "docs", "write": "write", "end": END})
-    graph.add_conditional_edges("final", route, {"docs": "docs", "write": "write", "end": END})
+    graph.add_conditional_edges("review", route, {"docs": "docs", "write": "write", "end": END})
     graph.add_edge("docs", END)
     return graph.compile()
 
@@ -902,8 +882,7 @@ def invoke_with_retry(make_runtime, initial: dict) -> dict:
             state.update({
                 "notes": final.get("notes", []) + ["attempt 1 did not converge; retrying once with twice the budget"],
                 "rounds": final.get("rounds", []), "committed": final.get("committed", False),
-                "code_committed": final.get("code_committed", False),
-                "prior_blocking": final.get("prior_blocking", []), "adjudications": final.get("adjudications", []),
+                "adjudications": final.get("adjudications", []),
                 "feedback": "THE PREVIOUS ATTEMPT DID NOT CONVERGE. What happened:\n" + "\n".join(final.get("notes", [])[-5:]),
             })
         limit = (rt.max_iterations + 1) * (rt.max_verify_retries + 1) * 6 + 30
@@ -918,7 +897,7 @@ def boosted(rt: Runtime, attempt: int, previous: dict) -> Runtime:
     committed work on an issue, check that work instead of starting from nothing."""
     if attempt == 1:
         return rt
-    start = previous.get("resume") or ("verify" if rt.start == "write" and previous.get("committed") else rt.start)
+    start = "verify" if rt.start == "write" and previous.get("committed") else rt.start
     return dataclasses.replace(rt, max_iterations=rt.max_iterations * RETRY_BOOST,
                                max_verify_retries=rt.max_verify_retries * RETRY_BOOST,
                                writer_rounds=rt.writer_rounds * RETRY_BOOST, start=start)
@@ -1200,9 +1179,12 @@ def cmd_change(args: argparse.Namespace) -> int:
                  evidence=lambda: lib.fetch_evidence(evidence_repo, head_sha, getattr(args, "evidence_prefix", ""),
                                                      getattr(args, "evidence_wait", 0),
                                                      own_run=os.environ.get("GITHUB_RUN_ID", "")))
-    final = invoke_with_retry(lambda attempt, previous: boosted(rt, attempt, previous),
-                              {"plan": plan, "iteration": 1, "verify_attempts": 0, "notes": [], "rounds": [],
-                               "failure_output": failure_output})
+    # One run of the graph. A second attempt with twice the budget once repeated the checks and the test
+    # steward for six minutes to wait again for the same silent reviewer; the loops inside the graph are
+    # what retries, each for its own reason.
+    final = build_graph(rt).invoke({"plan": plan, "iteration": 1, "verify_attempts": 0, "notes": [], "rounds": [],
+                                    "failure_output": failure_output},
+                                   config={"recursion_limit": (rt.max_iterations + 1) * (rt.max_verify_retries + 1) * 6 + 30})
 
     outcome = settle(final.get("outcome", "failed"))
     if getattr(caller, "out_of_time", False) and outcome == "abandoned":
@@ -1246,7 +1228,7 @@ def build_change_comment(result: dict, pushed_ok: bool | None) -> str:
         "clean": ("The" if left else "No blocking findings, and the") + " deterministic checks pass. Nothing was changed.",
         "converged": f"The agent {'worked on' if left else 'fixed'} this and {'pushed' if pushed_ok else 'could not push'} "
                      f"{n} commit(s) to the branch. " + ("The checks pass." if left else "Checks and every review pass."),
-        "abandoned": f"**The agent abandoned this change** after a second attempt with twice the budget ({last_note}). "
+        "abandoned": f"**The agent abandoned this change** ({last_note}). "
                      "Nothing was merged and the base branch is untouched.",
     }.get(outcome, outcome)
     if left and outcome in ("clean", "converged"):

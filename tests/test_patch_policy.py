@@ -3,6 +3,7 @@ agents added is checked again BEFORE it is published."""
 
 import json
 import pathlib
+import types
 import subprocess
 import sys
 
@@ -164,22 +165,22 @@ class TestFinalGateStopsPublishing:
                                   max_iterations=1, max_verify_retries=1, writer_rounds=1, ci_sha="", ci_repo="")
 
     def test_a_commit_with_a_credential_makes_the_result_abandoned_and_unpublishable(self, repo, monkeypatch):
-        def engine(make_runtime, initial):
+        def engine(state, config=None):
             commit({"leak.py": f"KEY = '{TOKEN}'\n"})
             return {"outcome": "converged", "notes": []}
         monkeypatch.setattr(ap.lib, "ModelCaller", lambda *a, **k: FakeCaller({}))
-        monkeypatch.setattr(ap, "invoke_with_retry", engine)
+        monkeypatch.setattr(ap, "build_graph", lambda rt: types.SimpleNamespace(invoke=engine))
         assert ap.cmd_change(self.args(repo)) == 0
         result = json.loads(pathlib.Path(".ai/agent-run/result.json").read_text())
         assert result["outcome"] == "abandoned" and result["commits"] == 0
         assert any("refusing to publish, policy" in n and "credential" in n for n in result["notes"])
 
     def test_a_clean_commit_is_published_as_before(self, repo, monkeypatch):
-        def engine(make_runtime, initial):
+        def engine(state, config=None):
             commit({"fine.py": "x = 1\n"})
             return {"outcome": "converged", "notes": []}
         monkeypatch.setattr(ap.lib, "ModelCaller", lambda *a, **k: FakeCaller({}))
-        monkeypatch.setattr(ap, "invoke_with_retry", engine)
+        monkeypatch.setattr(ap, "build_graph", lambda rt: types.SimpleNamespace(invoke=engine))
         ap.cmd_change(self.args(repo))
         assert json.loads(pathlib.Path(".ai/agent-run/result.json").read_text())["outcome"] == "converged"
 
