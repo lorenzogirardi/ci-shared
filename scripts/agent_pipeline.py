@@ -180,6 +180,10 @@ def review_diff(caller: lib.ModelCaller, diff: str, plan: dict | None,
         if reply is None:
             return None
         found, notes = reply
+        if found and found[0].reviewers == ["reviewer-architect"]:
+            # The architect informs. Twice in its first hours it sent a change back over a rule of the
+            # project that the change was entitled to touch, and the change ended abandoned.
+            found = [dataclasses.replace(f, severity="medium") if f.blocking else f for f in found]
         if awareness is not None:
             awareness += [n for n in notes if n not in awareness]
         kept, dropped = lib.validate_findings(found, ranges)

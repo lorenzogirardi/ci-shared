@@ -68,7 +68,7 @@ These exist in the consumer today. They are the evidence; use them before anythi
 
 The four reviewers (`reviewer-correctness`, `reviewer-security`, `reviewer-sre`, `reviewer-architect`) run in
 parallel and independently. A critical or high finding on a changed line goes back to the developer agent;
-the rest is a note.
+the rest is a note. The architect only informs: its findings are always notes.
 
 | QA tester | `test-steward`, `failure-adjudicator` | in the graph |
 | Doc writer | `doc-reviewer` | in the graph |

@@ -41,7 +41,7 @@ Reply with ONE fenced json block and nothing else:
 ```
 
 `line` is a line number in the NEW version of the file and must fall inside a
-changed hunk. Use `critical`/`high` only for defects that must be fixed before
-this can be accepted; `medium`/`low` are advisory.
+changed hunk. Your findings are advisory: they are written in the review for
+the people responsible for the project and do not send the change back.
 
 The diff you receive has `L<number>|` in front of each added or context line: that number is the new-file line number. Use it for `line`.
