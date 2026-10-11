@@ -762,6 +762,14 @@ class TestWorkflowPrsBelongToTheBot:
         pr_review_sweep.set_review_status("o/r", "abc1234", "pending", "waiting")
         assert "could not set" in capsys.readouterr().out
 
+    def test_a_long_verdict_description_is_truncated_for_the_status_api(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(pr_review_sweep, "run",
+                            lambda cmd, **kw: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", ""))
+        pr_review_sweep.set_review_status("o/r", "abc1234", "failure", "x" * 300)
+        description = [arg for arg in calls[0] if arg.startswith("description=")][0]
+        assert description == "description=" + "x" * 140
+
     @pytest.mark.parametrize("state", ["green", "pending", "none"])
     def test_left_to_the_bot_unless_red(self, state):
         assert workflow_pr_action(state) == "leave"
