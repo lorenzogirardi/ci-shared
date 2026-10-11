@@ -60,11 +60,16 @@ These exist in the consumer today. They are the evidence; use them before anythi
 | Role | Node / prompt today | State |
 |---|---|---|
 | Developer | `writer`, `reviewer-correctness`, `final-reviewer` | in the graph |
+
+The four reviewers (`reviewer-correctness`, `reviewer-security`, `reviewer-sre`, `reviewer-architect`) run in
+parallel and independently. A critical or high finding on a changed line goes back to the developer agent;
+the rest is a note.
+
 | QA tester | `test-steward`, `failure-adjudicator` | in the graph |
 | Doc writer | `doc-reviewer` | in the graph |
 | Security | `reviewer-security` | in the graph; reads the diff and the tools' evidence (`ai-context-*` artifacts of the commit), which it reports as awareness |
-| SRE | none | missing; the build and deploy evidence exists and no agent reads it |
-| Architect | `docs-architect` (started by hand), `planner` (unused) | missing from the graph |
+| SRE | `reviewer-sre` | in the graph; reads the diff and the deploy and scan evidence |
+| Architect | `reviewer-architect` | in the graph; reads the diff and the project's own description (`--context-files`). `docs-architect` is still started by hand; `planner` belongs to the issue flow, which is out for now |
 
 Known departures from the rules, to remove rather than extend:
 
@@ -85,14 +90,14 @@ State: **yes** handled · **part** handled in part, outside the graph, or never 
 
 | # | Action | Roles | State |
 |---|---|---|---|
-| 1 | New feature (code and tests) | developer, QA, security, architect, doc | part: no architect, no security evidence |
+| 1 | New feature (code and tests) | developer, QA, security, architect, doc | yes |
 | 2 | Bug fix | developer, QA (regression test) | yes |
 | 3 | Intended change of behaviour (a test must change) | QA, developer | yes: the quote rule |
 | 4 | Pull request with red CI | QA (test or code at fault?), developer | yes |
-| 5 | Refactor with no change of behaviour | developer, architect | part: no architect |
+| 5 | Refactor with no change of behaviour | developer, architect | yes |
 | 6 | Documentation only | doc writer | yes |
-| 7 | Infrastructure: Dockerfile, helm chart, compose | SRE, security | no: no agent reads build and deploy evidence; Checkov runs only after the merge |
-| 8 | Configuration, environment variables, database schema | architect, SRE | no |
+| 7 | Infrastructure: Dockerfile, helm chart, compose | SRE, security | part: both roles read the evidence; not yet seen on a real infrastructure change |
+| 8 | Configuration, environment variables, database schema | architect, SRE | part: both roles review it; not yet seen in a real run |
 | 9 | Change to the pipeline (`.github/workflows/`) | SRE | no: a person merges it |
 | 10 | Pull request behind the base branch or in conflict | developer | part: only for the dependency bot |
 | 11 | Stalled pull request (forgotten draft, author gone) | — | part: closed only when it has no verdict |
@@ -158,8 +163,8 @@ Each step reuses or replaces something; none adds a layer.
 
 1. Done: Trivy, Checkov and TruffleHog output is evidence for `reviewer-security`, which reports what
    they found without blocking (rule 4). Still to do: remove `ci-analysis`.
-2. An SRE node reads the build and deploy evidence of the `image` job.
-3. The architect prompt becomes a reviewer node; `planner` is removed.
+2. Done: `reviewer-sre` reads the build and deploy evidence of the `image` job.
+3. Done: `reviewer-architect` reviews every change.
 4. The dependency bot's pull requests go through the same graph; the sweep only picks the pull
    request and starts it.
 5. Optional: a risk score computed from facts (files touched, size, tool findings) that chooses
