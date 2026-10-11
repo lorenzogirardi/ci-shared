@@ -292,6 +292,33 @@ def fetch_evidence(repo: str, sha: str, prefix: str = "ai-context-", wait_second
     return "\n\n".join(sorted(sections))[:EVIDENCE_TOTAL_CHARS]
 
 
+# --- risk: a number from facts, and the owner's setting that decides whether to ask ---------------
+
+_SENSITIVE_PATH_RE = re.compile(
+    r"(^|/)(Dockerfile[^/]*|docker-compose[^/]*|requirements[^/]*\.txt|pyproject\.toml|package(-lock)?\.json)$"
+    r"|^(helm|charts|k8s|deploy|\.github|migrations)/|(^|/)(settings|config|database|schema)[^/]*\.(py|ya?ml|toml|json)$")
+
+
+def risk_score(files: list[str], lines: int) -> tuple[int, list[str]]:
+    """How risky a change is, 1 (trivial) to 10, from facts only: how much it changes, how many files
+    and areas it touches, and whether it touches what the service is built, configured or deployed
+    with. Returns the score and the facts behind it, so the number can be read, not trusted."""
+    size = 0 if lines <= 20 else 1 if lines <= 100 else 2 if lines <= 300 else 3
+    spread = 0 if len(files) <= 2 else 1 if len(files) <= 5 else 2 if len(files) <= 15 else 3
+    sensitive = sorted(f for f in files if _SENSITIVE_PATH_RE.search(f))
+    areas = {f.split("/", 1)[0] for f in files}
+    facts = [f"{lines} changed line(s)", f"{len(files)} file(s) in {len(areas)} area(s)"]
+    if sensitive:
+        facts.append("touches build, configuration or deployment: " + ", ".join(sensitive[:4]))
+    return min(10, 1 + size + spread + (2 if sensitive else 0) + (1 if len(areas) >= 3 else 0)), facts
+
+
+def needs_confirmation(risk_level: int, score: int) -> bool:
+    """The owner's setting, 1 to 10: 1 never asks, 10 always asks, and in between a change asks when
+    its score reaches 11 - level. The default is 1: no person in the loop."""
+    return risk_level > 1 and score >= 11 - risk_level
+
+
 def parse_awareness(data: dict | None) -> list[str]:
     """What a role wants known about the tools' evidence. Notes, never findings: they are reported and
     cannot send work back, so a malformed list is dropped instead of failing the reply."""

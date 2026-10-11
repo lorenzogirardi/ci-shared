@@ -57,6 +57,11 @@ on:
         required: false
         type: string
         default: '3.12'
+      risk_level:
+        description: 'How much the owner wants to be asked, 1 to 10. 1 (default): never, every change ends merged, abandoned or reverted with no person. 10: every certified change waits for the label `risk-confirmed`. In between: a change waits when its risk score (1-10, computed from its size, spread and the paths it touches) reaches 11 minus this level.'
+        required: false
+        type: number
+        default: 1
       python_version_dockerfile:
         description: 'Path of a Dockerfile in the caller repository. When set, the Python version is read from its `FROM python:<major.minor>` line and python_version is ignored: the image is the single source for the interpreter.'
         required: false
@@ -251,7 +256,8 @@ jobs:
             --verify-timeout ${{ inputs.verify_timeout_seconds }} \
             --max-iterations ${{ inputs.max_iterations }} \
             --max-verify-retries ${{ inputs.max_verify_retries }} \
-            --writer-rounds ${{ inputs.writer_rounds }}
+            --writer-rounds ${{ inputs.writer_rounds }} \
+            --risk-level ${{ inputs.risk_level }}
 
       - name: Publish on the pull request (fixes pushed to its branch, one comment)
         if: steps.guard.outputs.skip != 'true' && inputs.mode != 'push'

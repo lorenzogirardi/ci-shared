@@ -174,6 +174,13 @@ has a budget of 15 minutes (`--time-budget-minutes`): past it no model is called
 seconds as abandoned, with the reason in the comment. The job's own `timeout-minutes: 25` is the stop
 behind it. Every model call writes one line to the job log (role, seconds, output tokens, cost).
 
+**Risk.** The comment also carries a risk score, 1 to 10, computed from facts (`agent_lib.risk_score`:
+changed lines, files and areas touched, paths that build, configure or deploy the service). The input
+`risk_level` of `reusable_agent-change.yml` is the owner's dial: at 1, the default, nothing ever asks;
+at 10 every certified change asks; in between a change asks when its score reaches 11 minus the level.
+Asking means the comment carries `<!-- agent-needs-confirmation: <sha> -->`, the pull request gets the
+label `needs-confirmation`, and the merge gate waits for the label `risk-confirmed`.
+
 **One agent at a time.** The caller for `mode: pr` and the caller for `mode: ci` share a concurrency
 group per pull request, so when the checks fail the run that holds the real CI logs takes over.
 

@@ -107,7 +107,7 @@ State: **yes** handled · **part** handled in part, outside the graph, or never 
 | 10 | Pull request behind the base branch or in conflict | developer | part: only for the dependency bot |
 | 11 | Stalled pull request (forgotten draft, author gone) | — | part: closed only when it has no verdict |
 | 12 | Pull request from a fork (no secrets) | security | no: never tried |
-| 13 | Very large pull request, or one across many areas | all | no: the case for the risk score |
+| 13 | Very large pull request, or one across many areas | all | part: it gets a high risk score; whether it waits is the owner's `risk_level` |
 
 ### Directly on the main branch
 
@@ -172,8 +172,10 @@ Each step reuses or replaces something; none adds a layer.
 3. Done: `reviewer-architect` reviews every change.
 4. The dependency bot's pull requests go through the same graph; the sweep only picks the pull
    request and starts it.
-5. Optional: a risk score computed from facts (files touched, size, tool findings) that chooses
-   between merge and abandon.
+5. Done: every pull request comment carries a risk score, 1 to 10, computed from facts (size,
+   spread, paths that build, configure or deploy the service). The input `risk_level` is the owner's
+   dial: 1, the default, never asks; 10 always asks; in between a certified change waits for the label
+   `risk-confirmed` when its score reaches 11 minus the level.
 
 ## Layout
 

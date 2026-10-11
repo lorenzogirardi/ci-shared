@@ -63,6 +63,11 @@ RETRY_BOOST = 2
 CERT_MARKER = "agent-certified"
 ABANDON_MARKER = "agent-abandoned"
 ABANDONED_LABEL = "agent-abandoned"
+# Only with a risk level above 1: a certified change whose risk score reaches the owner's threshold
+# is not merged until the owner puts CONFIRMED_LABEL on the pull request.
+CONFIRM_MARKER = "agent-needs-confirmation"
+NEEDS_CONFIRMATION_LABEL = "needs-confirmation"
+CONFIRMED_LABEL = "risk-confirmed"
 # Every way a change can end, and what the system does about it. None of them
 # waits for a person; tests/test_terminal_states.py fails if one ever does.
 TERMINAL_ACTIONS = {
@@ -1203,7 +1208,12 @@ def cmd_change(args: argparse.Namespace) -> int:
         outcome = "clean"
     rounds = final.get("rounds", [])
     sha7 = head_sha[:7]
+    numstat = git("diff", "--numstat", args.base_sha, "HEAD").stdout.split("\n")
+    score, facts = lib.risk_score([n for n in git("diff", "--name-only", args.base_sha, "HEAD").stdout.split("\n") if n],
+                                  sum(int(x) for row in numstat for x in row.split("\t")[:2] if x.isdigit()))
+    risk_level = getattr(args, "risk_level", 1)
     result = {
+        "risk": {"score": score, "facts": facts, "level": risk_level, "ask": lib.needs_confirmation(risk_level, score)},
         "mode": args.mode, "outcome": outcome, "branch": branch, "head_sha": head_sha, "commits": new_commits,
         "final_sha": git("rev-parse", "HEAD").stdout.strip(),
         "plan": plan, "notes": final.get("notes", []), "rounds": rounds,
@@ -1234,10 +1244,17 @@ def build_change_comment(result: dict, pushed_ok: bool | None) -> str:
         "abandoned": f"**The agent abandoned this change** after a second attempt with twice the budget ({last_note}). "
                      "Nothing was merged and the base branch is untouched.",
     }.get(outcome, outcome)
-    if certified:
+    risk = result.get("risk") or {}
+    ask = certified and bool(risk.get("ask"))
+    if certified and ask:
+        status += (f" **Certified at `{sha[:7]}`**, and waiting for confirmation: its risk is {risk['score']}/10 and the "
+                   f"risk level of this repository is {risk['level']}. It merges once the label `{CONFIRMED_LABEL}` is on "
+                   "this pull request and its CI is green.")
+    elif certified:
         status += f" **Certified at `{sha[:7]}`**: it merges automatically once its CI is green."
     abandoned_head = result.get("head_sha", "") if outcome == "abandoned" else ""
     parts = ["<!-- agent-pr -->" + (f"\n<!-- {CERT_MARKER}: {sha} -->" if certified else "")
+             + (f"\n<!-- {CONFIRM_MARKER}: {sha} -->" if ask else "")
              + (f"\n<!-- {ABANDON_MARKER}: {abandoned_head} -->" if abandoned_head else ""), "## Agent review", status]
     rounds = result.get("rounds", [])
     if rounds:
@@ -1252,6 +1269,8 @@ def build_change_comment(result: dict, pushed_ok: bool | None) -> str:
         parts.append("### Who was wrong, the code or the test?\n" + "\n".join(lines))
     if result.get("findings"):
         parts.append("### Findings at the last round\n" + lib.render_findings_md([lib.Finding(**f) for f in result["findings"]]))
+    if risk:
+        parts.append(f"**Risk {risk['score']}/10**: " + "; ".join(risk.get("facts", [])) + ".")
     if result.get("awareness"):
         parts.append("### Awareness (not blocking)\nWhat the pipeline's tools reported that matters for this change. "
                      "It is here to be known; it did not hold the change.\n"
@@ -1299,6 +1318,8 @@ def cmd_publish_pr(args: argparse.Namespace) -> int:
     if result["outcome"] in ("clean", "converged"):
         # A new push by the author, now certified, is not abandoned any more.
         _gh("pr", "edit", str(args.pr), "--repo", args.repo, "--remove-label", ABANDONED_LABEL)  # best effort
+        if (result.get("risk") or {}).get("ask"):
+            _gh("pr", "edit", str(args.pr), "--repo", args.repo, "--add-label", NEEDS_CONFIRMATION_LABEL)  # best effort
     if result["outcome"] == "abandoned":
         # Terminal, with no hand-off: the PR is labelled so the merge gate never touches it, and
         # a PR the agent itself opened is closed. A person's own PR is left open and unmerged.
@@ -1355,6 +1376,10 @@ def merge_one(args: argparse.Namespace, number: int) -> str:
         return "not merging: labelled abandoned, and nothing certifies this commit"
     if not certified:
         return f"not merging: nothing certifies {head[:7]} yet (a later run, or the next push, will)"
+    asks = any(f"<!-- {CONFIRM_MARKER}: {head} -->" in (c.get("body") or "") and (c.get("user") or {}).get("login") in trusted
+               for c in comments)
+    if asks and CONFIRMED_LABEL not in {label["name"] for label in pr.get("labels", [])}:
+        return f"not merging: certified, and waiting for the label {CONFIRMED_LABEL} (the risk level of this repository asks for it)"
     reverts = recent_reverts(args.repo, args.base_branch)
     if reverts >= args.max_reverts:
         return f"not merging: circuit breaker open ({reverts} automatic reverts in 24h). Merging resumes by itself as they age out."
@@ -1756,6 +1781,9 @@ def main() -> int:
     c.add_argument("--ci-sha", default="")
     c.add_argument("--time-budget-minutes", type=int, default=15,
                    help="after this long no model is called any more and the run ends abandoned, with the reason")
+    c.add_argument("--risk-level", type=int, default=1, choices=range(1, 11), metavar="1-10",
+                   help="1 never asks for confirmation (default), 10 always asks; in between, asks when the change's "
+                        "risk score reaches 11 minus this level")
     c.add_argument("--evidence-prefix", default="ai-context-",
                    help="artifacts of the commit's workflow runs whose name starts with this are shown to the roles as evidence")
     c.add_argument("--evidence-wait", type=int, default=300,
