@@ -140,6 +140,7 @@ CI actually passed, and — opt-in — repair the broken ones.
 | `triage_on_failure` | `false` | On red CI, explain the failure instead of reviewing the diff |
 | `autofix` | `false` | On red CI, push a verified fix instead of only explaining. Implies `triage_on_failure`. No file-type restriction beyond `.github/workflows/**`; a reply may also list a directory, find a file by name, grep file contents, or read a real file (repo, installed package, or stdlib) before proposing an edit — see architecture.md. |
 | `python_version` | `3.12` | Interpreter `verify_command` runs under — **must match the real CI gate's version** |
+| `python_version_dockerfile` | — | Path of the caller's Dockerfile. When set, the version is read from its `FROM python:<major.minor>` line and `python_version` is ignored: one source for the interpreter, nothing to keep in step by hand |
 | `verify_command` | `''` | Shell command proving an autofix edit works, run before pushing anything |
 | `verify_timeout_seconds` | `180` | |
 | `max_autofix_attempts` | `3` | Propose→verify rounds tried locally before giving up on one PR — a `{"read": ...}` reply costs a round too, so code-level migrations need more than a manifest revert does |
@@ -227,7 +228,7 @@ jobs:
       required_checks: 'checks,workflows'   # your pr-checks.yml job names
       triage_on_failure: true
       autofix: true
-      python_version: "3.14"                # must match your real CI gate
+      python_version_dockerfile: Dockerfile  # the interpreter the image runs; or python_version: "3.14"
       verify_command: |
         set -euo pipefail
         pip install --dry-run -r requirements.txt
