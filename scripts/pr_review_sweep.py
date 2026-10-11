@@ -1031,6 +1031,21 @@ def may_auto_merge(auto_merge: bool, auto_merge_authors: set[str] | frozenset[st
     return auto_merge and (not auto_merge_authors or author in auto_merge_authors)
 
 
+def sweep_auto_merges(bot_merges: bool, is_clean: bool, auto_merge: bool,
+                      auto_merge_authors: set[str] | frozenset[str],
+                      author: str) -> bool:
+    """Whether the sweep itself may merge this pull request.
+
+    A pull request that touches `.github/workflows/` is left for the
+    dependency bot: the sweep only records the `agent-review` verdict
+    status, and the bot merges once it reads that verdict. The job's
+    GITHUB_TOKEN has no `workflow` scope, so an attempt here would fail
+    and record a misleading merge outcome.
+    """
+    return (not bot_merges and is_clean
+            and may_auto_merge(auto_merge, auto_merge_authors, author))
+
+
 def try_merge(repo: str, number: int, head_sha: str, method: str,
               required: tuple[str, ...] = (), *,
               poll_seconds: int = 0, poll_interval: int = 15) -> str:
@@ -1508,7 +1523,7 @@ def main() -> int:
         # Merge first, comment second, so the comment can state what actually
         # happened rather than what was about to be attempted.
         merge_outcome = "not attempted"
-        if is_clean and may_auto_merge(args.auto_merge, auto_merge_authors, author):
+        if sweep_auto_merges(bot_merges, is_clean, args.auto_merge, auto_merge_authors, author):
             merge_outcome = try_merge(args.repo, number, head_sha, args.merge_method, required,
                                        poll_seconds=args.merge_poll_seconds,
                                        poll_interval=args.merge_poll_interval)

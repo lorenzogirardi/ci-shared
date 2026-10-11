@@ -55,3 +55,21 @@ def test_a_status_that_cannot_be_written_is_a_warning_and_not_a_crash(monkeypatc
     pr_review_sweep.set_review_status("o/r", "abcdef1234", "pending", "waiting")
 
     assert "could not set the agent-review status on abcdef1" in capsys.readouterr().out
+
+
+def test_a_workflow_pull_request_is_never_merged_by_the_sweep():
+    assert pr_review_sweep.sweep_auto_merges(
+        bot_merges=True, is_clean=True, auto_merge=True,
+        auto_merge_authors=set(), author="dependabot[bot]") is False
+
+
+def test_an_ordinary_clean_pull_request_is_still_merged_by_the_sweep():
+    assert pr_review_sweep.sweep_auto_merges(
+        bot_merges=False, is_clean=True, auto_merge=True,
+        auto_merge_authors=set(), author="dependabot[bot]") is True
+
+
+def test_a_workflow_pull_request_blocks_even_an_explicitly_allowed_author():
+    assert pr_review_sweep.sweep_auto_merges(
+        bot_merges=True, is_clean=True, auto_merge=True,
+        auto_merge_authors={"dependabot[bot]"}, author="dependabot[bot]") is False
