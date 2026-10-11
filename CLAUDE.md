@@ -19,9 +19,14 @@ The pipeline does the work of a team on every change, with no person in it:
 
 ## Rules that do not bend
 
-1. **No person in the loop.** Every change ends **merged**, **abandoned** (closed, with the reason) or
-   **reverted**. Nothing waits for a decision, an approval or a merge by a person. If a design needs
-   one, the design is wrong. A risk score that picks the ending is allowed, and optional.
+1. **No person in the loop, unless the owner asks to be in it.** Every change ends **merged**,
+   **abandoned** (closed, with the reason) or **reverted**. By default nothing waits for a decision,
+   an approval or a merge by a person, and a design that needs one is wrong. There is exactly one
+   exception, and it is the owner's own dial: `risk_level`, 1 to 10. At 1, the default, this rule
+   holds with no exception. Above 1 the owner has chosen to confirm the riskier changes by putting
+   the label `risk-confirmed` on the pull request; at 10, every change. A change waiting for that
+   label is the rule working as the owner set it, not a breach of it. Nothing else may make a change
+   wait for a person.
 2. **One LangGraph graph.** Every role is a node of the graph in `scripts/agent_pipeline.py`. No
    second engine, no model call outside the graph that judges or changes a pull request.
 3. **Agents judge evidence, not diffs alone.** Each role reads the output of the deterministic tools
