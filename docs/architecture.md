@@ -266,8 +266,8 @@ Step 2 exists because unit tests do not show what a model does with a real pull 
 
 Pull requests to this repository go through the same loop (`agent-change.yml`,
 `agent-ci-failure.yml`, `agent-merge.yml`), with the agents running at the released tag, never at
-the pull request's own code. What stays with a person: a pull request that touches
-`.github/workflows/`, and a breaking change that needs a new tag.
+the pull request's own code. What stays with a person: a finding inside `.github/workflows/` itself, which no agent may edit, and a
+breaking change that needs a new tag.
 
 ## Constraints of GitHub Actions that shape the design
 
