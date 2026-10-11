@@ -82,7 +82,9 @@ class ModelCaller:
     # Roles asked to answer with no thinking before the answer. Thinking, this reviewer gave no answer in
     # 300 seconds on a change of 350 lines, three times; without it the same question took 1 to 7 seconds
     # in 15 local calls, none without an answer, and it still found the defect it had found before.
-    NO_REASONING = ("reviewer-correctness",)
+    # The security reviewer was then the slowest of the four (132 seconds on that same change); without
+    # thinking it took 1 to 6 seconds in 6 local calls and reported the same kind of findings.
+    NO_REASONING = ("reviewer-correctness", "reviewer-security")
 
     def __init__(self, ai_script: str, *, max_chars: int = 140_000, timeout: int = 180,
                  work_dir: str = ".ai/agents") -> None:
