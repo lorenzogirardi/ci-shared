@@ -121,3 +121,16 @@ class TestAwarenessIsANoteNeverAFinding:
              "awareness": ["Trivy: one critical vulnerability in the base image"]}, None)
         assert "### Awareness (not blocking)" in comment and "Trivy: one critical" in comment
         assert "Certified at" in comment
+
+
+class TestTheEvidenceIsCapped:
+    def test_a_single_file_is_capped(self):
+        line = "log line about nothing in particular. "
+        text = fetch(FakeGitHub({"ai-context-log": zipped(**{"log.txt": line * 200})}))
+        assert len(text.split("### log\n", 1)[1]) == lib.EVIDENCE_FILE_CHARS
+
+    def test_the_whole_evidence_is_capped(self):
+        line = "log line about nothing in particular. "
+        big = zipped(**{f"f{i}.txt": line * 200 for i in range(5)})
+        text = fetch(FakeGitHub({"ai-context-big": big}))
+        assert len(text) == lib.EVIDENCE_TOTAL_CHARS
