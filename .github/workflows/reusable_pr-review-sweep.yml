@@ -96,6 +96,11 @@ on:
         required: false
         type: string
         default: '3.12'
+      python_version_dockerfile:
+        description: 'Path of a Dockerfile in the caller repository. When set, the Python version is read from its `FROM python:<major.minor>` line and python_version is ignored: the image is the single source for the interpreter.'
+        required: false
+        type: string
+        default: ''
       verify_command:
         description: 'Shell command that proves an autofix edit actually works, run in this job BEFORE anything is pushed. Should mirror the real CI gate (dependency resolution, install, a smoke test) as closely as practical. Empty = skip local verification and push on the model''s word alone, as the first version of autofix did.'
         required: false
@@ -205,12 +210,29 @@ jobs:
         id: harness
         run: echo "sha=$(git -C .shared rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      - name: Python version
+        # One source for the interpreter: when the caller names its Dockerfile, the version is read
+        # from its `FROM python:` line, so the agents verify on what the image runs and no workflow
+        # carries a second copy that can drift from it.
+        id: python
+        env:
+          DOCKERFILE: ${{ inputs.python_version_dockerfile }}
+          FALLBACK: ${{ inputs.python_version }}
+        run: |
+          version="$FALLBACK"
+          if [ -n "$DOCKERFILE" ]; then
+            version=$(sed -n 's/^FROM python:\([0-9]*\.[0-9]*\).*/\1/p' "$DOCKERFILE" | head -n 1)
+            [ -n "$version" ] || { echo "::error::no 'FROM python:<version>' line in $DOCKERFILE"; exit 1; }
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Python $version"
+
       - name: Set up Python for verify_command
         # Matches the interpreter pr-checks.yml verifies against — see the
         # python_version input description for why that match matters.
         uses: actions/setup-python@v7
         with:
-          python-version: ${{ inputs.python_version }}
+          python-version: ${{ steps.python.outputs.version }}
 
       - name: Render the system prompt
         env:
