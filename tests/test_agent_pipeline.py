@@ -138,6 +138,22 @@ class TestLoop:
         assert len([1 for r, _ in caller.log if r == "reviewer-correctness"]) == 2
         assert final["rounds"][-1]["findings"][0]["severity"] == "high"             # reported as it was judged
 
+    def test_after_the_fix_only_the_second_developer_reads_and_only_the_fix(self, repo):
+        fix = fence({"explanation": "fix greeting", "changes": [{"file": "greet.py", "find": "'hello'", "replace": "'hello, world'"}]})
+        caller = FakeCaller({
+            "writer": [write_change("def greeting():\n    return 'hello'\n" + "\n" * 8 + "def other():\n    return 1\n"), fix],
+            "reviewer-correctness": [blocking_finding(line=2), no_findings()], "reviewer-security": [no_findings()],
+            "doc-reviewer": [fence({"explanation": "nothing needed", "changes": []})],
+        })
+        rt, final = run_graph(caller)
+        assert final["outcome"] == "converged" and [r["stage"] for r in final["rounds"]] == ["review", "fix"]
+        asked = [r for r, _ in caller.log if r.startswith("reviewer-") or r == "final-reviewer"]
+        assert asked.count("reviewer-correctness") == 2 and asked.count("reviewer-security") == 1 and len(asked) == 5
+        second = [u for r, u in caller.log if r == "reviewer-correctness"][1]
+        assert "hello, world" in second and "def other" not in second          # the correction, not the whole change
+        assert "returns the wrong greeting" in second                           # and what it was asked to fix
+        assert [r for r, _ in caller.log].count("test-steward") == 1            # the tests were judged once
+
     def test_a_fix_the_developer_agent_cannot_write_does_not_end_a_change_that_works(self, repo):
         caller = FakeCaller({
             "writer": [write_change(), "not a change"],
