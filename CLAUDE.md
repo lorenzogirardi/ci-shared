@@ -82,8 +82,9 @@ Known departures from the rules, to remove rather than extend:
 - `scripts/pr_review_sweep.py` is a second engine for the dependency bot's pull requests.
 - `reusable_ci-analysis.yml`, release notes and changelog are model calls outside the graph; the
   first one receives the Trivy, Checkov and deploy output and acts on none of it.
-- A change to `.github/workflows/` cannot be merged by an agent (no `workflow` scope), so every
-  change to the pipeline itself is merged by a person.
+- A change to `.github/workflows/` was merged by a person until 2026-10-11: the merge gate refused it
+  before trying. The owner gave the agents' token the `workflow` permission and the gate now attempts
+  the merge like any other, gated by the same required checks; not yet seen in a real run.
 
 ## What the pipeline must close by itself
 
@@ -104,7 +105,7 @@ State: **yes** handled · **part** handled in part, outside the graph, or never 
 | 6 | Documentation only | doc writer | yes |
 | 7 | Infrastructure: Dockerfile, helm chart, compose | SRE, security | part: both roles read the evidence; not yet seen on a real infrastructure change |
 | 8 | Configuration, environment variables, database schema | architect, SRE | part: both roles review it; not yet seen in a real run |
-| 9 | Change to the pipeline (`.github/workflows/`) | SRE | no: a person merges it |
+| 9 | Change to the pipeline (`.github/workflows/`) | SRE | part: the gate merges it with the agents' token; not yet seen in a real run |
 | 10 | Pull request behind the base branch or in conflict | developer | part: only for the dependency bot |
 | 11 | Stalled pull request (forgotten draft, author gone) | — | part: closed only when it has no verdict |
 | 12 | Pull request from a fork (no secrets) | security | no: never tried |
