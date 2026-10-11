@@ -39,6 +39,10 @@ class TestTheScoreComesFromFacts:
         assert lib.risk_score(files, 5000)[0] == 10
         assert lib.risk_score(["app/a.py", "app/b.py", "app/c.py"], 150)[0] == 4      # 1 + size 2 + spread 1
 
+    def test_three_areas_raise_the_score_but_staying_in_one_does_not(self):
+        assert lib.risk_score(["a/x.py", "a/y.py", "a/z.py"], 10)[0] == 2
+        assert lib.risk_score(["a/x.py", "b/y.py", "c/z.py"], 10)[0] == 3
+
 
 def result(ask: bool) -> dict:
     return {"outcome": "clean", "commits": 0, "final_sha": SHA, "notes": [], "rounds": [],
