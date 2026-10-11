@@ -190,3 +190,17 @@ def test_the_writer_is_shown_the_code_a_finding_points_at(tmp_path, monkeypatch)
     text = lib.findings_for_writer([finding, lib.Finding("high", "gone.py", 3, "bug", "e", "p", "s", ["r"])])
     assert "1355| line_1355 = 1355" in text and "1340| line_1340" in text and "1370| line_1370" in text
     assert "line_1339 " not in text and "gone.py" in text          # a missing file is still reported, without code
+
+
+def test_the_architect_informs_and_never_sends_a_change_back():
+    class Caller:
+        max_chars = 1000
+
+        def call(self, role, system, user):
+            if role == "reviewer-architect":                # two findings: the rule holds for each, not for the first
+                return fence({"findings": [finding(severity="low", problem="naming"), finding(file="c.py", severity="high", problem="layering")]})
+            return fence({"findings": [finding(file="b.py", problem="wrong result")] if role == "reviewer-correctness" else []})
+    diff = DIFF + DIFF.replace("a.py", "b.py") + DIFF.replace("a.py", "c.py")
+    found, _ = ap.review_diff(Caller(), diff, None)
+    assert {f.file: f.severity for f in found} == {"a.py": "low", "b.py": "high", "c.py": "medium"}
+    assert [f.file for f in found if f.blocking] == ["b.py"]      # the other roles still send a change back

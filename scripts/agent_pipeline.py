@@ -176,10 +176,14 @@ def review_diff(caller: lib.ModelCaller, diff: str, plan: dict | None,
     # declared order, so the deduplication (and the report) do not depend on who finished first.
     with ThreadPoolExecutor(max_workers=max(1, len(reviewers))) as pool:
         results = list(pool.map(one, reviewers))
-    for reply in results:
+    for name, reply in zip(reviewers, results):
         if reply is None:
             return None
         found, notes = reply
+        if name == "reviewer-architect":
+            # The architect informs. Twice in its first hours it sent a change back over a rule of the
+            # project that the change was entitled to touch, and the change ended abandoned.
+            found = [dataclasses.replace(f, severity="medium") if f.blocking else f for f in found]
         if awareness is not None:
             awareness += [n for n in notes if n not in awareness]
         kept, dropped = lib.validate_findings(found, ranges)
