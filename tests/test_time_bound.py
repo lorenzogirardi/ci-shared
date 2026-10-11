@@ -29,10 +29,11 @@ def test_every_call_writes_one_line_with_its_time_and_cost(tmp_path, capsys):
     assert "model call 001 reviewer-sre:" in out and "7 output tokens" in out and "$0.0100" in out
 
 
-def test_the_correctness_reviewer_is_asked_to_answer_with_no_thinking(tmp_path):
+def test_the_correctness_and_security_reviewers_are_asked_to_answer_with_no_thinking(tmp_path):
     echo = "import sys\nprint('--no-reasoning' in sys.argv)\n"
     assert caller(tmp_path, echo).call("reviewer-correctness", "s", "u").strip() == "True"
-    assert caller(tmp_path, echo).call("reviewer-security", "s", "u").strip() == "False"
+    assert caller(tmp_path, echo).call("reviewer-security", "s", "u").strip() == "True"
+    assert caller(tmp_path, echo).call("reviewer-sre", "s", "u").strip() == "False"
 
 
 def test_a_call_that_does_not_answer_is_stopped(tmp_path, capsys, monkeypatch):
