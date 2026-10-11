@@ -67,8 +67,9 @@ These exist in the consumer today. They are the evidence; use them before anythi
 | Developer | `writer`, `reviewer-correctness`, `final-reviewer` | in the graph |
 
 The four reviewers (`reviewer-correctness`, `reviewer-security`, `reviewer-sre`, `reviewer-architect`) run in
-parallel and independently. A critical or high finding on a changed line goes back to the developer agent;
-the rest is a note. The architect only informs: its findings are always notes.
+parallel and independently. A critical or high finding on a changed line goes back to the developer agent,
+once; the rest is a note, and so is what remains after that one fix. A reviewer's finding never ends a
+change whose checks pass (rule 4). The architect only informs: its findings are always notes.
 
 | QA tester | `test-steward`, `failure-adjudicator` | in the graph |
 | Doc writer | `doc-reviewer` | in the graph |

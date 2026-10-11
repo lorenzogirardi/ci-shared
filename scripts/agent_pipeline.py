@@ -56,6 +56,7 @@ BRANCH_PREFIX = "agent/issue-"
 # The roles that review a change, independent and in parallel: a second developer (correctness),
 # security, the SRE and the architect. The QA tester and the doc writer are nodes of their own.
 REVIEWERS = ("reviewer-correctness", "reviewer-security", "reviewer-sre", "reviewer-architect")
+REVIEW_FEEDBACK = "REVIEW FINDINGS"      # how the writer is told its task comes from the review
 # Roles that are shown what the pipeline's tools reported (scans, deploy), next to the diff.
 EVIDENCE_ROLES = frozenset({"reviewer-security", "reviewer-sre"})
 PLANNER_ROUNDS = 6
@@ -463,6 +464,12 @@ def build_graph(rt: Runtime):
 
     def n_write(state: RunState) -> dict:
         applied, text = run_writer(rt, state["plan"], state.get("feedback", ""))
+        if applied is None and state.get("feedback", "").startswith(REVIEW_FEEDBACK):
+            # Asked by the review, right after checks that passed, and nothing was changed since: the
+            # change works as it is. It goes on with the findings written in the review.
+            return {"route": "docs", "notes": state.get("notes", []) + [
+                f"writer: {text}", "the developer agent produced no fix for the review's findings; the checks pass, "
+                                   "so the findings are reported and the change goes on"]}
         if applied is None:
             reportable = state.get("committed") or state.get("rounds")
             return stop(state, "escalated" if reportable else "failed", f"writer: {text}")
@@ -703,22 +710,24 @@ def build_graph(rt: Runtime):
             "iteration": state["iteration"], "stage": label,
             "findings": [f.to_dict() for f in findings], "dropped": len(dropped),
         }]
-        if not blocking:
+        if not blocking or state["iteration"] > 1:
+            # A reviewer asks for a fix once. What it still finds after that is written in the review and
+            # the change goes on: failing checks end a change, a reviewer's finding does not. Changes whose
+            # checks passed were abandoned over findings the developer agent had not resolved.
+            left = ([f"{len(blocking)} finding(s) of the review remain after the developer agent's one fix; the checks "
+                     "pass, so they are reported and the change goes on"] if blocking else [])
             # A final review certifies the agent's own changes to the code; if it made none (a clean PR
             # or push), the first review already was the verdict. Tests the steward added are not a reason
             # for it: they are in the diff the four reviewers have just read, and the checks ran them. A
             # final review of such a change once took 271 seconds to read it a second time.
             skip_final = label == "final" or not state.get("code_committed")
             return {"route": "docs" if skip_final else "final", "rounds": rounds,
-                    "notes": state.get("notes", []) + scope_note}
-        if state["iteration"] >= rt.max_iterations:
-            return {**stop(state, "escalated", f"{len(blocking)} blocking finding(s) remain after {state['iteration']} iteration(s)"),
-                    "rounds": rounds}
+                    "notes": state.get("notes", []) + scope_note + left}
         return {
             "route": "write", "rounds": rounds, "iteration": state["iteration"] + 1,
             "prior_blocking": state.get("prior_blocking", []) + [f.to_dict() for f in blocking],
             "notes": state.get("notes", []) + scope_note,
-            "feedback": "REVIEW FINDINGS to fix (each is blocking; fix exactly these, minimally):\n"
+            "feedback": REVIEW_FEEDBACK + " to fix (each is blocking; fix exactly these, minimally):\n"
                         + lib.findings_for_writer(blocking),
         }
 
@@ -798,7 +807,7 @@ def build_graph(rt: Runtime):
     graph.add_conditional_edges("ci_failure", route, {"write": "write", "steward": "steward", "verify": "verify", "end": END})
     graph.add_conditional_edges("steward", route, {"verify": "verify", "write": "write", "end": END})
     graph.add_conditional_edges("tests", route, {"verify": "verify", "review": "review", "end": END})
-    graph.add_conditional_edges("write", route, {"verify": "verify", "write": "write", "end": END})
+    graph.add_conditional_edges("write", route, {"verify": "verify", "write": "write", "docs": "docs", "end": END})
     graph.add_conditional_edges("verify", route, {"review": "review", "tests": "tests", "write": "write", "steward": "steward",
                                                   "verify": "verify", "end": END})
     graph.add_conditional_edges("review", route, {"final": "final", "docs": "docs", "write": "write", "end": END})
@@ -1232,13 +1241,17 @@ def build_change_comment(result: dict, pushed_ok: bool | None) -> str:
     sha = result.get("final_sha", "")
     certified = outcome in ("clean", "converged") and pushed_ok is not False and bool(sha)
     last_note = (result.get("notes") or ["no detail"])[-1].splitlines()[0][:300]
+    left = sum(1 for f in result.get("findings") or [] if f["severity"] in lib.BLOCKING)
     status = {
-        "clean": "No blocking findings, and the deterministic checks pass. Nothing was changed.",
-        "converged": f"The agent fixed this and {'pushed' if pushed_ok else 'could not push'} {n} commit(s) to the branch. "
-                     "Checks and every review pass.",
+        "clean": ("The" if left else "No blocking findings, and the") + " deterministic checks pass. Nothing was changed.",
+        "converged": f"The agent {'worked on' if left else 'fixed'} this and {'pushed' if pushed_ok else 'could not push'} "
+                     f"{n} commit(s) to the branch. " + ("The checks pass." if left else "Checks and every review pass."),
         "abandoned": f"**The agent abandoned this change** after a second attempt with twice the budget ({last_note}). "
                      "Nothing was merged and the base branch is untouched.",
     }.get(outcome, outcome)
+    if left and outcome in ("clean", "converged"):
+        status += (f" {left} finding(s) of the review were not resolved: they are below for the people responsible for "
+                   "the project, and did not hold the change, because it works.")
     if certified:
         status += f" **Certified at `{sha[:7]}`**: it merges automatically once its CI is green."
     abandoned_head = result.get("head_sha", "") if outcome == "abandoned" else ""

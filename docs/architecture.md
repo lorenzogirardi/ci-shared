@@ -78,10 +78,11 @@ flowchart TD
     C -->|code is wrong| W
     C -->|test is wrong| ST
     C -->|environment| V
-    R -->|blocking findings| W
+    R -->|blocking findings, first time| W
+    R -->|findings left after the one fix| D
     R -->|clean, nothing changed| D[docs]
     R -->|clean, agent changed code| F[final]
-    F -->|blocking findings| W
+    F -->|blocking findings, first time| W
     F -->|clean| D
     D --> E([END])
 ```
@@ -100,8 +101,13 @@ flowchart TD
 Every node writes a `route` into the state. The graph runs once; if it does not converge it runs once
 more with twice the budget (`RETRY_BOOST`), continuing from what the first attempt committed. After
 that the outcome is `abandoned`. A second attempt that follows a review left without an answer starts at the
-review, not at the checks, and asks only the reviewers that gave none. Loops are bounded by `max_iterations`, `max_verify_retries` and
+review, not at the checks, and asks only the reviewers that gave none. Loops are bounded by `max_verify_retries` and
 `writer_rounds`.
+
+**A reviewer asks once and never ends a change.** A critical or high finding goes to the developer agent one
+time. What the reviewers still find after that fix, or when the developer agent could write none, is
+reported in the comment with its severity and the change goes on to be certified: what ends a change is
+checks that fail. A reviewer that gives no usable answer still stops the certification.
 
 ### How an agent's reply is used
 
@@ -306,7 +312,8 @@ These are the reasons behind choices that otherwise look arbitrary.
 - **`openrouter_ai.py`**: stdlib only. Reads its configuration from the environment, prints only the
   model's reply. It redacts the key and secret-shaped strings from everything it prints, truncates
   oversized prompts with a marker, gives a reasoning model's thinking its own allowance
-  (`reasoning.max_tokens`, 6,000 by default) so the answer keeps its budget, asks again once, with the same
+  (`reasoning.max_tokens`, 6,000 by default) so the answer keeps its budget, or none at all with
+  `--no-reasoning` (the roles in `ModelCaller.NO_REASONING`: the correctness reviewer), asks again once, with the same
   budget, when a reply comes back empty, and writes the tokens and estimated cost of every attempt to
   `--usage-file`.
 - **`ai_sanitize.py`**: bundles files into a prompt with secrets redacted and a size cap, or masks
