@@ -306,8 +306,8 @@ These are the reasons behind choices that otherwise look arbitrary.
 - **`openrouter_ai.py`**: stdlib only. Reads its configuration from the environment, prints only the
   model's reply. It redacts the key and secret-shaped strings from everything it prints, truncates
   oversized prompts with a marker, gives a reasoning model's thinking its own allowance
-  (`reasoning.max_tokens`, 6,000 by default) so the answer keeps its budget, retries an empty reply with
-  at most four times the first budget, and writes the tokens and estimated cost of every attempt to
+  (`reasoning.max_tokens`, 6,000 by default) so the answer keeps its budget, asks again once, with the same
+  budget, when a reply comes back empty, and writes the tokens and estimated cost of every attempt to
   `--usage-file`.
 - **`ai_sanitize.py`**: bundles files into a prompt with secrets redacted and a size cap, or masks
   secret patterns in a finished report.

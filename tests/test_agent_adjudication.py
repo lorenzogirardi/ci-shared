@@ -382,6 +382,8 @@ class TestProactiveSteward:
         assert final["outcome"] == "converged" and pathlib.Path("tests/test_sub.py").is_file()
         assert any(s.startswith("test(agent)") for s in subjects(repo))
         assert not any("also pass without the change" in n for n in final["notes"])   # it fails on the base: it tests the change
+        # The steward's tests are in the diff the reviewers read: nobody reads the change a second time for them.
+        assert "final-reviewer" not in [role for role, _ in caller.log]
 
     def test_a_trivially_passing_new_test_is_called_out(self, repo):
         pathlib.Path("calc.py").write_text(GOOD + "\n\ndef sub(a, b):\n    return a - b\n")

@@ -291,6 +291,7 @@ class RunState(TypedDict, total=False):
     spec_violations: int
     awareness: list          # what the roles noted about the tools' evidence: reported, never acted on
     resume: str              # the node a second attempt starts from, when the first one ended there
+    code_committed: bool     # an agent committed something other than tests
 
 
 def is_doc_path(path: str) -> bool:
@@ -559,12 +560,13 @@ def build_graph(rt: Runtime):
         raw = state.get("applied")
         applied = lib.Applied(raw["edited"], raw["created"]) if raw else None
         if ok:
+            kind = state.get("applied_kind") or (rt.fix_kind if state["iteration"] == 1 else "fix")
             if applied:
-                kind = state.get("applied_kind") or (rt.fix_kind if state["iteration"] == 1 else "fix")
                 commit_round(f"{kind}(agent): {state['explanation'][:120]}\n\nIteration {state['iteration']} of the agent pipeline.")
             needs_tests = rt.write_tests and state.get("tests_done") != state["iteration"]
             return {"route": "tests" if needs_tests else "review",
                     "committed": bool(applied) or state.get("committed", False),
+                    "code_committed": (bool(applied) and kind != "test") or state.get("code_committed", False),
                     "verify_attempts": 0, "applied": None, "applied_kind": None, "own_tests": "", "spec_tests": []}
         if state.get("own_tests") and applied:
             # The steward has just written or rewritten these tests and they fail: they assert something the
@@ -702,9 +704,11 @@ def build_graph(rt: Runtime):
             "findings": [f.to_dict() for f in findings], "dropped": len(dropped),
         }]
         if not blocking:
-            # A final review certifies the agent's own changes; if it made none
-            # (a clean PR or push), the first review already was the verdict.
-            skip_final = label == "final" or not state.get("committed")
+            # A final review certifies the agent's own changes to the code; if it made none (a clean PR
+            # or push), the first review already was the verdict. Tests the steward added are not a reason
+            # for it: they are in the diff the four reviewers have just read, and the checks ran them. A
+            # final review of such a change once took 271 seconds to read it a second time.
+            skip_final = label == "final" or not state.get("code_committed")
             return {"route": "docs" if skip_final else "final", "rounds": rounds,
                     "notes": state.get("notes", []) + scope_note}
         if state["iteration"] >= rt.max_iterations:
@@ -889,6 +893,7 @@ def invoke_with_retry(make_runtime, initial: dict) -> dict:
             state.update({
                 "notes": final.get("notes", []) + ["attempt 1 did not converge; retrying once with twice the budget"],
                 "rounds": final.get("rounds", []), "committed": final.get("committed", False),
+                "code_committed": final.get("code_committed", False),
                 "prior_blocking": final.get("prior_blocking", []), "adjudications": final.get("adjudications", []),
                 "feedback": "THE PREVIOUS ATTEMPT DID NOT CONVERGE. What happened:\n" + "\n".join(final.get("notes", [])[-5:]),
             })

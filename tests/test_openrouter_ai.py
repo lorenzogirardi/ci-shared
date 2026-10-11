@@ -248,9 +248,9 @@ def test_the_allowance_can_be_set_or_switched_off(mock_server):
     assert "reasoning" not in body and body["max_tokens"] == 1000
 
 
-def test_empty_attempts_are_counted_in_the_cost_and_the_retry_budget_is_capped(mock_server, tmp_path):
-    """The attempts that came back with thinking and no answer were paid for and never reported; and each
-    retry doubled the budget, up to 65,536 tokens."""
+def test_an_empty_reply_is_asked_again_once_with_the_same_budget_and_both_are_counted(mock_server, tmp_path):
+    """The attempts that came back with thinking and no answer were paid for and never reported; and three
+    retries, each with twice the budget, made one answer take minutes."""
     MockHandler.response_body = (b'{"choices":[{"message":{"content":"","reasoning_content":"thinking..."}}],'
                                  b'"usage":{"prompt_tokens":10,"completion_tokens":100,"total_tokens":110}}')
     usage_file = tmp_path / "usage.json"
@@ -258,9 +258,9 @@ def test_empty_attempts_are_counted_in_the_cost_and_the_retry_budget_is_capped(m
                         "--usage-file", str(usage_file), env={"STDIN": "hi"})
     assert result.returncode == 0                       # falls back to the reasoning text, as before
     budgets = [r["body"]["max_tokens"] for r in MockHandler.requests]
-    assert budgets == [1000, 2000, 4000, 4000]          # doubled, then capped at four times the first
+    assert budgets == [1000, 1000]                      # asked again once, with no more room to think
     usage = json.loads(usage_file.read_text())
-    assert usage["completion_tokens"] == 400 and usage["prompt_tokens"] == 40    # four attempts, all counted
+    assert usage["completion_tokens"] == 200 and usage["prompt_tokens"] == 20    # both attempts counted
 
 
 def test_usage_adds_up_every_attempt(mock_server, tmp_path):
