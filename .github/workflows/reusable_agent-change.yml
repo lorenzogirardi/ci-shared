@@ -113,7 +113,9 @@ permissions: {}
 jobs:
   change:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # The engine ends a run by itself after 15 minutes (--time-budget-minutes), with a verdict. This is
+    # the hard stop behind it: Actions minutes are limited, and no run is worth more than this.
+    timeout-minutes: 25
     permissions:
       contents: read
       pull-requests: write

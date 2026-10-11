@@ -75,11 +75,18 @@ class ModelCaller:
     particular not the verify_command, see run_verify_isolated().
     """
 
+    # One role's answer never takes longer than this, whatever the model does. The request timeout
+    # alone does not guarantee it: it is per read, and a model that keeps the connection alive while it
+    # thinks, then gets retried on an empty reply, once held one review for more than twenty minutes.
+    CALL_SECONDS = 300
+
     def __init__(self, ai_script: str, *, max_chars: int = 140_000, timeout: int = 180,
                  work_dir: str = ".ai/agents") -> None:
         self.ai_script = ai_script
         self.max_chars = max_chars
         self.timeout = timeout
+        self.deadline: float | None = None   # time.time() after which no model is called any more
+        self.out_of_time = False             # a call was refused or cut for that reason
         self.work_dir = pathlib.Path(work_dir)
         self.calls = 0
         self.usage: list[dict] = []
@@ -95,17 +102,31 @@ class ModelCaller:
         usage_path = stem.with_suffix(".usage.json")
         system_path.write_text(system)
         user_path.write_text(user)
-        proc = subprocess.run(
-            [sys.executable, self.ai_script,
-             "--system-file", str(system_path), "--prompt-file", str(user_path),
-             "--max-chars", str(self.max_chars), "--timeout", str(self.timeout),
-             "--usage-file", str(usage_path)],
-            capture_output=True, text=True,
-        )
+        allowed = self.CALL_SECONDS if self.deadline is None else min(self.CALL_SECONDS, self.deadline - time.time())
+        if allowed <= 0:
+            self.out_of_time = True
+            print(f"model call {number:03d} {role}: not made, the run is out of time", flush=True)
+            return None
+        started = time.time()
+        try:
+            proc = subprocess.run(
+                [sys.executable, self.ai_script,
+                 "--system-file", str(system_path), "--prompt-file", str(user_path),
+                 "--max-chars", str(self.max_chars), "--timeout", str(self.timeout),
+                 "--usage-file", str(usage_path)],
+                capture_output=True, text=True, timeout=allowed,
+            )
+        except subprocess.TimeoutExpired:
+            self.out_of_time = self.out_of_time or allowed < self.CALL_SECONDS
+            print(f"model call {number:03d} {role}: stopped after {allowed:.0f}s without an answer", flush=True)
+            return None
+        seconds = time.time() - started
         if proc.returncode != 0:
+            print(f"model call {number:03d} {role}: failed after {seconds:.0f}s", flush=True)
             print(f"::warning::model call for role {role!r} failed: {proc.stderr.strip()[:400]}", file=sys.stderr)
             return None
         stem.with_suffix(".reply.txt").write_text(proc.stdout)
+        record: dict = {}
         if usage_path.is_file():
             try:
                 record = {"role": role, **json.loads(usage_path.read_text())}
@@ -113,6 +134,9 @@ class ModelCaller:
                     self.usage.append(record)
             except (ValueError, OSError):
                 pass
+        # One line per call, as it happens: a run that says nothing for minutes cannot be told from one that hangs.
+        print(f"model call {number:03d} {role}: {seconds:.0f}s, {record.get('completion_tokens', '?')} output tokens, "
+              f"${float(record.get('cost_usd') or 0):.4f}", flush=True)
         return proc.stdout
 
     def total_cost_usd(self) -> float:
