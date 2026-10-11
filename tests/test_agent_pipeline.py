@@ -53,6 +53,8 @@ class FakeCaller:
         if not queue:
             # A test that says nothing about the steward is not about the steward: it finds the tests fine.
             # (A steward that really returns nothing blocks the certification; see TestAgentFailureBlocks.)
+            if role in ("reviewer-sre", "reviewer-architect"):
+                return fence({"findings": []})      # a test that says nothing about these roles is not about them
             return fence({"explanation": "the existing tests cover this change", "changes": []}) if role == "test-steward" else None
         return queue.pop(0) if len(queue) > 1 else queue[0]
 

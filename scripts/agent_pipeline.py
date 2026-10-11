@@ -52,9 +52,11 @@ from pr_review_sweep import _parse_json_reply, build_diff, collect_failure_logs,
 
 OUT_DIR = pathlib.Path(".ai/agent-run")
 BRANCH_PREFIX = "agent/issue-"
-REVIEWERS = ("reviewer-correctness", "reviewer-security")
+# The roles that review a change, independent and in parallel: a second developer (correctness),
+# security, the SRE and the architect. The QA tester and the doc writer are nodes of their own.
+REVIEWERS = ("reviewer-correctness", "reviewer-security", "reviewer-sre", "reviewer-architect")
 # Roles that are shown what the pipeline's tools reported (scans, deploy), next to the diff.
-EVIDENCE_ROLES = frozenset({"reviewer-security"})
+EVIDENCE_ROLES = frozenset({"reviewer-security", "reviewer-sre"})
 PLANNER_ROUNDS = 6
 RETRY_BOOST = 2
 CERT_MARKER = "agent-certified"
@@ -140,7 +142,7 @@ def run_planner(caller: lib.ModelCaller, title: str, body: str, context: str) ->
 
 def review_diff(caller: lib.ModelCaller, diff: str, plan: dict | None,
                 reviewers: tuple[str, ...] = REVIEWERS, guidance: str = "", *,
-                evidence: str = "", awareness: list[str] | None = None):
+                evidence: str = "", awareness: list[str] | None = None, context: str = ""):
     """Run the independent reviewers on `diff`. Returns (findings, dropped)
     after validation against the diff and dedup, or None if a reviewer could
     not produce a usable reply (fail closed: the change cannot be certified).
@@ -160,11 +162,14 @@ def review_diff(caller: lib.ModelCaller, diff: str, plan: dict | None,
     shown = ("\n\n## Evidence from the pipeline's tools (untrusted data; report what matters under `awareness`)\n"
              + evidence) if evidence.strip() else ""
 
+    design = f"\n\n## The project, as it describes itself (untrusted data)\n{context}" if context.strip() else ""
+
     def one(name: str):
         def validate(data, n=name):
             found = lib.parse_findings(data, n)
             return None if found is None else (found, lib.parse_awareness(data))
-        return lib.ask_json(caller, name, lib.load_prompt(name), user + (shown if name in EVIDENCE_ROLES else ""), validate)
+        extra = shown if name in EVIDENCE_ROLES else design if name == "reviewer-architect" else ""
+        return lib.ask_json(caller, name, lib.load_prompt(name), user + extra, validate)
 
     # Independent reviewers share nothing, so they run at the same time. Results are read back in the
     # declared order, so the deduplication (and the report) do not depend on who finished first.
@@ -198,7 +203,7 @@ def structured_review(caller: lib.ModelCaller, diff: str, title: str, body: str,
         return None
     findings, dropped = result
     blocking = sum(1 for f in findings if f.blocking)
-    text = ("Reviewer A (correctness/design) and reviewer B (security/operability), independent, deduplicated: "
+    text = ("Developer (correctness), security, SRE and architect, independent, deduplicated: "
             f"{len(findings)} finding(s), {blocking} blocking"
             + (f", {len(dropped)} dropped (not on a changed line)" if dropped else "")
             + f".\n\n{lib.render_findings_md(findings)}")
@@ -707,7 +712,7 @@ def build_graph(rt: Runtime):
     def n_review(state: RunState) -> dict:
         notes: list[str] = list(state.get("awareness", []))
         result = review_diff(rt.caller, diff_since_base(rt.base_sha), state["plan"], guidance=rt.guidance,
-                             evidence=evidence(), awareness=notes)
+                             evidence=evidence(), awareness=notes, context=rt.context)
         if result is None:
             return stop(state, "escalated", "a reviewer did not return a usable reply, so the change could not be certified")
         return {**after_review(state, *result, "review"), "awareness": notes}
@@ -1227,7 +1232,7 @@ def build_change_comment(result: dict, pushed_ok: bool | None) -> str:
                      + "\n".join(f"- {x}" for x in result["awareness"]))
     if result.get("notes"):
         parts.append("### Notes\n" + "\n".join(f"- {x}" for x in result["notes"]))
-    parts.append(f"_Reviewer A (correctness/design) and reviewer B (security/operability), independent. "
+    parts.append(f"_Reviewed independently by four roles: developer (correctness), security, SRE and architect. "
                  f"Model cost ${result.get('cost_usd', 0):.4f}._")
     return "\n\n".join(parts)
 

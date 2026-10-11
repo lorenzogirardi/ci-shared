@@ -192,7 +192,8 @@ class FakeCaller:
         self.log.append((role, user))
         queue = self.replies.get(role)
         if not queue:
-            return None
+            # A test that says nothing about the SRE or the architect is not about them: they find nothing.
+            return fence({"findings": []}) if role in ("reviewer-sre", "reviewer-architect") else None
         return queue.pop(0) if len(queue) > 1 else queue[0]
 
     def total_cost_usd(self):

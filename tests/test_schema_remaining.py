@@ -49,7 +49,7 @@ class TestParallelReviewers:
                 return fence({"findings": [finding(line=1 if role == "reviewer-correctness" else 2, problem=f"by {role}", severity="medium")]})
         found, _ = ap.review_diff(Caller(), DIFF, None)
         assert len(found) == 1                                                   # same place, same topic: merged
-        assert found[0].reviewers == ["reviewer-correctness", "reviewer-security"]   # declared order, not finishing order
+        assert found[0].reviewers == list(ap.REVIEWERS)                          # declared order, not finishing order
 
     def test_one_unusable_reviewer_still_fails_closed(self):
         class Caller:
@@ -100,7 +100,7 @@ class FakeCaller:
         self.log.append((role, user))
         queue = self.replies.get(role)
         if not queue:
-            return None
+            return fence({"findings": []}) if role in ("reviewer-sre", "reviewer-architect") else None
         return queue.pop(0) if len(queue) > 1 else queue[0]
 
     def total_cost_usd(self):

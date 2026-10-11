@@ -36,7 +36,8 @@ merged · abandoned · reverted        + warnings and every role's verdict visib
 | Step | What | Where | Seen in a real run |
 |---|---|---|---|
 | 1 | Trivy, Checkov, TruffleHog and the deploy state on every pull request, as warnings and `ai-context-*` artifacts; TruffleHog on `main` | flask #262 | yes: four artifacts, Checkov warning, all required checks green |
-| 2 | The engine downloads those artifacts at the first review; `reviewer-security` reads them and reports under "Awareness (not blocking)" | ci-shared (this change) | not yet |
+| 2 | The engine downloads those artifacts at the first review; `reviewer-security` reads them and reports under "Awareness (not blocking)" | ci-shared #48 | yes: the canary's pull requests carry the section, quoting Checkov, Trivy and the deploy |
+| 3 | `reviewer-sre` and `reviewer-architect` added to the reviewers of the graph | ci-shared (this change) | not yet |
 
 ## Notes from reading the engine
 
@@ -63,7 +64,7 @@ Each item is one pull request, proven by the canary before the next one starts.
    blocking)" in the pull request comment; it never holds the change.
 3. **SRE and architect as reviewers** (engine). Two prompts, `reviewer-sre` (build, deploy, health,
    with the evidence) and `reviewer-architect` (fit with the design, with the context files), added to
-   the reviewers of the graph. `planner.md` removed.
+   the reviewers of the graph. `planner.md` stays: it belongs to the issue flow, which is out for now.
 4. **Risk level** (engine, optional for the consumer). Input `risk_level` 1-10, default 1.
    1 = never asks; 10 = always asks for confirmation; in between, asks when the change's risk score
    (computed from facts: files touched, size, areas, tool findings) is at least `11 - risk_level`.
