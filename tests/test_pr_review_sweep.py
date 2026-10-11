@@ -7,6 +7,7 @@ a PR the model flagged, or blocks one it cleared. No network, no `gh`.
 import pathlib
 import subprocess
 import sys
+import types
 
 import pytest
 
@@ -525,17 +526,15 @@ class TestWorkflowFileMerge:
         self._fake_diff(monkeypatch, [], returncode=1)
         assert touches_workflow_files("o/r", 1) is False
 
-    def test_try_merge_skips_workflow_file_prs_without_checking_ci(self, monkeypatch):
+    def test_a_change_to_a_workflow_file_is_merged_like_any_other_when_ci_is_green(self, monkeypatch):
+        """It used to be refused before any check: the agents' token could not merge it. The owner gave the
+        token that permission on 2026-10-11, so a change to the pipeline is gated by CI like any other."""
         monkeypatch.setattr(pr_review_sweep, "touches_workflow_files", lambda repo, number: True)
-
-        def fail_if_called(*a, **k):
-            raise AssertionError("must not check CI or attempt a merge for a workflow-file PR")
-
-        monkeypatch.setattr(pr_review_sweep, "checks_state", fail_if_called)
-        monkeypatch.setattr(pr_review_sweep, "run", fail_if_called)
-
-        outcome = try_merge("o/r", 1, "sha", "squash")
-        assert outcome == "workflow-file"
+        monkeypatch.setattr(pr_review_sweep, "checks_state", lambda *a, **k: ("green", "all passed"))
+        calls = []
+        monkeypatch.setattr(pr_review_sweep, "run", lambda cmd, **k: calls.append(cmd) or types.SimpleNamespace(returncode=0, stdout="", stderr=""))
+        assert try_merge("o/r", 1, "sha", "squash") == "merged"
+        assert any(cmd[:3] == ["gh", "pr", "merge"] for cmd in calls)
 
     def test_workflow_file_outcome_reads_as_clean_but_unmerged(self):
         body = comment_body("h", "x", "c" * 40, is_clean=True, merge_outcome="workflow-file")

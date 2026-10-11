@@ -1055,10 +1055,6 @@ def try_merge(repo: str, number: int, head_sha: str, method: str,
     whether the code still installs and serves requests, and two bumps it
     waved through as clean broke main precisely there.
     """
-    if touches_workflow_files(repo, number):
-        print(f"Not merging PR #{number}: touches .github/workflows/ — the dependency bot merges those itself.")
-        return "workflow-file"
-
     if poll_seconds:
         state, detail = wait_for_settled_checks(repo, head_sha, required, poll_seconds, poll_interval)
     else:
