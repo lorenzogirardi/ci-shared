@@ -48,7 +48,7 @@ on:
         type: boolean
         default: false
       workflow_prs_to_bot:
-        description: 'A PR that touches .github/workflows/ is left to the dependency bot (it merges it itself once the required checks pass) and is abandoned if its checks fail on current code. The agents cannot edit those files.'
+        description: 'A PR that touches .github/workflows/ is abandoned if its checks fail on current code. Otherwise it is reviewed like any other, and merged by the dependency bot itself once the checks pass, the commit status `agent-review` written by the review included (the caller grants `statuses: write`). The agents cannot edit those files or merge the PR.'
         required: false
         type: boolean
         default: false
@@ -171,6 +171,7 @@ jobs:
     permissions:
       contents: write        # only used when auto_merge is on
       pull-requests: write   # post/update the review comment
+      statuses: write        # the review verdict on a PR the dependency bot merges itself
     env:
       OPENROUTER_API_KEY: ${{ secrets.openrouter_api_key }}
       OPENROUTER_MODEL: ${{ inputs.openrouter_model }}

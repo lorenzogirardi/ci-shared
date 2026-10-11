@@ -212,8 +212,11 @@ flowchart LR
 1. **Behind the base branch** (counted from the commits through the compare API, ignoring bookkeeping
    commits): the bot is asked to rebase its own branch (label `rebase`), and the pull request is
    judged after its CI has run on current code.
-2. **Touches `.github/workflows/`** (`workflow_prs_to_bot`): left to the bot's own automerge, which
-   has the permission; abandoned if its checks are red on current code.
+2. **Touches `.github/workflows/`** (`workflow_prs_to_bot`): abandoned if its checks are red on
+   current code. Otherwise it is reviewed like any other (steps 3 and 4) and the agents repair what
+   is outside the workflow files; only the merge is left to the bot's own automerge, which has the
+   permission. The verdict is written as the commit status `agent-review` (pending, success,
+   failure), so the bot, which merges only when every check is green, waits for it.
 3. **CI red**: the engine is started at `ci_failure` with the failing logs, with guidance for a
    dependency migration (fix the call site rather than the pin; grep for every use of a renamed
    symbol). The push token is taken out of `.git/config` while the pull request's code runs.
@@ -263,8 +266,8 @@ Step 2 exists because unit tests do not show what a model does with a real pull 
 
 Pull requests to this repository go through the same loop (`agent-change.yml`,
 `agent-ci-failure.yml`, `agent-merge.yml`), with the agents running at the released tag, never at
-the pull request's own code. What stays with a person: a pull request that touches
-`.github/workflows/`, and a breaking change that needs a new tag.
+the pull request's own code. What stays with a person: a finding inside `.github/workflows/` itself, which no agent may edit, and a
+breaking change that needs a new tag.
 
 ## Constraints of GitHub Actions that shape the design
 
