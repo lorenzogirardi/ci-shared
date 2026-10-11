@@ -50,8 +50,9 @@ These exist in the consumer today. They are the evidence; use them before anythi
 | pytest (integration) | PR `integration` | behaviour with PostgreSQL and Redis | yes (check result, logs) |
 | docker build + kind + helm deploy | PR `image`, `main` `k8s-check` | the image builds, deploys, becomes ready | result only |
 | actionlint | PR `workflows` | workflow files are valid | result only |
-| Trivy (image, CRITICAL) | `main` only, never fails; warning and run summary | known vulnerabilities in the image | **no** |
-| Checkov (helm, SARIF) | `main` only, never fails; warning and run summary | misconfiguration of the chart | **no** |
+| Trivy (image, CRITICAL) | PR `image`, `main`; never fails; warning and run summary | known vulnerabilities in the image | yes, as awareness |
+| Checkov (helm, SARIF) | PR `awareness`, `main`; never fails; warning and run summary | misconfiguration of the chart | yes, as awareness |
+| TruffleHog | PR `awareness`, `main` `secrets`; never fails; warning and run summary | secrets in the commits (found or not, never the value) | yes, as awareness |
 | SBOM (anchore) | `main` only, never fails | what the image contains | **no** |
 
 ## Roles and nodes: where we are
@@ -61,7 +62,7 @@ These exist in the consumer today. They are the evidence; use them before anythi
 | Developer | `writer`, `reviewer-correctness`, `final-reviewer` | in the graph |
 | QA tester | `test-steward`, `failure-adjudicator` | in the graph |
 | Doc writer | `doc-reviewer` | in the graph |
-| Security | `reviewer-security` | in the graph, but reads only the diff: no tool output reaches it |
+| Security | `reviewer-security` | in the graph; reads the diff and the tools' evidence (`ai-context-*` artifacts of the commit), which it reports as awareness |
 | SRE | none | missing; the build and deploy evidence exists and no agent reads it |
 | Architect | `docs-architect` (started by hand), `planner` (unused) | missing from the graph |
 
@@ -117,7 +118,7 @@ State: **yes** handled · **part** handled in part, outside the graph, or never 
 | 21 | Base image or runtime | SRE, QA | part: one source for the version, not yet seen in a real run |
 | 22 | Versions of GitHub Actions | SRE | part: reviewed, the bot's wait for `agent-review` not verified |
 | 23 | Vulnerability found in a dependency already on the main branch (no pull request exists) | security | no: Trivy sees it, nobody acts |
-| 24 | Secret committed | security | no: there is no tool for it |
+| 24 | Secret committed | security | part: TruffleHog reports it on the run and to the security role; nothing removes it |
 
 ### Release
 
@@ -155,8 +156,8 @@ architect (8, 25, 31, 37). Those are the roles the graph lacks.
 
 Each step reuses or replaces something; none adds a layer.
 
-1. Trivy and Checkov output become evidence for `reviewer-security`, which reports what they found
-   without blocking (rule 4); `ci-analysis` is removed.
+1. Done: Trivy, Checkov and TruffleHog output is evidence for `reviewer-security`, which reports what
+   they found without blocking (rule 4). Still to do: remove `ci-analysis`.
 2. An SRE node reads the build and deploy evidence of the `image` job.
 3. The architect prompt becomes a reviewer node; `planner` is removed.
 4. The dependency bot's pull requests go through the same graph; the sweep only picks the pull

@@ -93,7 +93,7 @@ flowchart TD
 | `ci_failure` | As `verify`, starting from the real logs of a failed CI run | Nothing |
 | `steward` | The test steward updates tests a verdict found wrong | Tests only |
 | `tests` | The test steward checks that changed code is covered | Tests only |
-| `review` | Reviewers A and B in parallel, validated and deduplicated | Nothing |
+| `review` | Reviewers A and B in parallel, validated and deduplicated. Reviewer B is also shown what the pipeline's tools reported for the commit (artifacts named `ai-context-*`, downloaded once, after a bounded wait for the commit's other runs) and reports it as awareness: a note in the comment, never a finding | Nothing |
 | `final` | Checks the earlier findings are fixed, looks for regressions | Nothing |
 | `docs` | Documentation reviewer, then a deterministic changelog entry | Documentation and changelog |
 
