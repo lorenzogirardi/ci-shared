@@ -106,4 +106,9 @@ class TestRetryWithMoreBudget:
         rt = runtime(start="write")
         assert ap.boosted(rt, 2, {"committed": True}).start == "verify"
         assert ap.boosted(rt, 2, {"committed": False}).start == "write"      # nothing to check yet
+
+    def test_a_review_left_without_an_answer_is_taken_up_again_not_the_whole_run(self):
+        rt = runtime(start="verify")
+        again = ap.boosted(rt, 2, {"resume": "review"})
+        assert again.start == "review" and again.answered is rt.answered      # and what was answered is kept
         assert ap.boosted(runtime(start="review"), 2, {"committed": True}).start == "review"

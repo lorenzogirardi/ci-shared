@@ -204,3 +204,20 @@ def test_the_architect_informs_and_never_sends_a_change_back():
     found, _ = ap.review_diff(Caller(), diff, None)
     assert {f.file: f.severity for f in found} == {"a.py": "low", "b.py": "high", "c.py": "medium"}
     assert [f.file for f in found if f.blocking] == ["b.py"]      # the other roles still send a change back
+
+
+def test_a_repeated_review_asks_only_the_reviewer_that_gave_no_answer():
+    class Caller:
+        max_chars = 1000
+        asked: list = []
+        silent = True
+
+        def call(self, role, system, user):
+            self.asked.append(role)
+            return None if role == "reviewer-correctness" and self.silent else fence({"findings": []})
+    caller, answered = Caller(), {}
+    assert ap.review_diff(caller, DIFF, None, answered=answered) is None      # one reviewer is silent: no verdict
+    caller.asked.clear()
+    caller.silent = False
+    assert ap.review_diff(caller, DIFF, None, answered=answered) == ([], [])
+    assert caller.asked == ["reviewer-correctness"]                            # the other three were not asked again

@@ -99,7 +99,8 @@ flowchart TD
 
 Every node writes a `route` into the state. The graph runs once; if it does not converge it runs once
 more with twice the budget (`RETRY_BOOST`), continuing from what the first attempt committed. After
-that the outcome is `abandoned`. Loops are bounded by `max_iterations`, `max_verify_retries` and
+that the outcome is `abandoned`. A second attempt that follows a review left without an answer starts at the
+review, not at the checks, and asks only the reviewers that gave none. Loops are bounded by `max_iterations`, `max_verify_retries` and
 `writer_rounds`.
 
 ### How an agent's reply is used
