@@ -22,17 +22,22 @@ Reply with ONE fenced json block and nothing else:
   "summary": "one sentence verdict",
   "findings": [
     {
-      "severity": "critical|high|medium|low",
       "file": "path as shown in the diff",
       "line": 42,
       "category": "bug|scope|contract",
       "evidence": "the exact code or fact in the diff that shows it",
       "problem": "what is wrong and why it matters",
-      "suggestion": "the smallest concrete fix"
+      "suggestion": "the smallest concrete fix",
+      "severity": "critical|high|medium|low"
     }
   ]
 }
 ```
+
+Write the fields of a finding in this order, and decide `severity` last, after
+you have written `problem`: the severity is a conclusion from what you wrote, not
+a first impression. If writing the problem showed that there is no defect, leave
+the finding out.
 
 `line` is a line number in the NEW version of the file and must fall inside a
 changed hunk. Use `critical`/`high` only for defects that must be fixed before

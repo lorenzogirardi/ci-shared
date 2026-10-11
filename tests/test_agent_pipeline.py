@@ -124,18 +124,30 @@ class TestLoop:
         assert "hello, world" in pathlib.Path("greet.py").read_text()
         assert any(s.startswith("fix(agent)") for s in commits(rt))
 
-    def test_does_not_converge_stops_at_the_limit_and_escalates(self, repo):
+    def test_a_reviewer_asks_for_a_fix_once_and_never_ends_a_change_that_works(self, repo):
         caller = FakeCaller({
             "writer": [write_change(), fence({"explanation": "tweak", "changes": [
-                {"file": "greet.py", "find": "'hello'", "replace": "'hi'"}]}),
-                fence({"explanation": "tweak", "changes": [{"file": "greet.py", "find": "'hi'", "replace": "'yo'"}]})],
+                {"file": "greet.py", "find": "'hello'", "replace": "'hi'"}]})],
             "reviewer-correctness": [blocking_finding()], "reviewer-security": [no_findings()],
+            "final-reviewer": [blocking_finding()], "doc-reviewer": [fence({"explanation": "nothing needed", "changes": []})],
         })
         rt, final = run_graph(caller, max_iterations=3)
-        assert final["outcome"] == "escalated"
-        assert any("blocking finding" in n for n in final["notes"])
-        assert len([1 for r, _ in caller.log if r == "reviewer-correctness"]) == 3
-        assert len(commits(rt)) == 3  # the work is kept for a person to look at
+        assert final["outcome"] == "converged"                                      # the checks pass: it goes on
+        assert any("remain after the developer agent's one fix" in n for n in final["notes"])
+        assert len([1 for r, _ in caller.log if r == "writer"]) == 2                # the change, then one fix
+        assert len([1 for r, _ in caller.log if r == "reviewer-correctness"]) == 2
+        assert final["rounds"][-1]["findings"][0]["severity"] == "high"             # reported as it was judged
+
+    def test_a_fix_the_developer_agent_cannot_write_does_not_end_a_change_that_works(self, repo):
+        caller = FakeCaller({
+            "writer": [write_change(), "not a change"],
+            "reviewer-correctness": [blocking_finding()], "reviewer-security": [no_findings()],
+            "doc-reviewer": [fence({"explanation": "nothing needed", "changes": []})],
+        })
+        rt, final = run_graph(caller)
+        assert final["outcome"] == "converged"
+        assert any("produced no fix for the review's findings" in n for n in final["notes"])
+        assert "'hello'" in pathlib.Path("greet.py").read_text()                    # what was verified is what remains
 
     def test_failing_checks_are_reverted_and_never_committed(self, repo):
         caller = FakeCaller({"writer": [write_change()]})
@@ -507,6 +519,11 @@ class TestPublishPr:
             {"iteration": 1, "stage": "review", "findings": [{"severity": "high"}], "dropped": 0}]), None)
         assert "abandoned this change" in text and "`a.py:1`" in text and text.startswith("<!-- agent-pr -->")
         assert "agent-certified" not in text      # an abandoned change is never certified
+        left = ap.build_change_comment(self.result(final_sha="abc1234def", findings=[
+            {"severity": "high", "file": "a.py", "line": 1, "category": "bug", "evidence": "e", "problem": "p",
+             "suggestion": "s", "reviewers": ["reviewer-correctness"]}]), None)
+        assert "No blocking findings" not in left and "1 finding(s) of the review were not resolved" in left
+        assert "<!-- agent-certified: abc1234def -->" in left      # it works, so it is certified all the same
 
     def args(self):
         return type("A", (), {"repo": "o/r", "pr": 5, "head_ref": "feature"})()

@@ -246,6 +246,9 @@ def test_the_allowance_can_be_set_or_switched_off(mock_server):
     run_script("--endpoint", mock_server, "--max-tokens", "1000", "--reasoning-tokens", "0", env={"STDIN": "hi"})
     body = MockHandler.requests[-1]["body"]
     assert "reasoning" not in body and body["max_tokens"] == 1000
+    run_script("--endpoint", mock_server, "--max-tokens", "1000", "--no-reasoning", env={"STDIN": "hi"})
+    body = MockHandler.requests[-1]["body"]
+    assert body["reasoning"] == {"enabled": False} and body["max_tokens"] == 1000      # the answer, with no thinking first
 
 
 def test_an_empty_reply_is_asked_again_once_with_the_same_budget_and_both_are_counted(mock_server, tmp_path):

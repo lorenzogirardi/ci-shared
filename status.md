@@ -27,24 +27,16 @@ merged · abandoned · reverted        + warnings and every role's verdict visib
 
 | Thing | State |
 |---|---|
-| `ci-shared` `main` | `33014fb` (#52) |
-| `ci-shared` `v2` (what every consumer runs) | `c80ae83` (#51): **one commit behind `main`** |
-| Why behind | the release canary of #52 failed: scenario `intent` (flask-test-api#273) ended abandoned |
-| ci-shared #53 `fix/architect-informs` | open, agents reviewing. The fix for that failure |
-| ci-shared #50 `feat/risk-level` | open, agent check red (the 49-minute run, cancelled by hand). Step 4 of the plan |
+| `ci-shared` `main` and `v2` (what every consumer runs) | `8e562d6` (#57), equal at 18:30 UTC on 2026-10-11 |
+| ci-shared #50 `feat/risk-level` | open, certified at `7880445`, **not to be merged as it is**: once the owner puts `risk-confirmed` on a pull request, every later commit merges without asking again (the label is never removed). Step 4 of the plan |
 | flask-test-api | `main` green, no open pull request |
 
 ## Next actions, in order
 
-1. **Get #53 merged and `v2` released.** It touches no workflow file, so the agents merge it when
-   they certify it. The release that follows carries #52 and #53 together. Check:
-   `gh pr view 53 --repo lorenzogirardi/ci-shared`, then that `v2` equals `main`
-   (`git fetch --tags -f origin && git rev-parse origin/main v2^{commit}`). If the canary fails again,
-   read which scenario and why (see "How to look at a run") before changing anything.
-2. **Resume #50 (risk level).** Rebase `feat/risk-level` on `main` (conflicts expected in `CLAUDE.md`,
-   `status.md`, `docs/architecture.md`: keep `main`'s text and re-add the step 4 lines). Rule 1 of
-   `CLAUDE.md` already names the risk level as its one exception, which was the architect's objection.
-   #50 touches `reusable_agent-change.yml`, so it is merged by hand once certified and green.
+1. Done: #53 (the architect informs), #55 (a second attempt takes up the review), #56, #57 merged by
+   the agents and released.
+2. **#50 (risk level).** Fix the confirmation first: it must be bound to the commit that asked for it.
+   Then rebase; it touches `reusable_agent-change.yml`, so it is merged by hand once certified and green.
 3. **Step 5: the dependency bot through the same graph.** Not started. The largest step: the sweep
    (`scripts/pr_review_sweep.py`) keeps only "pick the bot's pull requests, ask for a rebase when
    behind, leave the merge of workflow pull requests to the bot"; review, repair and merge come from
@@ -76,8 +68,8 @@ Outside the plan, each for a defect seen in a real run:
 | Python version written only in the `Dockerfile` | ci-shared #45, flask #257 | released, seen |
 | Trivy and Checkov findings as warning and summary on `main` | flask #258 | released, seen (Checkov) |
 | A model call is stopped after 5 minutes, a run after 15, the job after 25; one log line per model call | ci-shared #51 | released, seen (the lines) |
-| The developer agent is shown the code around each finding; the refusal of an unusable reply says what to send | ci-shared #52 | on `main`, **not released** |
-| The architect only informs | ci-shared #53 | open |
+| The developer agent is shown the code around each finding; the refusal of an unusable reply says what to send | ci-shared #52 | released, seen: the canary passed with it |
+| The architect only informs | ci-shared #53 | released; the canary passed |
 
 ## What went wrong today, and what it taught
 
@@ -101,6 +93,22 @@ Outside the plan, each for a defect seen in a real run:
   requests in a row queue their releases: group engine changes into fewer pull requests.
 - **#51 was merged without the agents' certification**: its review was running on the engine without
   the time bound, the one that had just hung. Tests were green. The only one today.
+
+## The slow reviewer, measured on 2026-10-11
+
+`reviewer-correctness` was the wait in every slow run (212 to 300 seconds, often with no answer). About
+340 calls to the model outside the pipeline, on the real inputs of #50, #53 and #57 (the experiment is in
+`~/ci-exp` on the owner's machine, not in the repository):
+
+- With thinking on, no wording of the prompt gave both speed and sight: seven versions, the owner's and
+  the caveman skill included, either gave no answer on a large diff or stopped seeing the real defect.
+  Giving it the surrounding code, before or after the change, did not shorten it.
+- With thinking off it answered in 1 to 16 seconds every time and saw the real defect of #53 every time,
+  but marked `high` what was not: 9 false `high` in 10 runs on two correct changes.
+- Deciding `severity` last in the answer brought that to 3 in 10, with no finding contradicting itself.
+
+Hence: that reviewer answers with no thinking and decides severity last; and a reviewer asks for a fix
+once and never ends a change whose checks pass, so a wrong `high` costs one round, not the change.
 
 ## How to work on this (the other machine has no memory)
 

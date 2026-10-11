@@ -226,7 +226,9 @@ def _request(
         "messages": messages,
         "max_tokens": max_tokens,
     }
-    if reasoning_tokens > 0:
+    if reasoning_tokens < 0:
+        payload["reasoning"] = {"enabled": False}
+    elif reasoning_tokens > 0:
         # The thinking gets its own allowance and the answer keeps all of max_tokens: the two used to share
         # one number, so a long chain of thought left nothing for the reply.
         payload["reasoning"] = {"max_tokens": reasoning_tokens}
@@ -287,6 +289,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--endpoint", help="API endpoint (env OPENROUTER_ENDPOINT overrides)")
     parser.add_argument("--max-chars", type=int, default=DEFAULT_MAX_CHARS, help="Max prompt chars")
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS, help="Max output tokens")
+    parser.add_argument("--no-reasoning", action="store_true",
+                        help="Ask for the answer with no thinking before it")
     parser.add_argument("--reasoning-tokens", type=int, default=None,
                         help="Tokens a reasoning model may spend thinking, on top of --max-tokens "
                              f"(env OPENROUTER_REASONING_TOKENS; default {DEFAULT_REASONING_TOKENS}; 0 = no limit sent)")
@@ -331,7 +335,7 @@ def main(argv: list[str] | None = None) -> int:
     system = _truncate(system, args.max_chars)
 
     timeout = args.timeout
-    reasoning_tokens = args.reasoning_tokens
+    reasoning_tokens = -1 if args.no_reasoning else args.reasoning_tokens
     if reasoning_tokens is None:
         raw = _read_env_secret("OPENROUTER_REASONING_TOKENS")
         reasoning_tokens = int(raw) if raw and raw.strip().isdigit() else DEFAULT_REASONING_TOKENS

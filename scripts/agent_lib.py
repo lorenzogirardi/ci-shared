@@ -79,6 +79,10 @@ class ModelCaller:
     # alone does not guarantee it: it is per read, and a model that keeps the connection alive while it
     # thinks, then gets retried on an empty reply, once held one review for more than twenty minutes.
     CALL_SECONDS = 300
+    # Roles asked to answer with no thinking before the answer. Thinking, this reviewer gave no answer in
+    # 300 seconds on a change of 350 lines, three times; without it the same question took 1 to 7 seconds
+    # in 15 local calls, none without an answer, and it still found the defect it had found before.
+    NO_REASONING = ("reviewer-correctness",)
 
     def __init__(self, ai_script: str, *, max_chars: int = 140_000, timeout: int = 180,
                  work_dir: str = ".ai/agents") -> None:
@@ -113,7 +117,7 @@ class ModelCaller:
                 [sys.executable, self.ai_script,
                  "--system-file", str(system_path), "--prompt-file", str(user_path),
                  "--max-chars", str(self.max_chars), "--timeout", str(self.timeout),
-                 "--usage-file", str(usage_path)],
+                 "--usage-file", str(usage_path)] + (["--no-reasoning"] if role in self.NO_REASONING else []),
                 capture_output=True, text=True, timeout=allowed,
             )
         except subprocess.TimeoutExpired as exc:
