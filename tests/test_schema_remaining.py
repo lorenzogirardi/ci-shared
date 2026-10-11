@@ -197,6 +197,10 @@ def test_the_architect_informs_and_never_sends_a_change_back():
         max_chars = 1000
 
         def call(self, role, system, user):
-            return fence({"findings": [finding(severity="high", problem=f"by {role}")] if role == "reviewer-architect" else []})
-    found, _ = ap.review_diff(Caller(), DIFF, None)
-    assert [f.severity for f in found] == ["medium"] and not any(f.blocking for f in found)
+            if role == "reviewer-architect":                # two findings: the rule holds for each, not for the first
+                return fence({"findings": [finding(severity="low", problem="naming"), finding(file="c.py", severity="high", problem="layering")]})
+            return fence({"findings": [finding(file="b.py", problem="wrong result")] if role == "reviewer-correctness" else []})
+    diff = DIFF + DIFF.replace("a.py", "b.py") + DIFF.replace("a.py", "c.py")
+    found, _ = ap.review_diff(Caller(), diff, None)
+    assert {f.file: f.severity for f in found} == {"a.py": "low", "b.py": "high", "c.py": "medium"}
+    assert [f.file for f in found if f.blocking] == ["b.py"]      # the other roles still send a change back
