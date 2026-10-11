@@ -333,8 +333,9 @@ def run_writer(rt: Runtime, plan: dict, feedback: str):
         parsed = lib.parse_changes(data) if data is not None else None
         if parsed is None:
             history.append(
-                f"Round {rnd}: your reply was malformed or outside the allowed scope (max {lib.MAX_CHANGES} "
-                "changes, nothing under .github/workflows/, find text must appear exactly once). Reply again."
+                f"Round {rnd}: your reply could not be used. Reply with exactly ONE json object and nothing else: "
+                "either one lookup or the changes. No second request, no commentary, no tool-call markup. "
+                f"(Changes: max {lib.MAX_CHANGES}, nothing under .github/workflows/, find text must appear exactly once.)"
             )
             continue
         changes, explanation = parsed

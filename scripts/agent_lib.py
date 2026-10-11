@@ -528,8 +528,20 @@ def render_findings_md(findings: list[Finding]) -> str:
     return "\n".join(lines)
 
 
-def findings_for_writer(findings: list[Finding]) -> str:
-    return json.dumps([f.to_dict() for f in findings], indent=2)
+def findings_for_writer(findings: list[Finding], around: int = 15) -> str:
+    """The findings, each followed by the code it points at. A finding names a file and a line; the
+    writer once spent all its rounds trying to read line 1355 of a file it is only ever shown the
+    beginning of. Showing the lines costs nothing and needs no lookup."""
+    out = [json.dumps([f.to_dict() for f in findings], indent=2)]
+    for f in findings:
+        try:
+            lines = pathlib.Path(f.file).read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        first = max(1, f.line - around)
+        shown = "\n".join(f"{n}| {text}" for n, text in enumerate(lines[first - 1:f.line + around], first))
+        out.append(f"### {f.file}, lines {first}-{min(len(lines), f.line + around)} (the finding is at line {f.line})\n{shown}")
+    return "\n\n".join(out)
 
 
 # ---------------------------------------------------------------------------
