@@ -40,6 +40,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TypedDict
@@ -1132,6 +1133,10 @@ def cmd_guard_change(args: argparse.Namespace) -> int:
 def cmd_change(args: argparse.Namespace) -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     caller = lib.ModelCaller(args.ai_script, max_chars=args.max_chars, timeout=args.timeout)
+    # The whole run has a time budget. Past it no model is called, so the graph ends by itself within
+    # seconds, as abandoned and with the reason written: a verdict, not a job killed without one.
+    minutes = getattr(args, "time_budget_minutes", 0)
+    caller.deadline = time.time() + minutes * 60 if minutes else None
     title = pathlib.Path(args.title_file).read_text().strip()
     body = pathlib.Path(args.body_file).read_text()
     context = lib.read_context_files([c.strip() for c in args.context_files.split(",") if c.strip()])
@@ -1167,6 +1172,8 @@ def cmd_change(args: argparse.Namespace) -> int:
                                "failure_output": failure_output})
 
     outcome = settle(final.get("outcome", "failed"))
+    if getattr(caller, "out_of_time", False) and outcome == "abandoned":
+        final["notes"] = final.get("notes", []) + [f"the run used its whole time budget of {minutes} minutes"]
     new_commits = int(git("rev-list", "--count", f"{head_sha}..HEAD").stdout.strip() or 0)
     touched_now = [n for n in git("diff", "--name-only", head_sha, "HEAD").stdout.split("\n") if n]
     violations = lib.policy_violations(head_sha)       # only what the agents added, not the author's own commits
@@ -1728,6 +1735,8 @@ def main() -> int:
     c.add_argument("--writer-rounds", type=int, default=8)
     c.add_argument("--ci-repo", default="", help="with --ci-sha: read the failing checks' logs of this commit")
     c.add_argument("--ci-sha", default="")
+    c.add_argument("--time-budget-minutes", type=int, default=15,
+                   help="after this long no model is called any more and the run ends abandoned, with the reason")
     c.add_argument("--evidence-prefix", default="ai-context-",
                    help="artifacts of the commit's workflow runs whose name starts with this are shown to the roles as evidence")
     c.add_argument("--evidence-wait", type=int, default=300,

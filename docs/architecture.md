@@ -168,6 +168,11 @@ Then: `code_defect` goes to the writer, `test_defect` to the steward, `environme
 push starts a new attempt. A run whose commit is no longer the head publishes nothing. A commit written
 by the agents is not reviewed again when it carries a verdict; one without is (at most 3 in a row).
 
+**Bounded in time.** A role's answer has a hard limit of 5 minutes (`ModelCaller.CALL_SECONDS`), and a run
+has a budget of 15 minutes (`--time-budget-minutes`): past it no model is called, so the graph ends within
+seconds as abandoned, with the reason in the comment. The job's own `timeout-minutes: 25` is the stop
+behind it. Every model call writes one line to the job log (role, seconds, output tokens, cost).
+
 **One agent at a time.** The caller for `mode: pr` and the caller for `mode: ci` share a concurrency
 group per pull request, so when the checks fail the run that holds the real CI logs takes over.
 
