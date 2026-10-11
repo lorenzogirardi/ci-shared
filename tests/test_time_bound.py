@@ -29,10 +29,11 @@ def test_every_call_writes_one_line_with_its_time_and_cost(tmp_path, capsys):
     assert "model call 001 reviewer-sre:" in out and "7 output tokens" in out and "$0.0100" in out
 
 
-def test_every_role_is_asked_to_answer_with_no_thinking(tmp_path):
+def test_every_role_but_the_writer_is_asked_to_answer_with_no_thinking(tmp_path):
     echo = "import sys\nprint('--no-reasoning' in sys.argv)\n"
-    for role in ("reviewer-correctness", "test-steward", "writer"):
+    for role in ("reviewer-correctness", "test-steward", "doc-reviewer"):
         assert caller(tmp_path, echo).call(role, "s", "u").strip() == "True"
+    assert caller(tmp_path, echo).call("writer", "s", "u").strip() == "False"      # it has to work out a change
 
 
 def test_a_call_that_does_not_answer_is_stopped(tmp_path, capsys, monkeypatch):
