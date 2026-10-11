@@ -180,3 +180,13 @@ class TestRunnerFailureVersusCodeFailure:
         payload = jobs(("image", [("Create a kind cluster", "failure")]))
         assert self.run(monkeypatch, tmp_path, payload, dry_run=True) == ("infra_retry=true", [])
         assert "would re-run it once" in capsys.readouterr().out
+
+
+def test_the_writer_is_shown_the_code_a_finding_points_at(tmp_path, monkeypatch):
+    """Seen in a real run: the writer used its eight rounds trying to read the line of a finding."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "big.py").write_text("\n".join(f"line_{n} = {n}" for n in range(1, 2001)))
+    finding = lib.Finding("high", "big.py", 1355, "bug", "e", "p", "s", ["reviewer-architect"])
+    text = lib.findings_for_writer([finding, lib.Finding("high", "gone.py", 3, "bug", "e", "p", "s", ["r"])])
+    assert "1355| line_1355 = 1355" in text and "1340| line_1340" in text and "1370| line_1370" in text
+    assert "line_1339 " not in text and "gone.py" in text          # a missing file is still reported, without code
