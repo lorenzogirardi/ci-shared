@@ -93,7 +93,7 @@ flowchart TD
 | `ci_failure` | As `verify`, starting from the real logs of a failed CI run | Nothing |
 | `steward` | The test steward updates tests a verdict found wrong | Tests only |
 | `tests` | The test steward checks that changed code is covered | Tests only |
-| `review` | Reviewers A and B in parallel, validated and deduplicated | Nothing |
+| `review` | Reviewers A and B in parallel, validated and deduplicated. Reviewer B is also shown what the pipeline's tools reported for the commit (artifacts named `ai-context-*`, downloaded once, after a bounded wait for the commit's other runs) and reports it as awareness: a note in the comment, never a finding | Nothing |
 | `final` | Checks the earlier findings are fixed, looks for regressions | Nothing |
 | `docs` | Documentation reviewer, then a deterministic changelog entry | Documentation and changelog |
 
@@ -115,6 +115,7 @@ asked to fix the format once. The model proposes, the code decides:
 - **Findings** (`parse_findings`, `validate_findings`): each needs a severity, a file, a line inside a
   changed hunk, the evidence and a fix. A finding on a line the diff does not contain is dropped; two
   about the same place and topic are merged. `critical` and `high` block.
+- **Awareness** (`parse_awareness`): what a role wants known about the tools' evidence. Notes only, capped at 6, shown under "Awareness (not blocking)" in the pull request comment; they are never findings and cannot send a change back.
 - **Verdicts** on failing tests: see the next section.
 
 ### When a check fails: the code or the test

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import dataclasses
 import difflib
+import io
 import json
 import os
 import pathlib
@@ -21,6 +22,8 @@ import re
 import subprocess
 import sys
 import threading
+import time
+import zipfile
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -158,6 +161,116 @@ def sanitize_untrusted(text: str, limit: int = 20_000) -> str:
     """Issue bodies and PR text are data: redact secret-shaped strings and cap
     the size before they reach a prompt."""
     return redact(text or "")[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Evidence: what the deterministic tools of the pipeline said about this commit
+# ---------------------------------------------------------------------------
+
+EVIDENCE_FILE_CHARS = 5000
+EVIDENCE_TOTAL_CHARS = 20_000
+EVIDENCE_MAX_ZIP_BYTES = 5_000_000
+MAX_AWARENESS = 6
+
+
+def sarif_summary(text: str) -> str:
+    """A SARIF report as one line per distinct result (rule, message, file): the report itself is
+    mostly schema and would spend the whole budget on brackets."""
+    try:
+        runs = json.loads(text).get("runs") or []
+    except (ValueError, AttributeError):
+        return text
+    lines: list[str] = []
+    for run in runs:
+        for result in (run.get("results") or []) if isinstance(run, dict) else []:
+            where = ""
+            try:
+                where = result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+            except (KeyError, IndexError, TypeError):
+                pass
+            line = f"- {result.get('ruleId', '?')}: {(result.get('message') or {}).get('text', '')} ({where or '?'})"
+            if line not in lines:
+                lines.append(line)
+    return "\n".join(lines) if lines else "no findings"
+
+
+def evidence_from_zip(name: str, blob: bytes) -> str:
+    """The text files of one downloaded artifact, as a section. Untrusted: the tools ran on the
+    code under review, so their output is capped and redacted like any other text from it."""
+    parts: list[str] = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(blob)) as archive:
+            for info in archive.infolist()[:5]:
+                if info.is_dir() or info.file_size > EVIDENCE_MAX_ZIP_BYTES:
+                    continue
+                text = archive.read(info).decode("utf-8", "replace")
+                if info.filename.endswith(".sarif"):
+                    text = sarif_summary(text)
+                parts.append(sanitize_untrusted(text.strip(), EVIDENCE_FILE_CHARS))
+    except (zipfile.BadZipFile, OSError):
+        return ""
+    body = "\n".join(x for x in parts if x)
+    return f"### {name}\n{body}" if body else ""
+
+
+def _gh_api_json(path: str) -> object:
+    done = subprocess.run(["gh", "api", path], capture_output=True, text=True)
+    try:
+        return json.loads(done.stdout) if done.returncode == 0 else None
+    except ValueError:
+        return None
+
+
+def _gh_api_bytes(path: str) -> bytes:
+    done = subprocess.run(["gh", "api", path], capture_output=True)
+    return done.stdout if done.returncode == 0 else b""
+
+
+def fetch_evidence(repo: str, sha: str, prefix: str = "ai-context-", wait_seconds: int = 300, *,
+                   own_run: str = "", poll: int = 15, api=_gh_api_json, download=_gh_api_bytes,
+                   sleep=time.sleep) -> str:
+    """What the pipeline's own tools reported for this commit: the artifacts whose name starts with
+    `prefix`, from every workflow run of the commit, as one text.
+
+    The checks run next to the agents, so their artifacts may not exist yet: wait, for a bounded
+    time, until the other runs of the commit have finished. Evidence informs a review; it is never
+    required. No runs, no artifacts or a failed download all give an empty text and the review goes
+    on without it."""
+    if not repo or not sha or not prefix:
+        return ""
+    waited = 0
+    while True:
+        listed = api(f"repos/{repo}/actions/runs?head_sha={sha}&per_page=50")
+        if not isinstance(listed, dict):
+            return ""      # the API cannot be read (no token, no network): nothing to wait for
+        runs = [r for r in (listed.get("workflow_runs") or []) if str(r.get("id")) != str(own_run)]
+        if (runs and all(r.get("status") == "completed" for r in runs)) or waited >= wait_seconds:
+            break
+        sleep(poll)
+        waited += poll
+    sections: list[str] = []
+    seen: set[str] = set()
+    for run in runs:
+        listed = api(f"repos/{repo}/actions/runs/{run.get('id')}/artifacts?per_page=100")
+        for artifact in (listed or {}).get("artifacts") or []:
+            name = str(artifact.get("name", ""))
+            if (not name.startswith(prefix) or name in seen or artifact.get("expired")
+                    or int(artifact.get("size_in_bytes") or 0) > EVIDENCE_MAX_ZIP_BYTES):
+                continue
+            seen.add(name)
+            section = evidence_from_zip(name[len(prefix):] or name, download(f"repos/{repo}/actions/artifacts/{artifact.get('id')}/zip"))
+            if section:
+                sections.append(section)
+    return "\n\n".join(sorted(sections))[:EVIDENCE_TOTAL_CHARS]
+
+
+def parse_awareness(data: dict | None) -> list[str]:
+    """What a role wants known about the tools' evidence. Notes, never findings: they are reported and
+    cannot send work back, so a malformed list is dropped instead of failing the reply."""
+    items = data.get("awareness") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return []
+    return [" ".join(x.split())[:300] for x in items if isinstance(x, str) and x.strip()][:MAX_AWARENESS]
 
 
 def repo_tree(max_files: int = 500) -> str:
