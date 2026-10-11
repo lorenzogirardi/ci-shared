@@ -311,7 +311,7 @@ These are the reasons behind choices that otherwise look arbitrary.
   model's reply. It redacts the key and secret-shaped strings from everything it prints, truncates
   oversized prompts with a marker, gives a reasoning model's thinking its own allowance
   (`reasoning.max_tokens`, 6,000 by default) so the answer keeps its budget, or none at all with
-  `--no-reasoning` (which the agents' `ModelCaller` passes for every role), asks again once, with the same
+  `--no-reasoning` (which the agents' `ModelCaller` passes for every role but the writer), asks again once, with the same
   budget, when a reply comes back empty, and writes the tokens and estimated cost of every attempt to
   `--usage-file`.
 - **`ai_sanitize.py`**: bundles files into a prompt with secrets redacted and a size cap, or masks

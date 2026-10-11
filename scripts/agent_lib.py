@@ -117,7 +117,10 @@ class ModelCaller:
                  # reviewer (132 seconds) and the test steward (over 180) were the wait in its place. Without
                  # it, in local calls on the same inputs: 1 to 10 seconds, always an answer, the same defect
                  # found, the missing tests still written. Measured for those three roles only.
-                 "--usage-file", str(usage_path), "--no-reasoning"],
+                 # The writer is the exception: it has to work out a change that applies. Without thinking,
+                 # after "anchor appears 2 times" it gave up or invented an anchor (canary run 38170540282,
+                 # and 5 of 5 local replays); thinking, it asked to read the file, 5 of 5, in 2 to 5 seconds.
+                 "--usage-file", str(usage_path)] + ([] if role == "writer" else ["--no-reasoning"]),
                 capture_output=True, text=True, timeout=allowed,
             )
         except subprocess.TimeoutExpired as exc:
