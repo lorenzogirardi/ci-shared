@@ -954,10 +954,26 @@ def touches_workflow_files(repo: str, number: int) -> bool:
 
 
 def workflow_pr_action(ci_state: str) -> str:
-    """What the sweep does with a PR that touches workflow files. No agent can edit or merge it, so
-    it is never waited on: green or still running it is the dependency bot's to merge; red on current
-    code it is abandoned, which is a terminal state, not a hand-off."""
+    """What the sweep does with a PR that touches workflow files. No agent can edit those files or
+    merge the PR: red on current code it is abandoned, which is a terminal state, not a hand-off;
+    otherwise it is reviewed like any other and the dependency bot merges it."""
     return "abandon" if ci_state == "failing" else "leave"
+
+
+REVIEW_STATUS = "agent-review"
+
+
+def set_review_status(repo: str, head_sha: str, state: str, description: str) -> None:
+    """The review verdict as a commit status, for a PR the dependency bot merges itself.
+
+    The bot merges once every check on the commit is green, and it cannot read a comment. A status it
+    can: pending while the review has not been made, success when it is clean, failure when it has
+    findings. A status that cannot be written is reported, never fatal: the review still happens."""
+    done = run(["gh", "api", "-X", "POST", f"repos/{repo}/statuses/{head_sha}",
+                "-f", f"state={state}", "-f", f"context={REVIEW_STATUS}",
+                "-f", f"description={description[:140]}"], check=False)
+    if done.returncode != 0:
+        print(f"::warning::could not set the {REVIEW_STATUS} status on {head_sha[:7]}: {(done.stderr or '').strip()[:200]}")
 
 
 def pr_head_sha(repo: str, number: int) -> str:
@@ -1322,15 +1338,19 @@ def main() -> int:
                 continue
             print(f"::warning::could not refresh PR #{number}; judging it as it is")
 
-        if args.workflow_prs_to_bot and touches_workflow_files(args.repo, number):
+        bot_merges = args.workflow_prs_to_bot and touches_workflow_files(args.repo, number)
+        if bot_merges:
             if workflow_pr_action(checks_state(args.repo, head_sha, required)[0]) == "abandon":
                 abandon_pr(args.repo, number, "it changes .github/workflows/, which the agents cannot repair, and its checks "
                            "fail on current code; the dependency bot proposes the next version by itself")
                 print(f"PR #{number} touches workflows and its CI is red: abandoned.")
-            else:
-                print(f"PR #{number} touches workflows: left to the dependency bot's own automerge.")
-            skipped += 1
-            continue
+                skipped += 1
+                continue
+            # Reviewed like any other pull request: what a workflow change leaves behind is usually in a
+            # file the agents can edit (a runtime bump in the workflows with the Dockerfile left on the
+            # old version went through unread). Only the merge stays with the dependency bot, which
+            # waits for the verdict because it is a status on the commit.
+            print(f"PR #{number} touches workflows: reviewed here, merged by the dependency bot.")
 
         existing = existing_sweep_comment(args.repo, number)
         existing_body = (existing or {}).get("body") or ""
@@ -1367,6 +1387,9 @@ def main() -> int:
                 continue
             reason = "the harness changed since" if harness_changed else "CI no longer failing"
             print(f"PR #{number}: {reason} at {head_sha[:7]} — re-reviewing.")
+
+        if bot_merges:
+            set_review_status(args.repo, head_sha, "pending", "waiting for the agents' review")
 
         if args.structured_review and required and checks_state(args.repo, head_sha, required)[0] == "pending":
             # The reviewers are given the CI results as evidence; judging before they exist would only
@@ -1465,6 +1488,8 @@ def main() -> int:
                 outcome, detail = "abandoned", f"{args.max_autofix_commits} automatic fixes in a row did not clear the findings"
             else:
                 outcome, detail = fix_findings_one(pr, args, args.repo, head_sha, body_text)
+            if bot_merges:
+                set_review_status(args.repo, head_sha, "failure", "the review has findings")
             print(f"fix findings {outcome}: {detail}")
             post_comment(args.repo, number,
                          comment_body(args.heading, body_text + ("\n\n### Automatic fix\n" + detail if detail else ""), head_sha,
@@ -1475,6 +1500,10 @@ def main() -> int:
             reviewed += 1
             print("::endgroup::")
             continue
+
+        if bot_merges:
+            set_review_status(args.repo, head_sha, "success" if is_clean else "failure",
+                              "reviewed clean" if is_clean else "the review has findings")
 
         # Merge first, comment second, so the comment can state what actually
         # happened rather than what was about to be attempted.

@@ -748,7 +748,19 @@ class TestBuildContext:
 
 class TestWorkflowPrsBelongToTheBot:
     """No agent can edit or merge a workflow file, so such a PR is never waited on by a person:
-    green or running it is the bot's to merge, red on current code it is abandoned."""
+    green or running it is reviewed and is the bot's to merge, red on current code it is abandoned."""
+
+    def test_the_verdict_is_a_status_the_bot_waits_for(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(pr_review_sweep, "run", lambda cmd, **kw: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", ""))
+        pr_review_sweep.set_review_status("o/r", "abc1234", "success", "reviewed clean")
+        assert "repos/o/r/statuses/abc1234" in calls[0]
+        assert "state=success" in calls[0] and "context=agent-review" in calls[0]
+
+    def test_a_status_that_cannot_be_written_does_not_stop_the_sweep(self, monkeypatch, capsys):
+        monkeypatch.setattr(pr_review_sweep, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "Resource not accessible"))
+        pr_review_sweep.set_review_status("o/r", "abc1234", "pending", "waiting")
+        assert "could not set" in capsys.readouterr().out
 
     @pytest.mark.parametrize("state", ["green", "pending", "none"])
     def test_left_to_the_bot_unless_red(self, state):
