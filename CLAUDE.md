@@ -27,10 +27,14 @@ The pipeline does the work of a team on every change, with no person in it:
 3. **Agents judge evidence, not diffs alone.** Each role reads the output of the deterministic tools
    the pipeline already runs (table below). A tool decides facts; a model decides what to do about
    them. Do not add a tool when one in the table already answers the question.
-4. **No over-engineering.** A change needs a defect seen in a real run, or a role in the table above
+4. **What gates is whether the application works.** Tests, build and deploy gate a change. Security
+   and quality tools (Trivy, Checkov, SBOM) give awareness and never block: a finding is a warning on
+   the run and a section of its summary, and the change goes on. An agent that reads such a finding
+   reports it; it does not hold the change for it.
+5. **No over-engineering.** A change needs a defect seen in a real run, or a role in the table above
    that is missing. Prefer changing a node or a prompt over adding a workflow, a script, a tag or a
    variable. When something is replaced, delete what it replaces in the same change.
-5. **Tests are the specification.** An agent changes a test only when it can quote the words of the
+6. **Tests are the specification.** An agent changes a test only when it can quote the words of the
    pull request that redefine the behaviour. Otherwise the code is what gets fixed.
 
 ## Deterministic tools already in the pipeline
@@ -46,8 +50,8 @@ These exist in the consumer today. They are the evidence; use them before anythi
 | pytest (integration) | PR `integration` | behaviour with PostgreSQL and Redis | yes (check result, logs) |
 | docker build + kind + helm deploy | PR `image`, `main` `k8s-check` | the image builds, deploys, becomes ready | result only |
 | actionlint | PR `workflows` | workflow files are valid | result only |
-| Trivy (image, CRITICAL) | `main` only, never fails | known vulnerabilities in the image | **no** |
-| Checkov (helm, SARIF) | `main` only, never fails | misconfiguration of the chart | **no** |
+| Trivy (image, CRITICAL) | `main` only, never fails; warning and run summary | known vulnerabilities in the image | **no** |
+| Checkov (helm, SARIF) | `main` only, never fails; warning and run summary | misconfiguration of the chart | **no** |
 | SBOM (anchore) | `main` only, never fails | what the image contains | **no** |
 
 ## Roles and nodes: where we are
@@ -151,7 +155,8 @@ architect (8, 25, 31, 37). Those are the roles the graph lacks.
 
 Each step reuses or replaces something; none adds a layer.
 
-1. Trivy and Checkov output become evidence for `reviewer-security`; `ci-analysis` is removed.
+1. Trivy and Checkov output become evidence for `reviewer-security`, which reports what they found
+   without blocking (rule 4); `ci-analysis` is removed.
 2. An SRE node reads the build and deploy evidence of the `image` job.
 3. The architect prompt becomes a reviewer node; `planner` is removed.
 4. The dependency bot's pull requests go through the same graph; the sweep only picks the pull
