@@ -116,9 +116,13 @@ class ModelCaller:
                  "--usage-file", str(usage_path)],
                 capture_output=True, text=True, timeout=allowed,
             )
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
             self.out_of_time = self.out_of_time or allowed < self.CALL_SECONDS
-            print(f"model call {number:03d} {role}: stopped after {allowed:.0f}s without an answer", flush=True)
+            said = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr or ""
+            # What the model script said before it was stopped (its retries on an empty reply) is the only
+            # trace of why: the same reviewer went silent on the same change three times and nothing told why.
+            print(f"model call {number:03d} {role}: stopped after {allowed:.0f}s without an answer"
+                  + (f"; it said: {' | '.join(said.strip().splitlines()[-4:])}" if said.strip() else ""), flush=True)
             return None
         seconds = time.time() - started
         if proc.returncode != 0:

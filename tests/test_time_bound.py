@@ -39,6 +39,13 @@ def test_a_call_that_does_not_answer_is_stopped(tmp_path, capsys, monkeypatch):
     assert c.out_of_time is False            # one slow call is not the run's budget
 
 
+def test_a_stopped_call_says_what_the_model_script_reported(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(lib.ModelCaller, "CALL_SECONDS", 1)
+    script = "import sys, time\nprint('warning: empty reply, retrying', file=sys.stderr, flush=True)\ntime.sleep(30)\n"
+    assert caller(tmp_path, script).call("reviewer-correctness", "s", "u") is None
+    assert "without an answer; it said: warning: empty reply, retrying" in capsys.readouterr().out
+
+
 def test_past_the_run_budget_no_model_is_called(tmp_path, capsys):
     c = caller(tmp_path, SLOW)
     c.deadline = time.time() - 1

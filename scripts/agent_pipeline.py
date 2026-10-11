@@ -143,14 +143,18 @@ def run_planner(caller: lib.ModelCaller, title: str, body: str, context: str) ->
 
 def review_diff(caller: lib.ModelCaller, diff: str, plan: dict | None,
                 reviewers: tuple[str, ...] = REVIEWERS, guidance: str = "", *,
-                evidence: str = "", awareness: list[str] | None = None, context: str = ""):
+                evidence: str = "", awareness: list[str] | None = None, context: str = "",
+                answered: dict | None = None):
     """Run the independent reviewers on `diff`. Returns (findings, dropped)
     after validation against the diff and dedup, or None if a reviewer could
     not produce a usable reply (fail closed: the change cannot be certified).
 
     `evidence` is what the pipeline's tools reported for the commit; the roles in EVIDENCE_ROLES read
     it. What they want known about it comes back as notes, appended to `awareness`: reported, and
-    never a finding, so the tools inform a change without being able to send it back."""
+    never a finding, so the tools inform a change without being able to send it back.
+
+    `answered` keeps each reviewer's answer to what it was shown. A review repeated on the same diff
+    asks only the reviewers that gave none: one silent reviewer once had the other three asked again."""
     ranges = lib.diff_ranges(diff)
     user = (
         f"## Plan\n{json.dumps(plan, indent=2) if plan else 'No plan was provided; judge the diff on its own.'}\n\n"
@@ -170,7 +174,13 @@ def review_diff(caller: lib.ModelCaller, diff: str, plan: dict | None,
             found = lib.parse_findings(data, n)
             return None if found is None else (found, lib.parse_awareness(data))
         extra = shown if name in EVIDENCE_ROLES else design if name == "reviewer-architect" else ""
-        return lib.ask_json(caller, name, lib.load_prompt(name), user + extra, validate)
+        if answered is not None and (name, user + extra) in answered:
+            print(f"{name}: not asked again, its answer to this same diff is kept", flush=True)
+            return answered[(name, user + extra)]
+        reply = lib.ask_json(caller, name, lib.load_prompt(name), user + extra, validate)
+        if answered is not None and reply is not None:
+            answered[(name, user + extra)] = reply
+        return reply
 
     # Independent reviewers share nothing, so they run at the same time. Results are read back in the
     # declared order, so the deduplication (and the report) do not depend on who finished first.
@@ -253,6 +263,7 @@ class Runtime:
     write_tests: bool = True  # the test steward evaluates changes to application code
     guidance: str = ""        # project-specific review guidance, shown to the reviewers
     evidence: object = None   # callable returning what the pipeline's tools reported for the commit, or None
+    answered: dict = dataclasses.field(default_factory=dict)   # reviewers' answers of this run, kept for a second attempt
 
 
 class RunState(TypedDict, total=False):
@@ -279,6 +290,7 @@ class RunState(TypedDict, total=False):
     spec_tests: list         # test files the writer may not edit: a verdict said the CODE is wrong there
     spec_violations: int
     awareness: list          # what the roles noted about the tools' evidence: reported, never acted on
+    resume: str              # the node a second attempt starts from, when the first one ended there
 
 
 def is_doc_path(path: str) -> bool:
@@ -718,9 +730,11 @@ def build_graph(rt: Runtime):
     def n_review(state: RunState) -> dict:
         notes: list[str] = list(state.get("awareness", []))
         result = review_diff(rt.caller, diff_since_base(rt.base_sha), state["plan"], guidance=rt.guidance,
-                             evidence=evidence(), awareness=notes, context=rt.context)
+                             evidence=evidence(), awareness=notes, context=rt.context, answered=rt.answered)
         if result is None:
-            return stop(state, "escalated", "a reviewer did not return a usable reply, so the change could not be certified")
+            # A second attempt takes up the review again: the checks passed and the tests were judged.
+            return {**stop(state, "escalated", "a reviewer did not return a usable reply, so the change could not be certified"),
+                    "resume": "review"}
         return {**after_review(state, *result, "review"), "awareness": notes}
 
     def n_final(state: RunState) -> dict:
@@ -890,7 +904,7 @@ def boosted(rt: Runtime, attempt: int, previous: dict) -> Runtime:
     committed work on an issue, check that work instead of starting from nothing."""
     if attempt == 1:
         return rt
-    start = "verify" if rt.start == "write" and previous.get("committed") else rt.start
+    start = previous.get("resume") or ("verify" if rt.start == "write" and previous.get("committed") else rt.start)
     return dataclasses.replace(rt, max_iterations=rt.max_iterations * RETRY_BOOST,
                                max_verify_retries=rt.max_verify_retries * RETRY_BOOST,
                                writer_rounds=rt.writer_rounds * RETRY_BOOST, start=start)
