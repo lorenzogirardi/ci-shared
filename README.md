@@ -237,7 +237,7 @@ jobs:
 See `flask-test-api/.github/workflows/` for the real wrappers: `agent-change.yml`,
 `agent-ci-failure.yml`, `agent-merge.yml`, `agent-main-guard.yml`,
 `ai-review-sweep.yml`, `pipeline-health.yml`, `pipeline-canary.yml` and
-`pipeline.yml`'s `ai-analysis` job. Its `release-notes.yml` does not fit a
+`pipeline.yml`. Its `release-notes.yml` does not fit a
 reusable shape: it checks this repo out at `.shared` and calls
 `.shared/scripts/openrouter_ai.py` directly.
 
