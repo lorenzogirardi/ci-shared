@@ -27,8 +27,10 @@ merged · abandoned · reverted        + warnings and every role's verdict visib
 
 | Thing | State |
 |---|---|
-| `ci-shared` `main` | `d48989c` (#59) at 19:15 UTC on 2026-10-11 |
-| `ci-shared` `v2` (what every consumer runs) | `d48989c` at the same time |
+| `ci-shared` `main` and `v2` (what every consumer runs) | `e92c07a` (#62), equal at 06:00 UTC on 2026-10-12 |
+| Seen on the consumer on 2026-10-11/12 | a real change to the app through the whole graph, merged with no person in 6 minutes (flask #302); two changes to workflow files merged by the agents (flask #306, #307); the canary with one pull request (flask #305) |
+| The dependency bot | since flask #307 the graph reviews its pull requests too, next to the sweep. **Not seen**: needs its next pull request. If the graph posts its verdict there, the sweep is reduced to asking for a rebase |
+| The model key | its monthly limit was reached on 2026-10-11 and every pull request was abandoned until the owner raised it; the comment said "the test steward could not produce a usable answer", the cause was only in the log. A commit abandoned for that is not tried again without a new push |
 | ci-shared #50 `feat/risk-level` | **closed by accident** on 2026-10-11 (the commit message of #58 said "resolved (#50": GitHub took it as a closing word). The branch is there. Not to be merged as it is: once the owner puts `risk-confirmed` on a pull request, every later commit merges without asking again. Step 4 of the plan |
 | flask-test-api | `main` green, no open pull request |
 
@@ -42,8 +44,7 @@ merged · abandoned · reverted        + warnings and every role's verdict visib
    (`scripts/pr_review_sweep.py`) keeps only "pick the bot's pull requests, ask for a rebase when
    behind, leave the merge of workflow pull requests to the bot"; review, repair and merge come from
    the graph and the existing merge gate; its own review, triage, autofix and merge code is deleted.
-4. **Step 6: remove `ai-analysis`** (`pipeline.yml` in flask, `reusable_ci-analysis.yml` here): the
-   graph now reads the same artifacts.
+4. Done: step 6, `ai-analysis` removed (flask #306, and `reusable_ci-analysis.yml` here).
 5. Update the state column of the 38 actions in `CLAUDE.md` in each change that moves one.
 
 ## The plan and what is done

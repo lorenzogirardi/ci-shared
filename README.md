@@ -177,17 +177,6 @@ for the push. There used to be a separate `autofix_core.py` graph and a
 `reusable_main-autofix.yml` for a red base branch; both are gone: a red base
 branch is handled by `reusable_agent-main-guard.yml` (re-run once, then revert).
 
-### `reusable_ci-analysis.yml`
-
-Post-pipeline informative report: downloads `ai-context-*` artifacts from
-earlier jobs (lint/test/trivy/checkov/k8s-probe), bundles them with the app
-source, asks the model for a security/quality report, posts it to the job
-summary and as an artifact. Never gates the pipeline —
-`continue-on-error: true` is set inside the reusable workflow's own job (a
-job that *calls* a reusable workflow can't set that itself).
-
-Secret: `openrouter_api_key` (required).
-
 ## Consumer wrapper examples
 
 Plain review (safe for any PR, including forks):
@@ -248,7 +237,7 @@ jobs:
 See `flask-test-api/.github/workflows/` for the real wrappers: `agent-change.yml`,
 `agent-ci-failure.yml`, `agent-merge.yml`, `agent-main-guard.yml`,
 `ai-review-sweep.yml`, `pipeline-health.yml`, `pipeline-canary.yml` and
-`pipeline.yml`'s `ai-analysis` job. Its `release-notes.yml` does not fit a
+`pipeline.yml`. Its `release-notes.yml` does not fit a
 reusable shape: it checks this repo out at `.shared` and calls
 `.shared/scripts/openrouter_ai.py` directly.
 
