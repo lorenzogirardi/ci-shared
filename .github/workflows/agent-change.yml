@@ -3,8 +3,8 @@ name: Agent Change
 # This repository under its own pipeline: every pull request here is reviewed, repaired and certified by
 # the agents it defines. They run at the published tag (v2), never at the pull request's own code, so a
 # change that breaks a reviewer is still judged by the reviewer that works.
-# Workflow files are outside the agents' reach, here as everywhere: a pull request that touches
-# .github/workflows/ is reviewed but merged by a person.
+# No agent edits a workflow file, here as everywhere. A pull request that touches .github/workflows/ is
+# reviewed and merged like any other.
 
 on:
   pull_request:

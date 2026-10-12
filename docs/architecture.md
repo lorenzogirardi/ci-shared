@@ -30,7 +30,7 @@ ci-shared/
 │   ├── reusable_changelog.yml         deterministic changelog entry
 │   ├── reusable_docs-architect.yml    documentation proposal, plan only
 │   ├── reusable_agent-pipeline.yml    the engine started from a written request (planner first)
-│   ├── reusable_agent-review.yml      reviewers A and B only, one comment
+│   ├── reusable_agent-review.yml      the four reviewers only, one comment
 │   ├── reusable_pr-diff-review.yml    single-reviewer comment on a diff
 │   ├── agent-change.yml, agent-ci-failure.yml, agent-merge.yml   this repository under its own loop
 │   ├── release-tag.yml                moves v2 after the tests and the consumer's canary pass
@@ -118,7 +118,8 @@ asked to fix the format once. The model proposes, the code decides:
   `.git/`, `.env*`, keys and certificates).
 - **Findings** (`parse_findings`, `validate_findings`): each needs a severity, a file, a line inside a
   changed hunk, the evidence and a fix. A finding on a line the diff does not contain is dropped; two
-  about the same place and topic are merged. `critical` and `high` block.
+  about the same place and topic are merged. A `critical` or `high` finding of the second developer goes
+  to the writer, once; every other finding is a note.
 - **Awareness** (`parse_awareness`): what a role wants known about the tools' evidence. Notes only, capped at 6, shown under "Awareness (not blocking)" in the pull request comment; they are never findings and cannot send a change back.
 - **Verdicts** on failing tests: see the next section.
 
@@ -148,9 +149,9 @@ Then: `code_defect` goes to the writer, `test_defect` to the steward, `environme
 - **A test an agent has just written is not the specification.** If tests the steward wrote or rewrote
   fail, they are discarded and the steward is asked again with the output. The application is not
   changed to satisfy them.
-- **An agent that cannot answer blocks the certification** (`usable_changes`): the steward and the
-  documentation reviewer get one more attempt, told exactly what was wrong; then the run ends not
-  certified.
+- **An agent that must answer and cannot ends the run not certified** (`usable_changes`): the steward
+  and the documentation reviewer get one more attempt, told exactly what was wrong. The same holds for the
+  second developer. A reviewer that only informs and gives no answer is reported, and the run goes on.
 - **Agent instructions are not documentation**: `CLAUDE.md`, `AGENTS.md` and `.claude/` are outside
   the documentation reviewer's reach.
 - **A last deterministic gate** (`policy_violations`) runs over the commits the agents made: protected
@@ -175,7 +176,9 @@ by the agents is not reviewed again when it carries a verdict; one without is (a
 **Bounded in time.** A role's answer has a hard limit of 5 minutes (`ModelCaller.CALL_SECONDS`), and a run
 has a budget of 15 minutes (`--time-budget-minutes`): past it no model is called, so the graph ends within
 seconds as abandoned, with the reason in the comment. The job's own `timeout-minutes: 25` is the stop
-behind it. Every model call writes one line to the job log (role, seconds, output tokens, cost).
+behind it. Every model call writes one line to the job log (role, seconds, output tokens, cost); a call
+that is stopped also writes what the model script reported. Every role but the writer is asked with no
+thinking before the answer: the reviews of a change take seconds.
 
 **One agent at a time.** The caller for `mode: pr` and the caller for `mode: ci` share a concurrency
 group per pull request, so when the checks fail the run that holds the real CI logs takes over.
@@ -216,8 +219,10 @@ flowchart LR
 
 ## The dependency sweep
 
-`pr_review_sweep.py` handles the pull requests of a dependency bot, which the consumer's caller for
-`mode: pr` leaves to it. For each open pull request of the configured authors:
+`pr_review_sweep.py` handles the pull requests of a dependency bot. It is a second engine, to be reduced
+to asking for a rebase: a consumer's caller for `mode: pr` may leave those pull requests to it, or have
+the graph review them too (flask-test-api does since 2026-10-12, with the sweep still merging). For each
+open pull request of the configured authors:
 
 1. **Behind the base branch** (counted from the commits through the compare API, ignoring bookkeeping
    commits): the bot is asked to rebase its own branch (label `rebase`), and the pull request is
@@ -230,7 +235,7 @@ flowchart LR
 3. **CI red**: the engine is started at `ci_failure` with the failing logs, with guidance for a
    dependency migration (fix the call site rather than the pin; grep for every use of a renamed
    symbol). The push token is taken out of `.git/config` while the pull request's code runs.
-4. **CI green**: reviewers A and B judge the diff with the results of the deterministic checks of that
+4. **CI green**: the reviewers judge the diff with the results of the deterministic checks of that
    commit as evidence. A blocking finding goes to the writer loop (`fix_findings`); a clean verdict
    merges.
 5. `max_autofix_commits` automatic fixes in a row that did not help: abandoned and closed.
@@ -253,7 +258,7 @@ neither is an agent.
   then abandoned, which is an ending; a new push starts a new attempt).
 
 **Canary** (`pipeline_canary.py`, nightly) opens the scenarios of the consumer's `.github/canary.json`
-as real pull requests against a throwaway copy of the base branch, lets the ordinary workflows run,
+as real pull requests (one each) against a throwaway copy of the base branch, lets the ordinary workflows run,
 waits for a verdict on the final commit and for the required checks, then checks facts: the verdict,
 the checks, which files the pull request changes, what a file contains, and what the agents' report
 says (the right files can be reached by the wrong verdict). Then it closes the pull requests and deletes
@@ -276,7 +281,9 @@ Step 2 exists because unit tests do not show what a model does with a real pull 
 
 Pull requests to this repository go through the same loop (`agent-change.yml`,
 `agent-ci-failure.yml`, `agent-merge.yml`), with the agents running at the released tag, never at
-the pull request's own code. What stays with a person: a finding inside `.github/workflows/` itself, which no agent may edit, and a
+the pull request's own code: a change to the engine is first judged by the engine it replaces, and then
+by the canary, which runs the new one. What stays with a person: writing a change inside
+`.github/workflows/`, which no agent may edit (the merge gate merges it like any other change), and a
 breaking change that needs a new tag.
 
 ## Constraints of GitHub Actions that shape the design
@@ -285,16 +292,21 @@ These are the reasons behind choices that otherwise look arbitrary.
 
 - **An event made with the job's `GITHUB_TOKEN` starts no workflow.** A push or a merge made with it
   builds no image and leaves the guard blind. So fixes are pushed, and pull requests merged, with a
-  separate push token (`AUTOFIX_PUSH_TOKEN`, Contents read/write, never the `workflow` scope).
+  separate push token (`AUTOFIX_PUSH_TOKEN`: Contents and Pull requests read/write, and Workflows
+  read/write if changes to workflow files are to be merged with no person).
 - **A pull request opened with the job token starts no checks either.** The canary and the fix after a
   direct push open the pull request with the job token (the push token is not required to be able to),
   then push one commit with the push token, which starts them. The repository must allow Actions to
   create pull requests.
-- **No token without the `workflow` scope can change `.github/workflows/`.** No agent has that scope,
-  by choice: an agent that can edit the CI that controls it cannot be left alone.
+- **No token without the `workflow` permission can change `.github/workflows/`, a merge included.**
+  The patch policy keeps every agent from editing those files (`validate_patch`): an agent that can
+  rewrite the CI that controls it cannot be left alone. Merging a certified, green change to them is
+  another matter: until 2026-10-11 the merge gate refused it and a person merged; it now merges it with
+  the push token, when the owner has given that token the permission.
 - **A `pull_request` run for a bot author gets a read-only token and no secrets.** That is why the
   dependency sweep is triggered by CI completion, pushes and a schedule, never by the bot's own
-  `pull_request` event.
+  `pull_request` event. Whether it still holds for the graph's own run on such a pull request is not
+  verified: the consumer's next pull request from the bot shows it.
 - **A reusable workflow cannot be granted more than its caller grants, and a caller that grants less
   does not start.** When a change here needs a new permission, the callers are updated first.
 - **Inside a reusable workflow there is no context for "the ref this file was fetched at"**
@@ -324,7 +336,7 @@ These are the reasons behind choices that otherwise look arbitrary.
 
 ## Tests
 
-`pytest tests/`, about 450 tests, no network. The engine's graph runs against real throwaway git
+`pytest tests/`, about 490 tests, no network. The engine's graph runs against real throwaway git
 repositories with a scripted model; the merge gate and the guard against a local bare remote; the
 health check and the canary on recorded shapes of the API. A test enumerates the terminal states and
 fails if one of them hands work to a person.
@@ -346,3 +358,9 @@ and the reason a release waits for it.
   agents looking for it; the rules keep the outcome safe, but the change may be abandoned.
 - `v2` is a moving tag that receives the consumers' secrets: what lands on `main` here and passes the
   release steps runs with their credentials.
+- When the model cannot be reached (the key's limit, the provider down) a change ends abandoned, with a
+  comment that names the role that had no answer and not the cause, which is in the job log. A commit
+  abandoned this way is not tried again until a new commit is pushed.
+- The second developer answers with no thinking: it is fast and it sees an evident defect, and it is
+  less able to weigh a subtle one. A defect the developer agent does not fix in its one round is merged
+  with the finding written in the comment.

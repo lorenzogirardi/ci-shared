@@ -1,8 +1,9 @@
 name: Reusable Agent Change
 
 # Runs the pipeline on a change that ALREADY exists, whoever wrote it:
-#   mode: pr    a pull request. Checks -> reviewer A + B -> bounded fix loop
-#               (the agent pushes fix commits to the PR branch) -> final reviewer
+#   mode: pr    a pull request. Checks -> test steward -> four reviewers (developer for
+#               correctness, security, SRE, architect) -> one fix asked by the developer
+#               (the agent pushes it to the PR branch), reread by it
 #               -> documentation reviewer. One edited comment on the PR.
 #   mode: ci    a CI run on a PR just FAILED (called from a workflow_run trigger).
 #               The failing checks' own logs are the first input; each failing
@@ -105,7 +106,7 @@ on:
       openrouter_api_key:
         required: true
       agent_push_token:
-        description: 'Fine-grained PAT (Contents + Pull requests: read/write, this repo only, no `workflow` scope). Needed to push fixes so the PR checks re-run.'
+        description: 'Fine-grained PAT (Contents + Pull requests: read/write, this repo only). Needed to push fixes so the PR checks re-run, and to merge. With Workflows: read/write it also merges a change to a workflow file; no agent edits one.'
         required: true
 
 permissions: {}

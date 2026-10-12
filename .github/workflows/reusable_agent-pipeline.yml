@@ -1,8 +1,8 @@
 name: Reusable Agent Pipeline
 
-# Issue -> planner -> writer -> deterministic checks -> reviewer A + reviewer B
-# -> dedup/validation -> fix loop (bounded) -> final reviewer -> documentation
-# reviewer -> changelog -> pull request. All logic lives in
+# Issue -> planner -> writer -> deterministic checks -> four reviewers (developer for
+# correctness, security, SRE, architect) -> dedup/validation -> one fix asked by the
+# developer, reread by it -> documentation reviewer -> changelog -> pull request. All logic lives in
 # scripts/agent_pipeline.py; this file only wires credentials.
 #
 # Credential boundaries, on purpose:
