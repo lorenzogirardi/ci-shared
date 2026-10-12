@@ -65,17 +65,18 @@ These exist in the consumer today. They are the evidence; use them before anythi
 | Role | Node / prompt today | State |
 |---|---|---|
 | Developer | `writer`, `reviewer-correctness` (the second developer) | in the graph |
-
-The four reviewers (`reviewer-correctness`, `reviewer-security`, `reviewer-sre`, `reviewer-architect`) run in
-parallel and independently. Only the second developer sends a change back: a critical or high finding of
-its own goes to the developer agent, once, and it rereads the fix. The other three inform. What remains
-after the one fix is a note, and no finding ends a change whose checks pass (rule 4).
-
 | QA tester | `test-steward`, `failure-adjudicator` | in the graph |
 | Doc writer | `doc-reviewer` | in the graph |
 | Security | `reviewer-security` | in the graph; reads the diff and the tools' evidence (`ai-context-*` artifacts of the commit), which it reports as awareness |
 | SRE | `reviewer-sre` | in the graph; reads the diff and the deploy and scan evidence |
 | Architect | `reviewer-architect` | in the graph; reads the diff and the project's own description (`--context-files`). `docs-architect` is still started by hand; `planner` belongs to the issue flow, which is out for now |
+
+The four reviewers (`reviewer-correctness`, `reviewer-security`, `reviewer-sre`, `reviewer-architect`) run in
+parallel and independently. Only the second developer sends a change back: a critical or high finding of
+its own goes to the developer agent, once, and it rereads the fix. The other three inform. What remains
+after the one fix is a note, and no finding ends a change whose checks pass (rule 4). Every role but the
+writer answers with no thinking before the answer: the reviews of a change take seconds, and the price is
+a second developer that sees an evident defect and weighs a subtle one less well.
 
 Known departures from the rules, to remove rather than extend:
 
@@ -83,9 +84,11 @@ Known departures from the rules, to remove rather than extend:
 - The consumer's release notes (`release-notes.yml`) are a model call outside the graph: a comment on
   a merged pull request, which judges and changes nothing. The changelog is not: `changelog_update.py`
   is deterministic. The analysis after the pipeline on `main` (`ci-analysis`) was removed on 2026-10-12.
-- A change to `.github/workflows/` was merged by a person until 2026-10-11: the merge gate refused it
-  before trying. The owner gave the agents' token the `workflow` permission and the gate now attempts
-  the merge like any other, gated by the same required checks; not yet seen in a real run.
+- No agent edits a file under `.github/workflows/`: a change to the pipeline is written by a person.
+  It is merged like any other since 2026-10-11, when the owner gave the agents' token the `workflow`
+  permission (seen: flask #306, #307, #308, ci-shared #63).
+- A change to the engine is reviewed by the released engine, the one it replaces; the canary is what
+  judges the new one.
 
 ## What the pipeline must close by itself
 
@@ -106,7 +109,7 @@ State: **yes** handled · **part** handled in part, outside the graph, or never 
 | 6 | Documentation only | doc writer | yes |
 | 7 | Infrastructure: Dockerfile, helm chart, compose | SRE, security | part: both roles read the evidence; not yet seen on a real infrastructure change |
 | 8 | Configuration, environment variables, database schema | architect, SRE | part: both roles review it; not yet seen in a real run |
-| 9 | Change to the pipeline (`.github/workflows/`) | SRE | part: the gate merges it with the agents' token; not yet seen in a real run |
+| 9 | Change to the pipeline (`.github/workflows/`) | SRE | yes: reviewed, and merged by the gate with the agents' token (flask #306). Written by a person: no agent edits those files |
 | 10 | Pull request behind the base branch or in conflict | developer | part: only for the dependency bot |
 | 11 | Stalled pull request (forgotten draft, author gone) | — | part: closed only when it has no verdict |
 | 12 | Pull request from a fork (no secrets) | security | no: never tried |
@@ -126,7 +129,7 @@ State: **yes** handled · **part** handled in part, outside the graph, or never 
 
 | # | Action | Roles | State |
 |---|---|---|---|
-| 19 | Patch or minor update of a library | developer, QA | yes, in the second engine (sweep) |
+| 19 | Patch or minor update of a library | developer, QA | yes, in the second engine (sweep); the graph reviews it too since flask #307, not yet seen |
 | 20 | Major update with a changed API | developer (migration) | yes, in the sweep |
 | 21 | Base image or runtime | SRE, QA | part: one source for the version, not yet seen in a real run |
 | 22 | Versions of GitHub Actions | SRE | part: reviewed, the bot's wait for `agent-review` not verified |
@@ -158,12 +161,11 @@ State: **yes** handled · **part** handled in part, outside the graph, or never 
 |---|---|---|---|
 | 34 | Flaky test or runner failure | QA, SRE | yes: one re-run, then a verdict |
 | 35 | The pipeline checks itself | SRE | yes: health check and canary |
-| 36 | Model unavailable or budget exhausted | SRE | part: retried, then abandoned |
+| 36 | Model unavailable or budget exhausted | SRE | part: abandoned, with a comment that names the role left without an answer and not the cause; not tried again until a new push (seen 2026-10-11, the key's monthly limit) |
 | 37 | Documentation drifting from the code with no pull request | doc writer, architect | no: started by hand |
 | 38 | Technical debt: dead code, falling coverage | developer, QA | no |
 
-The rows in state **no** gather on three roles: security (7, 12, 23, 24, 33), SRE (9, 18, 29) and
-architect (8, 25, 31, 37). Those are the roles the graph lacks.
+The rows in state **no**: 12, 13, 18, 23, 25, 29, the issues (30 to 33), 37 and 38.
 
 ## Order of work
 
@@ -173,8 +175,9 @@ Each step reuses or replaces something; none adds a layer.
    they found without blocking (rule 4). `ci-analysis` is removed.
 2. Done: `reviewer-sre` reads the build and deploy evidence of the `image` job.
 3. Done: `reviewer-architect` reviews every change.
-4. The dependency bot's pull requests go through the same graph; the sweep only picks the pull
-   request and starts it.
+4. The dependency bot's pull requests go through the same graph. First step done on the consumer
+   (flask #307): the graph reviews them, next to the sweep; not yet seen. Then the sweep keeps only
+   the request to rebase.
 5. Optional: a risk score computed from facts (files touched, size, tool findings) that chooses
    between merge and abandon.
 
@@ -192,6 +195,13 @@ Each step reuses or replaces something; none adds a layer.
 - Tests: `pytest tests/` (needs `scripts/requirements-autofix.txt`). The unit tests do not show what
   a model does with a real pull request: after an engine change, the consumer's canary is the proof.
 - Releases: `v2` moves by itself after the tests and the consumer's canary pass. Never move it by hand.
+  Every release runs the canary, which opens a pull request on the consumer: group the changes to the
+  engine into few pull requests.
+- Before an engine change goes into the pipeline, run the new engine on a real pull request locally
+  (`agent_pipeline.py change --mode pr` in a throwaway clone, the engine copied to `.shared/`, nothing
+  published) and look at the seconds and the outcome. The pipeline reviews it with the old engine.
+- A sentence such as "resolved (#50" in a commit message closes that pull request. Name a pull request
+  in a commit message without a closing word before it.
 - A reusable workflow that needs a new permission or input: the consumer's caller is changed first.
 - Say what was verified in a real run and what was not. Do not describe behaviour as working because
   the code for it exists.

@@ -80,8 +80,9 @@ How it fits together:
 - Deterministic checks run in a process whose environment contains no model
   key and no token, from a checkout that keeps no credentials. Only the final
   `publish` step holds a write token and it runs no repository code.
-- The loop is bounded (`max_iterations`, `max_verify_retries`,
-  `writer_rounds`). When it stops without converging, the PR says so.
+- One loop: only the developer who reviews correctness sends a change back, once, and rereads the
+  fix; the other roles inform. Failing checks are retried within `max_verify_retries` and the writer
+  within `writer_rounds`. When a run stops without converging, the PR says so.
 - `reusable_pr-review-sweep.yml` gained `skip_head_prefixes` so the sweep
   leaves `agent/` branches to the pipeline that certifies them.
 - Cost per role is recorded (`.ai/agents/*.usage.json`) and shown in the PR.
@@ -89,8 +90,9 @@ How it fits together:
   The rules that make that safe are code, not prompt: tests are the
   specification (a test is changed only when the change's own description says
   so, quoted word for word); a test an agent has just written is not the
-  specification, so the application is never changed to satisfy it; an agent
-  that cannot produce a usable answer blocks the certification; a verdict is
+  specification, so the application is never changed to satisfy it; without a
+  usable answer from the correctness reviewer, the test steward or the
+  documentation reviewer nothing is certified; a verdict is
   bound to one commit, and a run whose commit is no longer the head publishes
   nothing; documentation edits never touch `CLAUDE.md`, `AGENTS.md` or
   `.claude/`.
@@ -168,8 +170,8 @@ comment both say plainly that a machine wrote it, unreviewed, and that the
 real CI on the pushed commit — not this loop — decides whether it merges.
 The repair loop is the same engine as every other change (`scripts/agent_pipeline.py`),
 started from the failing CI logs: writer, deterministic checks in a secret-free
-process, failure adjudication (is the code or the test wrong), two independent
-reviewers; retried once with twice the budget, then the PR is abandoned. Before
+process, failure adjudication (is the code or the test wrong), the reviewers;
+retried once with twice the budget, then the PR is abandoned. Before
 the model reads anything, the checks run once on the PR as the bot left it, so
 the NEW dependency version is installed and its source can be read. The push
 token is taken out of `.git/config` while the PR's code runs and put back only
@@ -265,16 +267,19 @@ Each consumer repo needs, in *Settings → Secrets and variables → Actions*:
   the script), `OPENROUTER_SITE_URL`, `OPENROUTER_APP_NAME` (optional)
 - Secret `OPENROUTER_API_KEY`
 - Secret `AUTOFIX_PUSH_TOKEN` (the agent workflows): a fine-grained token with
-  *Contents: read and write* on the repository, never the `workflow` scope. It
-  pushes fixes and merges, so that the workflows of the branch it lands on
-  start. It does not need to open pull requests: those are opened with the
-  job's own token.
+  *Contents* and *Pull requests: read and write* on the repository. It pushes
+  fixes and merges, so that the workflows of the branch it lands on start. Add
+  *Workflows: read and write* for the merge gate to merge a change to
+  `.github/workflows/` too; without it GitHub refuses that merge and such a
+  change waits for a person. No agent edits a workflow file either way. It does
+  not need to open pull requests: those are opened with the job's own token.
 - *Settings → Actions → General → Workflow permissions*: **Allow GitHub
   Actions to create and approve pull requests**, for the canary and for the
   fix pull request after a direct push.
 - For the canary: a small module nothing imports, its tests, and
   `.github/canary.json` describing the scenarios (edits to make, and what must
-  be true afterwards).
+  be true afterwards). One pull request is opened per scenario, on every run
+  and on every release of this repository: keep them few.
 
 Nothing needs to be configured in this repo per consumer — it's stateless.
 
@@ -286,8 +291,8 @@ the same commit, and `release-tag.yml` then moves `v2`, once the canary of the c
 passed against the merged commit. The agents run at the published tag, never at the
 pull request's own code, so a change that breaks a reviewer is still judged by the reviewer that works.
 
-Two things stay with a person: a pull request that touches `.github/workflows/` (no agent may edit or merge
-those), and a breaking change that needs a new tag.
+What stays with a person: writing a change to `.github/workflows/` (no agent edits those; since 2026-10-11
+the merge gate merges them like any other change), and a breaking change that needs a new tag.
 
 ## Tests
 
@@ -295,7 +300,7 @@ those), and a breaking change that needs a new tag.
 pytest tests/ -v
 ```
 
-430+ tests, no network, no real `gh` calls — `checks_state`, verdict parsing,
+About 490 tests, no network, no real `gh` calls — `checks_state`, verdict parsing,
 the engine's graph against real throwaway git repositories and a scripted
 model, failure adjudication, the weakening guard, the merge gate and the main
 guard (with a local bare remote), terminal states, and `auto_merge_authors`

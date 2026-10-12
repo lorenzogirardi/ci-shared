@@ -1,6 +1,6 @@
 name: Reusable Agent Review
 
-# Reviewer A (correctness/design) and reviewer B (security/operability) on a
+# The four reviewers (developer for correctness, security, SRE, architect) on a
 # pull request: independent calls, structured findings validated against the
 # diff, deduplicated, posted as one comment. Reads the diff only; no repository
 # code is executed, so no secrets are at risk from the PR content.

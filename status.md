@@ -1,6 +1,6 @@
 # Status — AI-native pipeline
 
-Written 2026-10-11 13:40 UTC as a handoff: the work continues from another machine with no memory of
+Written 2026-10-11 as a handoff and brought up to date on 2026-10-12 06:30 UTC: the work continues from another machine with no memory of
 this session. Read `CLAUDE.md` first (intent, rules, tools, the 38 team actions), then this file.
 
 Engine: `lorenzogirardi/ci-shared` (tag `v2`, moved only by `release-tag.yml`).
@@ -27,7 +27,7 @@ merged · abandoned · reverted        + warnings and every role's verdict visib
 
 | Thing | State |
 |---|---|
-| `ci-shared` `main` and `v2` (what every consumer runs) | `e92c07a` (#62), equal at 06:00 UTC on 2026-10-12 |
+| `ci-shared` `main` and `v2` (what every consumer runs) | equal after every release; check with `git fetch --tags -f origin && git rev-parse origin/main v2^{commit}` |
 | Seen on the consumer on 2026-10-11/12 | a real change to the app through the whole graph, merged with no person in 6 minutes (flask #302); two changes to workflow files merged by the agents (flask #306, #307); the canary with one pull request (flask #305) |
 | The dependency bot | since flask #307 the graph reviews its pull requests too, next to the sweep. **Not seen**: needs its next pull request. If the graph posts its verdict there, the sweep is reduced to asking for a rebase |
 | The model key | its monthly limit was reached on 2026-10-11 and every pull request was abandoned until the owner raised it; the comment said "the test steward could not produce a usable answer", the cause was only in the log. A commit abandoned for that is not tried again without a new push |
@@ -36,15 +36,17 @@ merged · abandoned · reverted        + warnings and every role's verdict visib
 
 ## Next actions, in order
 
-1. Done: #53 (the architect informs), #55 (a second attempt takes up the review), #56, #57 merged by
-   the agents and released.
-2. **#50 (risk level).** Fix the confirmation first: it must be bound to the commit that asked for it.
-   Then rebase; it touches `reusable_agent-change.yml`, so it is merged by hand once certified and green.
-3. **Step 5: the dependency bot through the same graph.** Not started. The largest step: the sweep
-   (`scripts/pr_review_sweep.py`) keeps only "pick the bot's pull requests, ask for a rebase when
-   behind, leave the merge of workflow pull requests to the bot"; review, repair and merge come from
-   the graph and the existing merge gate; its own review, triage, autofix and merge code is deleted.
-4. Done: step 6, `ai-analysis` removed (flask #306, and `reusable_ci-analysis.yml` here).
+1. **The dependency bot's next pull request on flask.** Look for the graph's comment on it (marker
+   `<!-- agent-pr -->`) next to the sweep's. If it is there, reduce the sweep to asking for a rebase
+   (step 5); if it is not, the `pull_request` run of a bot author still has a token that cannot write,
+   and the graph has to be started another way for those pull requests.
+2. **#50 (risk level).** Closed by accident, the branch is there. Fix the confirmation first: it must
+   be bound to the commit that asked for it. It touches `reusable_agent-change.yml`: the agents merge
+   it now.
+3. **The consumer's release notes** (`release-notes.yml`): the one model call left outside the graph.
+   The owner has not said whether it stays.
+4. What a run does when the model cannot be reached (row 36 of `CLAUDE.md`): say the cause in the
+   comment, and try the commit again by itself.
 5. Update the state column of the 38 actions in `CLAUDE.md` in each change that moves one.
 
 ## The plan and what is done
@@ -57,9 +59,9 @@ Approved by the owner on 2026-10-11. One pull request per step and repository, r
 | 1 | Trivy, Checkov, TruffleHog and the deploy state on every pull request, as warnings and `ai-context-*` artifacts; TruffleHog on `main` | flask #262 | yes |
 | 2 | The engine downloads those artifacts at the first review; security reads them and reports under "Awareness (not blocking)" | ci-shared #48 | yes: the canary's pull requests carry the section |
 | 3 | `reviewer-sre` and `reviewer-architect` added to the reviewers of the graph | ci-shared #49 | yes: four roles, three canary pull requests certified, $0.011-0.019 each |
-| 4 | Risk score on every pull request; input `risk_level` 1-10 (default 1, never asks); above 1 a certified change waits for the label `risk-confirmed` | ci-shared #50 | **open** |
-| 5 | The dependency bot through the same graph | — | not started |
-| 6 | Remove `ai-analysis` and what else was replaced | — | not started |
+| 4 | Risk score on every pull request; input `risk_level` 1-10 (default 1, never asks); above 1 a certified change waits for the label `risk-confirmed` | ci-shared #50 | **closed, not merged**: the confirmation is not bound to the commit |
+| 5 | The dependency bot through the same graph | flask #307 (the graph reviews them too) | first step, **not seen**: needs the bot's next pull request |
+| 6 | Remove `ai-analysis` and what else was replaced | flask #306, ci-shared #63 | yes |
 
 Outside the plan, each for a defect seen in a real run:
 
@@ -71,7 +73,17 @@ Outside the plan, each for a defect seen in a real run:
 | Trivy and Checkov findings as warning and summary on `main` | flask #258 | released, seen (Checkov) |
 | A model call is stopped after 5 minutes, a run after 15, the job after 25; one log line per model call | ci-shared #51 | released, seen (the lines) |
 | The developer agent is shown the code around each finding; the refusal of an unusable reply says what to send | ci-shared #52 | released, seen: the canary passed with it |
-| The architect only informs | ci-shared #53 | released; the canary passed |
+| The architect only informs | ci-shared #53 | replaced by #60: every role but the second developer informs |
+| A stopped call says what the model script reported | ci-shared #55 | released, seen (#57: "empty reply, retrying") |
+| The correctness reviewer has a narrower task and a cap of 5 findings | ci-shared #56 | released; it did not shorten the wait |
+| One retry of an empty reply, with the same budget | ci-shared #57 | released |
+| A reviewer asks for a fix once and never ends a change whose checks pass | ci-shared #58 | released; "never ends" seen only in unit tests |
+| One loop: only the second developer sends back and rereads the fix; no final reviewer; no second attempt on a pull request | ci-shared #60 | released, the canary passed |
+| Every role but the writer answers with no thinking | ci-shared #59, #60, #62 | released, seen: the six reviews of #61 took 9 seconds of model time in all; a real change on flask (#302) merged in 6 minutes |
+| The merge gate merges a change to a workflow file | ci-shared #61 | released, seen (flask #306, #307, #308; ci-shared #63) |
+| The canary opens one pull request | flask #303 | seen (flask #305). The `intent` scenario left the canary |
+| The `image` job does not rebuild for a commit that only changes unit tests | flask #293 | merged; **not seen**: on #302 the agents' last commit was documentation, so it rebuilt |
+| The SBOM of the pull request's image is evidence | flask #308 | the artifact is produced (210 packages); **not seen** in a role's awareness yet |
 
 ## What went wrong today, and what it taught
 
@@ -139,9 +151,11 @@ The owner's standing instructions, in their words where it matters:
 
 Practical facts that cost time to learn:
 
-- A change that touches `.github/workflows/` cannot be merged by the agents (no `workflow` scope):
-  wait for their certification and the checks, then `gh pr merge <n> --squash --delete-branch`, as its
-  own short command. Everything else they merge themselves.
+- The agents merge every certified, green pull request, those that touch `.github/workflows/`
+  included (since ci-shared #61; the token has the `workflow` permission). No agent edits those files.
+- A session of Claude Code may be refused, by its own permission rules, the merge of a pull request and
+  a change that removes a protection of the pipeline: the owner then runs the command with `!`.
+- A commit the agents abandoned is not reviewed again by a re-run: push a commit, an empty one will do.
 - A reusable workflow that needs a new permission or input: change the consumer's caller first, then
   let `v2` move. Never move `v2` by hand.
 - The agents reviewing a pull request of this repository run at the released `v2`, not at the pull
@@ -162,13 +176,16 @@ How to look at a run:
 
 ## Not verified in a real run
 
+- The graph on a pull request opened by the dependency bot (flask #307).
 - The dependency bot waiting for the status `agent-review` before merging a workflow pull request.
 - A base-image update (`Dockerfile`, Python 3.15 when its image is published) taken to merge by the
   agents alone.
 - Trivy or TruffleHog reporting a finding (the image has no critical vulnerability, no secret was committed).
 - The fix pull request after a direct push to `main`.
 - A run actually ending at its 15-minute budget.
-- The risk level asking for confirmation (unit tests only; no consumer sets a level above 1).
+- A change that goes on to be certified with a finding of the second developer left unresolved.
+- A change of behaviour made on purpose, where a test must be updated, since it left the canary.
+- The security role reporting the SBOM.
 
 ## Left for the owner
 

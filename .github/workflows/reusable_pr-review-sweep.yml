@@ -38,7 +38,7 @@ on:
         type: string
         default: ''
       structured_review:
-        description: 'Review with the two independent reviewers of the agent pipeline (structured findings, validated against the diff) instead of the single reviewer, and review a machine-written autofix commit before it can merge. A clean verdict then means: no blocking finding.'
+        description: 'Review with the reviewers of the agent pipeline (structured findings, validated against the diff) instead of the single reviewer, and review a machine-written autofix commit before it can merge. A clean verdict then means: no blocking finding.'
         required: false
         type: boolean
         default: false
