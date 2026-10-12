@@ -407,9 +407,10 @@ class TestProactiveSteward:
         caller = FakeCaller({"test-steward": [evil], **reviewers_ok()})
         _, final = run(repo, caller, "feat: add sub")
         assert pathlib.Path("tests/test_calc.py").read_text() == TEST
-        # It tried twice, was refused twice: the tests of this change were never established, so no certification.
-        assert final["outcome"] != "converged"
-        assert any("weaken the tests" in n and "not certified" in n for n in final["notes"])
+        # It tried twice, was refused twice: nothing of it was kept. The change works and goes on, and it is
+        # said that nobody established whether it has the tests it needs.
+        assert final["outcome"] == "converged"
+        assert any("weaken the tests" in n and n.startswith(ap.UNTESTED) for n in final["notes"])
 
     def test_a_steward_whose_first_reply_is_unusable_gets_told_why_and_tries_again(self, repo):
         """flask-test-api PR #190: an anchor that is not in the file. It used to end as a note under a certification."""
@@ -443,7 +444,9 @@ class TestProactiveSteward:
         second = [user for role, user in caller.log if role == "test-steward"][1]
         assert "FAILED against this change" in second
 
-    def test_steward_tests_that_fail_twice_block_the_certification_and_leave_the_code_alone(self, repo):
+    def test_steward_tests_that_fail_twice_are_taken_out_and_the_change_that_works_goes_on(self, repo):
+        """The mcp-2 migration, 2026-10-12: right, checks passing, and abandoned because the steward called a
+        fixture as a function and then left out an import. A new test that does not run says nothing of the app."""
         pathlib.Path("calc.py").write_text(GOOD + "\n\ndef sub(a, b):\n    return a - b\n")
         commit_all("feat: add sub")
         code_before = pathlib.Path("calc.py").read_text()
@@ -451,18 +454,19 @@ class TestProactiveSteward:
                        "content": "from calc import sub\n\n\ndef test_sub():\n    assert sub(3, 1) == 99\n"}]})
         caller = FakeCaller({"test-steward": [wrong], **reviewers_ok()})
         _, final = run(repo, caller, "feat: add sub")
-        assert final["outcome"] != "converged"
+        assert final["outcome"] == "converged"
         assert pathlib.Path("calc.py").read_text() == code_before
         assert not pathlib.Path("tests/test_sub.py").exists()
-        assert any("not certified" in n for n in final["notes"])
+        assert [role for role, _ in caller.log].count("test-steward") == 2      # two tries, and no more
+        assert any(n.startswith(ap.UNTESTED) and "did not pass against the change, twice" in n for n in final["notes"])
 
-    def test_a_steward_that_never_answers_blocks_the_certification(self, repo):
+    def test_a_steward_that_never_answers_is_said_and_does_not_end_a_change_that_works(self, repo):
         pathlib.Path("calc.py").write_text(GOOD + "\n\ndef sub(a, b):\n    return a - b\n")
         commit_all("feat: add sub")
         caller = FakeCaller({"test-steward": ["not json at all"], **reviewers_ok()})
         _, final = run(repo, caller, "feat: add sub")
-        assert final["outcome"] != "converged"
-        assert any("test steward could not produce a usable answer" in n for n in final["notes"])
+        assert final["outcome"] == "converged"
+        assert any(n.startswith(ap.UNTESTED) and "no usable answer" in n for n in final["notes"])
 
 
 class TestGuardCi:

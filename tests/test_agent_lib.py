@@ -215,3 +215,128 @@ class TestAskJson:
 def test_untrusted_text_is_redacted_and_capped():
     text = lib.sanitize_untrusted("key sk-or-v1-" + "a" * 40 + " " + "x" * 50, limit=60)
     assert "sk-or-v1-" not in text and len(text) <= 60
+
+
+class TestArchitectTools:
+    """The look-ups an architect may ask for: fixed, read-only, and none of them a way out of the repository."""
+
+    @pytest.fixture(autouse=True)
+    def project(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        files = {
+            "app/__init__.py": "",
+            "app/api.py": "from somelib.server import Old\nfrom app.store import save\n\n\n@router.get('/items')\ndef items():\n    return save(Old())\n",
+            "app/store.py": "def save(item, *, retries: int = 2) -> bool:\n    \"\"\"Keep one item.\"\"\"\n    return True\n\n\nclass Store:\n    def __init__(self, url: str):\n        self.url = url\n\n    def get(self, key: str) -> str:\n        return key\n\n    def _hidden(self):\n        pass\n",
+            "tests/test_store.py": "from app.store import save\n\n\ndef test_save():\n    assert save(1)\n",
+            "tests/test_api.py": "from somelib.client import old_client\n\n\ndef test_items():\n    pass\n",
+        }
+        for name, text in files.items():
+            (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+            (tmp_path / name).write_text(text)
+        run = lambda *a: subprocess.run(["git", *a], cwd=tmp_path, check=True, capture_output=True)  # noqa: E731
+        run("init", "-q"), run("config", "user.email", "t@t"), run("config", "user.name", "t")
+        run("add", "-A"), run("commit", "-qm", "first: the store keeps items")
+        self.base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tmp_path, capture_output=True, text=True).stdout.strip()
+        monkeypatch.setattr(lib, "tool_context", {"base_sha": self.base, "evidence": None, "runs_dir": str(tmp_path / "agents-run")})
+        monkeypatch.delenv("AGENTS_RUN_DIR", raising=False)
+        self.root = tmp_path
+
+    def test_a_request_is_one_key_and_an_empty_value_still_asks(self):
+        assert lib.parse_explore('```json\n{"usages": "somelib"}\n```') == ("usages", "somelib")
+        assert lib.parse_explore('```json\n{"api": ""}\n```') == ("api", "")
+        assert lib.parse_explore('```json\n{"read": "app/api.py"}\n```') == ("read", "app/api.py")
+        assert lib.parse_explore('```json\n{"shell": "rm -rf ."}\n```') is None
+        assert "needs a value" in lib.explore("usages", "")
+
+    def test_usages_shows_every_place_and_the_imports_first(self):
+        out = lib.explore("usages", "somelib")
+        assert "2 lines in 2 files" in out
+        assert "app/api.py:1: from somelib.server import Old" in out and "tests/test_api.py:1:" in out
+        assert "Nothing in this repository" in lib.explore("usages", "nowhere_at_all")
+
+    def test_signature_reads_a_function_and_a_class_without_running_them(self):
+        assert "def save(item, *, retries: int=2) -> bool" in lib.explore("signature", "app/store.py::save")
+        out = lib.explore("signature", "app/store.py::Store")
+        assert "def __init__(self, url: str)" in out and "def get(self, key: str) -> str" in out and "_hidden" not in out
+        gone = lib.explore("signature", "app/store.py::Missing")
+        assert "defines no function or class named 'Missing'" in gone and "save" in gone
+
+    def test_signature_follows_a_name_a_package_only_passes_on(self):
+        assert "def dumps(" in lib.explore("signature", "json.dumps")
+        assert "class JSONDecoder" in lib.explore("signature", "json.JSONDecoder")     # defined in json.decoder
+
+    def test_history_says_why_a_file_is_as_it_is(self):
+        assert "first: the store keeps items" in lib.explore("history", "app/store.py")
+        assert "is not a file or folder of this repository" in lib.explore("history", "/etc/passwd")
+
+    def test_tests_names_the_test_files_that_import_a_source_file(self):
+        out = lib.explore("tests", "app/store.py")
+        assert "tests/test_store.py (1 tests)" in out and "test_api" not in out
+        assert "No test file imports app.api" in lib.explore("tests", "app/api.py")
+        assert "not a Python file of this repository" in lib.explore("tests", "../outside.py")
+
+    def test_api_lists_the_routes_and_what_the_change_adds(self):
+        assert "no route added or removed" in lib.explore("api", "")
+        (self.root / "app/api.py").write_text((self.root / "app/api.py").read_text() + "\n\n@router.post('/items')\ndef add():\n    pass\n")
+        out = lib.explore("api", "")
+        assert "2 routes" in out and "+ added: POST    /items" in out and "removed" not in out.split("Against")[1]
+
+    def test_imports_runs_one_fixed_command_on_tracked_paths_only(self):
+        seen = []
+
+        def run(cmd, **kw):
+            seen.append(cmd)
+            return subprocess.CompletedProcess(cmd, 2, "app/api.py:1: No name 'Old' in module 'somelib.server'\n*** noise\n", "")
+        out = lib.tool_imports("app ../elsewhere --load-plugins=x", run=run)
+        assert "found 1 in app" in out and "No name 'Old'" in out and "noise" not in out
+        assert seen[0][-1] == "app" and "--load-plugins=x" not in seen[0] and "../elsewhere" not in seen[0]
+        assert "None of" in lib.tool_imports("--help", run=run) and len(seen) == 1
+
+    def test_evidence_is_what_the_run_was_given(self):
+        assert "reported nothing" in lib.explore("evidence", "")
+        lib.tool_context["evidence"] = lambda: "### trivy\n0 critical"
+        assert "0 critical" in lib.explore("evidence", "")
+
+    def test_runs_finds_the_earlier_records_and_not_its_own(self):
+        folder = self.root / "agents-run"
+        folder.mkdir()
+        (folder / "old.md").write_text("# an earlier run\nchanged app/store.py and it failed")
+        (folder / "now.md").write_text("this run, on app/store.py")
+        lib.tool_context["run_record"] = "now.md"
+        out = lib.explore("runs", "app/store.py")
+        assert "1 earlier runs" in out and "old.md" in out and "now.md" not in out
+        assert "No earlier run on record" in lib.explore("runs", "app/other.py")
+
+    def test_docs_reads_only_the_pages_a_library_names_for_itself(self, monkeypatch):
+        monkeypatch.setattr(lib, "_declared_urls", lambda name: ("2.0.0", {
+            "Documentation": "https://docs.somelib.example/", "Repository": "https://github.com/someone/somelib"}) if name == "somelib" else None)
+
+        class Dist:
+            metadata = {"Name": "somelib"}
+        monkeypatch.setattr(lib.importlib.metadata, "distributions", lambda: [Dist()])
+        asked = []
+
+        def fetch(url):
+            asked.append(url)
+            return None if "CHANGELOG" in url else "intro\n## `old_client` removed\nUse `new_client`.\n## other\n"
+        about = lib.tool_docs("somelib", fetch=fetch, release_notes=lambda repo, tag: "renamed Old to New" if tag == "v2.0.0" else "",
+                              guides=lambda repo, tag: [f"https://raw.githubusercontent.com/{repo}/{tag}/docs/migration.md"])
+        assert "version 2.0.0" in about and "renamed Old to New" in about and "someone/somelib/v2.0.0/docs/migration.md" in about
+        page = lib.tool_docs("https://docs.somelib.example/migration::old_client", fetch=fetch)
+        assert "## `old_client` removed" in page and "new_client" in page and "## other" not in page
+        both = lib.tool_docs("https://docs.somelib.example/migration::old_client::other::nowhere", fetch=fetch)
+        assert "new_client" in both and "--- about 'other':\n## other" in both and "'nowhere': the page does not mention it" in both
+        long_page = "# Guide\n" + "x" * 13000 + "\n## Clients\ntext\n```\n# a comment in code\n```\n### Auth\n"
+        listed = lib.tool_docs("https://docs.somelib.example/migration", fetch=lambda url: long_page)
+        assert "Its sections:\n- Guide\n  - Clients\n    - Auth" in listed and "a comment in code" not in listed.split("Its sections:")[1]
+        assert "new_client" in lib.tool_docs("https://raw.githubusercontent.com/someone/somelib/v2.0.0/docs/migration.md", fetch=fetch)
+        before = len(asked)
+        for refused in ("https://evil.example/x", "http://docs.somelib.example/x", "https://github.com/other/repo/blob/main/x.md",
+                        "https://raw.githubusercontent.com/someone/other/main/x.md", "https://169.254.169.254/latest/meta-data"):
+            assert "cannot be read" in lib.tool_docs(refused, fetch=fetch)
+        assert len(asked) == before
+        assert "No installed library is named" in lib.tool_docs("not-installed-anywhere", fetch=fetch)
+
+    def test_a_page_on_a_private_address_is_never_fetched(self, monkeypatch):
+        monkeypatch.setattr(lib.socket, "getaddrinfo", lambda host, port: [(2, 1, 6, "", ("10.0.0.5", 443))])
+        assert lib.fetch_page("https://docs.somelib.example/") is None

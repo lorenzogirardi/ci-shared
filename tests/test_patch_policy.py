@@ -142,7 +142,8 @@ class TestWriterIsRefusedBeforeApplying:
         caller = FakeCaller({"writer": [bad, good]})
         applied, _ = ap.run_writer(self.runtime(caller, repo), {"scope": ["s"], "out_of_scope": []}, "")
         assert applied is not None and pathlib.Path("b.py").read_text() == "KEY = None\n"
-        assert "refused before it touched anything" in caller.log[1][1] and "credential" in caller.log[1][1]
+        second = [user for role, user in caller.log if role == "writer"][1]
+        assert "refused before it touched anything" in second and "credential" in second
 
     def test_a_writer_that_keeps_proposing_a_forbidden_patch_never_touches_the_tree(self, repo):
         bad = fence({"explanation": "x", "changes": [{"file": "app/api.py", "content": "x = 1\n"}]})
@@ -169,7 +170,7 @@ class TestFinalGateStopsPublishing:
             commit({"leak.py": f"KEY = '{TOKEN}'\n"})
             return {"outcome": "converged", "notes": []}
         monkeypatch.setattr(ap.lib, "ModelCaller", lambda *a, **k: FakeCaller({}))
-        monkeypatch.setattr(ap, "build_graph", lambda rt: types.SimpleNamespace(invoke=engine))
+        monkeypatch.setattr(ap, "build_graph", lambda rt, checkpointer=None: types.SimpleNamespace(stream=lambda state, **k: iter([engine(state)])))
         assert ap.cmd_change(self.args(repo)) == 0
         result = json.loads(pathlib.Path(".ai/agent-run/result.json").read_text())
         assert result["outcome"] == "abandoned" and result["commits"] == 0
@@ -180,7 +181,7 @@ class TestFinalGateStopsPublishing:
             commit({"fine.py": "x = 1\n"})
             return {"outcome": "converged", "notes": []}
         monkeypatch.setattr(ap.lib, "ModelCaller", lambda *a, **k: FakeCaller({}))
-        monkeypatch.setattr(ap, "build_graph", lambda rt: types.SimpleNamespace(invoke=engine))
+        monkeypatch.setattr(ap, "build_graph", lambda rt, checkpointer=None: types.SimpleNamespace(stream=lambda state, **k: iter([engine(state)])))
         ap.cmd_change(self.args(repo))
         assert json.loads(pathlib.Path(".ai/agent-run/result.json").read_text())["outcome"] == "converged"
 
@@ -203,7 +204,7 @@ class TestNoAgentWeakensTests:
         applied, _ = ap.run_writer(ap.Runtime(caller, repo, "true", 30, 3, 2, 3, "", "", 0), {"scope": ["s"], "out_of_scope": []}, "")
         assert applied is None
         assert pathlib.Path(self.TEST_FILE).read_text() == self.GOOD                  # reverted
-        assert "weakens the tests" in caller.log[1][1]
+        assert "weakens the tests" in [user for role, user in caller.log if role == "writer"][1]
 
     def test_the_writer_may_correct_an_outdated_test_without_weakening_it(self, repo):
         self.seed(repo)

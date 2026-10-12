@@ -258,7 +258,7 @@ def build_context(history: list[str], budget: int = MAX_CONTEXT_CHARS) -> str:
     return "\n\n---\n\n".join(kept)
 
 
-_DOTTED_MODULE_RE = re.compile(r"^[A-Za-z_][\w]*(\.[A-Za-z_][\w]*)+$")
+_DOTTED_MODULE_RE = re.compile(r"^[A-Za-z_][\w]*(\.[A-Za-z_][\w]*)*$")     # `mcp.server.x`, and a top-level package: `mcp`
 
 
 def readable_roots() -> list[pathlib.Path]:

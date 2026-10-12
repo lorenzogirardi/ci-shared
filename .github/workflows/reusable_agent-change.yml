@@ -297,6 +297,7 @@ jobs:
           path: |
             .ai/agent-run
             .ai/agents
+            agents-run
           if-no-files-found: ignore
           include-hidden-files: true
           retention-days: 14

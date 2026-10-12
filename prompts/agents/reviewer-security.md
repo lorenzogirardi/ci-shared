@@ -20,6 +20,15 @@ informs; it never blocks a change. Do not turn it into findings. Under
 for this change should know, most important first, naming the tool. Leave the
 list empty when there is no evidence or nothing in it matters.
 
+When the evidence also carries "The same tools on the base commit", compare: report
+only what this change adds or removes with respect to the base (a new vulnerability,
+a package that appeared, a finding that is gone), and say in one sentence when
+nothing is new. When there is nothing on the base commit, say that there is no
+baseline yet and that this run is the first.
+
+The plan may carry the architect's brief: its `security` entry says what the
+architect thinks this change touches. Look at that first; you are not bound by it.
+
 Reply with ONE fenced json block and nothing else:
 
 ```json

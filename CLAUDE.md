@@ -64,23 +64,40 @@ These exist in the consumer today. They are the evidence; use them before anythi
 
 | Role | Node / prompt today | State |
 |---|---|---|
-| Developer | `writer`, `reviewer-correctness` (the second developer) | in the graph |
-| QA tester | `test-steward`, `failure-adjudicator` | in the graph |
+| Architect | `architect` (the brief), `architect-decide`, `architect-close` | opens and closes every change; has tools to look things up (below) |
+| Developer | `writer` (developer 1), `reviewer-correctness` (developer 2, the pair) | in the graph |
+| QA tester | `test-steward`, `failure-adjudicator` | in the graph; told by the brief what to check |
+| SRE | `reviewer-sre` | in the graph, next to security; reads the diff and the deploy and scan evidence; informs |
+| Security | `reviewer-security` | in the graph; reads the diff and the tools' evidence for the commit and for the base (`ai-context-*`); informs |
 | Doc writer | `doc-reviewer` | in the graph |
-| Security | `reviewer-security` | in the graph; reads the diff and the tools' evidence (`ai-context-*` artifacts of the commit), which it reports as awareness |
-| SRE | `reviewer-sre` | in the graph; reads the diff and the deploy and scan evidence |
-| Architect | `reviewer-architect` | in the graph; reads the diff and the project's own description (`--context-files`). `docs-architect` is still started by hand; `planner` belongs to the issue flow, which is out for now |
 
-The four reviewers (`reviewer-correctness`, `reviewer-security`, `reviewer-sre`, `reviewer-architect`) run in
-parallel and independently. Only the second developer sends a change back: a critical or high finding of
-its own goes to the developer agent, once, and it rereads the fix. The other three inform. What remains
-after the one fix is a note, and no finding ends a change whose checks pass (rule 4). Every role but the
-writer answers with no thinking before the answer: the reviews of a change take seconds, and the price is
-a second developer that sees an evident defect and weighs a subtle one less well.
+**The architect first** (on the way in: shown on local replays of real pull requests, not yet in a
+released run). Every change enters at the architect, which reads the code and the facts and writes the
+brief the others work from; developer 1 is always the agent; developer 2 accepts or sends back, three
+times at most, then the architect decides; QA, SRE and security, documents; the architect closes. What
+the code holds, whatever a prompt says:
+
+- a change whose checks pass is never ended by a finding, by an opinion, or by a test QA could not write;
+- the files touched oblige the roles (`roles_required`); the architect adds, never removes;
+- only the roles that write code or the brief think (`writer`, `test-steward`, `architect`);
+- a medium defect developer 2 found, with its fix, goes back once, the first time it reads the change;
+- what the brief asked for and nobody did goes back to the developer once, from the close;
+- work at a dead end returns to the architect once (a second cycle), then it is abandoned.
+
+The architect's tools are fixed, read-only look-ups it chooses among: `list`, `find`, `grep`, `read`,
+and `docs` (what a library says changed), `usages`, `imports`, `signature`, `history`, `tests`, `api`,
+`evidence`, `runs`. Give it a tool before a longer prompt. `docs/architecture.md` has the table.
+
+Every run leaves its record in `agents-run/` (what each role did and found, and the graph's state after
+every node): read it before guessing why a run went as it did.
 
 Known departures from the rules, to remove rather than extend:
 
-- `scripts/pr_review_sweep.py` is a second engine for the dependency bot's pull requests.
+- `scripts/pr_review_sweep.py` is a second engine for the dependency bot's pull requests. With the
+  architect's tools the graph did the mcp-2 migration the sweep was kept for, locally (three runs,
+  two converged in one cycle after QA was given thinking); the sweep goes once that is seen released.
+- The issue flow and the sweep still build the graph without the architect (`planner.md`,
+  `reviewer-architect.md`, `invoke_with_retry`): to delete with them.
 - The consumer's release notes (`release-notes.yml`) are a model call outside the graph: a comment on
   a merged pull request, which judges and changes nothing. The changelog is not: `changelog_update.py`
   is deterministic. The analysis after the pipeline on `main` (`ci-analysis`) was removed on 2026-10-12.
@@ -129,8 +146,8 @@ State: **yes** handled · **part** handled in part, outside the graph, or never 
 
 | # | Action | Roles | State |
 |---|---|---|---|
-| 19 | Patch or minor update of a library | developer, QA | yes, in the second engine (sweep); the graph reviews it too since flask #307, not yet seen |
-| 20 | Major update with a changed API | developer (migration) | yes, in the sweep |
+| 19 | Patch or minor update of a library | developer, QA | yes, in the second engine (sweep); the graph reviewed and merged one too (flask #313), so both engines comment |
+| 20 | Major update with a changed API | developer (migration) | yes, in the sweep; by the graph with the architect only on a local replay (mcp 2) |
 | 21 | Base image or runtime | SRE, QA | part: one source for the version, not yet seen in a real run |
 | 22 | Versions of GitHub Actions | SRE | part: reviewed, the bot's wait for `agent-review` not verified |
 | 23 | Vulnerability found in a dependency already on the main branch (no pull request exists) | security | no: Trivy sees it, nobody acts |

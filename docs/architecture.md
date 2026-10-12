@@ -53,58 +53,112 @@ ci-shared/
 
 ## The engine
 
-`scripts/agent_pipeline.py` builds one `StateGraph`. The same graph serves every entry point; a
-`start` node picks where to begin.
+`scripts/agent_pipeline.py` builds one `StateGraph`. A change that already exists (a pull request, a
+pull request whose checks failed, a push on the base branch: `reusable_agent-change.yml`) enters at the
+architect and is closed by it. Not yet seen in a released run: the whole of this section is on the way
+in, shown on three local replays of real pull requests.
 
 ```mermaid
 flowchart TD
-    S[start]
-    S -->|pull request| V[verify]
-    S -->|CI failed| C[ci_failure]
-    S -->|push on the base branch| R[review]
-    S -->|finding on a dependency PR| W[write]
-    W --> V
-    W -->|edited a test the verdict found right| W
-    V -->|checks pass, code touched| T[tests]
-    V -->|checks pass| R
-    V -->|code is wrong| W
-    V -->|test is wrong| ST[steward]
-    V -->|flaky, retry| V
-    V -->|a test the steward just wrote fails| T
-    T -->|tests added| V
-    T -->|nothing to add| R
+    S[start] --> A[architect: the brief]
+    A -->|a change is needed| W[write: developer 1]
+    A -->|the change is right as submitted| P[pair: developer 2]
+    W --> V[verify: the checks]
+    V -->|fail: the code is wrong| W
+    V -->|fail: the test is wrong| ST[steward]
     ST --> V
-    C -->|code is wrong| W
-    C -->|test is wrong| ST
-    C -->|environment| V
-    R -->|the second developer found a defect, first time| W
-    R -->|nothing to send back, or the fix has been reread| D[docs]
-    D --> E([END])
+    V -->|pass| P
+    P -->|sends back, up to three times| W
+    P -->|third time| DE[decide: architect]
+    DE -->|instructs| W
+    P -->|accepts| T[tests: QA]
+    DE -->|accepts| T
+    T -->|tests added| V
+    T -->|nothing to add, or it could not| I[inform]
+    V -->|QA's tests pass| I
+    I --> SRE[sre]
+    I --> SEC[security]
+    SRE --> IN[informed]
+    SEC --> IN
+    IN --> D[docs]
+    D --> C[close: architect]
+    C -->|the brief asked for something nobody did, once| W
+    C --> E([END])
+    V -.->|the work is at a dead end, first cycle| A
 ```
 
 | Node | Role | May change |
 |---|---|---|
-| `write` | The writer explores read-only (`list`, `find`, `grep`, `read`), then proposes a patch | Code and tests, through a validated patch |
+| `architect` | Runs the checks, then writes the brief every other role works from: what the developer must change, file by file; what the tests must check; whether infrastructure, security and documents are concerned; the facts it established. It reads first (role `architect-read`, no thinking, up to twelve look-ups) and thinks once, on the brief | Nothing |
+| `write` | Developer 1, always the agent, also on a person's pull request. Reads (`writer-read`), then proposes a patch | Code and tests, through a validated patch |
 | `verify` | Runs the consumer's verify command in a process with no secrets | Nothing (reverts a patch that fails) |
-| `ci_failure` | As `verify`, starting from the real logs of a failed CI run | Nothing |
-| `steward` | The test steward updates tests a verdict found wrong | Tests only |
-| `tests` | The test steward checks that changed code is covered | Tests only |
-| `review` | Four independent roles in parallel, validated and deduplicated: developer (`reviewer-correctness`), security, SRE and architect. Security and SRE are also shown what the pipeline's tools reported for the commit (artifacts named `ai-context-*`, downloaded once, after a bounded wait for the commit's other runs) and report it as awareness: a note in the comment, never a finding. The architect is shown the project's context files | Nothing |
+| `pair` | Developer 2 (`reviewer-correctness`): same model, other instructions, no shared context. It has the brief, the touched files whole, the diff and the record of the run. Accepts, or sends back | Nothing |
+| `decide` | The third time the pair does not agree, the architect accepts the change or gives one last instruction, which is not reviewed again | Nothing |
+| `tests` | QA (`test-steward`): which behaviours to check comes from the brief | Tests only |
+| `steward` | QA updates tests a verdict found wrong | Tests only |
+| `sre`, `security` | Two nodes started together. They read the diff and what the pipeline's tools reported for the commit and for the base commit (artifacts `ai-context-*`), and inform | Nothing |
 | `docs` | Documentation reviewer, then a deterministic changelog entry | Documentation and changelog |
+| `close` | The architect tells what happened, for a person who was not there, and names what its brief asked for and nobody did | Nothing |
 
-Every node writes a `route` into the state. On a pull request or a push the graph runs once; the
-issue flow and the dependency sweep still run it a second time with twice the budget
-(`invoke_with_retry`) when it does not converge. Loops are bounded by `max_verify_retries` and
-`writer_rounds`.
+What the code decides, not a prompt:
 
-**One loop, and one role that can start it.** Of the four reviewers only the second developer
-(`reviewer-correctness`) sends a change back: a critical or high finding of its own goes to the developer
-agent, one time. The other roles inform: what they find is reported with the severity they gave it. After
-the fix the checks run, and the second developer alone rereads the fix alone (stage `fix` in the comment);
-what it still finds, or what the developer agent could not fix, is reported and the change goes on to be
-certified. What ends a change is checks that fail. The test steward judges a change once. Without an
-answer from the second developer nothing is certified; a role that only informs and gives none is said so
-in the comment.
+- **Whether the change works is a fact.** Every commit that reaches the close went through the checks.
+  No finding and no opinion ends a change whose checks pass.
+- **Facts oblige the roles** (`lib.roles_required`): application code touched calls QA; Dockerfile,
+  chart, compose, workflows, configuration call the SRE; dependencies, authentication, secrets call
+  security. The architect can add a role and say what to look at; it cannot take one away.
+- **Who thinks** (`ModelCaller.THINKING`): the roles that write code or the brief (`writer`,
+  `test-steward`, `architect`, `architect-decide`). Every other role, and every reading step, answers
+  at once: seconds instead of minutes, measured.
+- **The pair**: only developer 2 sends a change back, up to three times; then the architect decides. A
+  critical or high finding goes back; so does, the first time the change is read and only then, a
+  medium one of category `bug` (`worth_one_fix`).
+- **QA never ends a change that works.** Tests it writes that do not pass, twice, are taken out; an
+  answer that cannot be used is dropped. The change goes on with the tests it had, and the comment says
+  so (the health check looks for that sentence). A test that existed and fails is another matter: it is
+  the specification.
+- **What the brief asked for and nobody did** goes back to the developer once, from the close. If it
+  cannot be done, or breaks the checks, it is taken back and reported; the change is not undone.
+- **A second cycle, once.** Work at a dead end (checks that keep failing, no usable brief) returns to
+  the architect with the reason; a second dead end is the end: abandoned.
+- **A model that is unavailable** raises `ModelUnavailable`; the node is tried again by the graph
+  (`RetryPolicy`), and a second failure ends the run with the cause.
+
+### The architect's tools
+
+Fixed look-ups, read-only, one per reply; whether to use one is the architect's choice. None is a
+shell and none runs the application's code (`lib.explore`, `lib.TOOL_KINDS`).
+
+| Request | What it returns |
+|---|---|
+| `list`, `find`, `grep`, `read` | The repository and the installed libraries; `read` of `module::name` is one function or class |
+| `docs` | For an installed library: its version, the pages its own metadata names, the notes of its release and the pages of its repository about what changed. For one of those pages: its text, with the list of its sections when it is long; `::word::word` reads several sections in one request. A page is readable only on the site or in the repository the library's metadata names, over https, at a public address |
+| `usages` | Every line of the repository that uses a name or a library, the imports first |
+| `imports` | Imported names that do not exist and calls whose arguments do not fit (pylint, those errors only) |
+| `signature` | The parameters of a function, or of a class with its constructor and public methods, read from the source; a name a package only passes on is followed to its definition |
+| `history` | The last commits of a file or folder, with their reason |
+| `tests` | The test files that import a source file |
+| `api` | The routes the application declares, and those the change adds or removes |
+| `evidence` | What the scanners and the deploy reported for the commit and for the base |
+| `runs` | The records of earlier runs that name a file or a word. Empty in the pipeline until `agents-run` is kept between jobs |
+
+The developer's requests go through the same function, so it is answered too; its prompt names only
+the reading ones.
+
+### The record of a run
+
+Every role writes what it did and found into the state (`journal`, a reducer channel); the next role
+reads it instead of finding it again. The graph is streamed, and after every node the journal is
+written to `agents-run/<repository>-<ref>-<run>.md`, next to a SQLite file with the graph's state after
+every node (`SqliteSaver`). The folder is uploaded in the job's artifact (`agent-change-<mode>-<run>`). Nothing resumes from the
+checkpoints yet: the agents' commits are on disk, not in them.
+
+### The older path
+
+The issue flow (`reusable_agent-pipeline.yml`, out of use) and the dependency sweep still build the
+graph without the architect: `start` goes to `write` or `verify`, the reviewers run as one step, and a
+run that does not converge is tried a second time with twice the budget (`invoke_with_retry`). It goes
+when the sweep does.
 
 ### How an agent's reply is used
 
@@ -148,10 +202,11 @@ Then: `code_defect` goes to the writer, `test_defect` to the steward, `environme
   tests or assertions in a file, or adds `skip`/`xfail` is reverted, whoever proposed it.
 - **A test an agent has just written is not the specification.** If tests the steward wrote or rewrote
   fail, they are discarded and the steward is asked again with the output. The application is not
-  changed to satisfy them.
-- **An agent that must answer and cannot ends the run not certified** (`usable_changes`): the steward
-  and the documentation reviewer get one more attempt, told exactly what was wrong. The same holds for the
-  second developer. A reviewer that only informs and gives no answer is reported, and the run goes on.
+  changed to satisfy them; after the second time the change goes on without them.
+- **An agent that must answer and cannot** (`usable_changes`): the steward and the documentation
+  reviewer get one more attempt, told exactly what was wrong. Without an answer from the second developer
+  or the documentation reviewer the run is not certified. A steward with no usable answer, and a reviewer
+  that only informs and gives none, are reported and the run goes on.
 - **Agent instructions are not documentation**: `CLAUDE.md`, `AGENTS.md` and `.claude/` are outside
   the documentation reviewer's reach.
 - **A last deterministic gate** (`policy_violations`) runs over the commits the agents made: protected
@@ -322,7 +377,7 @@ These are the reasons behind choices that otherwise look arbitrary.
   model's reply. It redacts the key and secret-shaped strings from everything it prints, truncates
   oversized prompts with a marker, gives a reasoning model's thinking its own allowance
   (`reasoning.max_tokens`, 6,000 by default) so the answer keeps its budget, or none at all with
-  `--no-reasoning` (which the agents' `ModelCaller` passes for every role but the writer), asks again once, with the same
+  `--no-reasoning` (which the agents' `ModelCaller` passes for every role that does not write code or the brief), asks again once, with the same
   budget, when a reply comes back empty, and writes the tokens and estimated cost of every attempt to
   `--usage-file`.
 - **`ai_sanitize.py`**: bundles files into a prompt with secrets redacted and a size cap, or masks
@@ -358,9 +413,19 @@ and the reason a release waits for it.
   agents looking for it; the rules keep the outcome safe, but the change may be abandoned.
 - `v2` is a moving tag that receives the consumers' secrets: what lands on `main` here and passes the
   release steps runs with their credentials.
-- When the model cannot be reached (the key's limit, the provider down) a change ends abandoned, with a
-  comment that names the role that had no answer and not the cause, which is in the job log. A commit
-  abandoned this way is not tried again until a new commit is pushed.
-- The second developer answers with no thinking: it is fast and it sees an evident defect, and it is
-  less able to weigh a subtle one. A defect the developer agent does not fix in its one round is merged
-  with the finding written in the comment.
+- When the model cannot be reached (the key's limit, the provider down) a change ends abandoned, with the
+  cause. A commit abandoned this way is not tried again until a new commit is pushed.
+- The second developer answers with no thinking. With thinking, tried once on 2026-10-12 with the brief
+  and the whole files in hand, it took 133 seconds where it takes 1 to 4, and said nothing more. Whether it
+  catches a real defect in the new graph is not shown: the replay used for it (ci-shared #53, first
+  version) held fragile code that behaved right. The canary's scenario carries a real one.
+- A medium finding of category `bug` goes back once (`worth_one_fix`), by the owner's choice; no run has
+  shown it catch a real defect, and on the replay above it would have cost a round for a matter of form.
+- The architect is one point of failure: a wrong brief is followed by everyone. What limits it: the roles
+  the facts oblige, the close tied to the checks, the second cycle, the brief published in the comment. A
+  wrong brief that leads to software that passes its tests and does the wrong thing is not caught.
+- A change can be merged without a test QA thought it needed, or with a warning of the security role
+  that only a real deployment would prove (seen on the local replay of the mcp-2 update: the new version
+  refuses requests whose Host is not local). Both are written in the comment; nothing acts on them.
+- The architect's `docs` tool reads pages from the network. They are untrusted text shown to a model,
+  from addresses the installed libraries name for themselves.

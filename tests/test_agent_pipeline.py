@@ -55,6 +55,11 @@ class FakeCaller:
             # (A steward that really returns nothing blocks the certification; see TestAgentFailureBlocks.)
             if role in ("reviewer-sre", "reviewer-architect"):
                 return fence({"findings": []})      # a test that says nothing about these roles is not about them
+            if role == "architect":                 # nor about the architect: the change is fine as it is, nobody is called for
+                return fence({"summary": "the change as submitted", "developer": {"change_needed": False, "instructions": [], "look_up": []},
+                              "acceptance_criteria": [], "tests": {"needed": False, "what": []},
+                              "infrastructure": {"impact": False, "what": ""}, "security": {"impact": False, "what": ""},
+                              "docs": {"needed": False, "what": []}, "beyond_the_task": [], "risks": []})
             return fence({"explanation": "the existing tests cover this change", "changes": []}) if role == "test-steward" else None
         return queue.pop(0) if len(queue) > 1 else queue[0]
 
@@ -124,19 +129,38 @@ class TestLoop:
         assert "hello, world" in pathlib.Path("greet.py").read_text()
         assert any(s.startswith("fix(agent)") for s in commits(rt))
 
-    def test_a_reviewer_asks_for_a_fix_once_and_never_ends_a_change_that_works(self, repo):
+    def test_the_pair_that_does_not_agree_in_three_rounds_goes_to_the_architect_and_the_change_goes_on(self, repo):
         caller = FakeCaller({
-            "writer": [write_change(), fence({"explanation": "tweak", "changes": [
-                {"file": "greet.py", "find": "'hello'", "replace": "'hi'"}]})],
+            "writer": [write_change(),
+                       fence({"explanation": "tweak", "changes": [{"file": "greet.py", "find": "'hello'", "replace": "'hi'"}]}),
+                       fence({"explanation": "tweak", "changes": [{"file": "greet.py", "find": "'hi'", "replace": "'yo'"}]})],
             "reviewer-correctness": [blocking_finding()], "reviewer-security": [no_findings()],
-            "final-reviewer": [blocking_finding()], "doc-reviewer": [fence({"explanation": "nothing needed", "changes": []})],
+            "doc-reviewer": [fence({"explanation": "nothing needed", "changes": []})],
         })
         rt, final = run_graph(caller, max_iterations=3)
         assert final["outcome"] == "converged"                                      # the checks pass: it goes on
-        assert any("remain after the developer agent's one fix" in n for n in final["notes"])
-        assert len([1 for r, _ in caller.log if r == "writer"]) == 2                # the change, then one fix
-        assert len([1 for r, _ in caller.log if r == "reviewer-correctness"]) == 2
-        assert final["rounds"][-1]["findings"][0]["severity"] == "high"             # reported as it was judged
+        assert any("did not agree in three rounds" in n for n in final["notes"])
+        roles = [r for r, _ in caller.log]
+        assert roles.count("reviewer-correctness") == 3 and roles.count("writer") == 3      # the change, then two fixes
+        assert roles.count("architect-decide") == 1                                 # asked once, and no answer is an acceptance
+        sent_back = [f for r in final["rounds"] for f in r["findings"] if f["severity"] == "high"]
+        assert len(sent_back) == 3                                                  # reported as it was judged, every time
+
+    def test_the_architect_can_ask_for_one_last_change_which_is_not_reviewed_again(self, repo):
+        last = fence({"explanation": "as decided", "changes": [{"file": "greet.py", "find": "'yo'", "replace": "'hello!'"}]})
+        caller = FakeCaller({
+            "writer": [write_change(),
+                       fence({"explanation": "tweak", "changes": [{"file": "greet.py", "find": "'hello'", "replace": "'hi'"}]}),
+                       fence({"explanation": "tweak", "changes": [{"file": "greet.py", "find": "'hi'", "replace": "'yo'"}]}), last],
+            "reviewer-correctness": [blocking_finding()], "reviewer-security": [no_findings()],
+            "architect-decide": [fence({"decision": "instruct", "reason": "the greeting is wrong", "instructions": ["greet.py: return 'hello!'"]})],
+            "doc-reviewer": [fence({"explanation": "nothing needed", "changes": []})],
+        })
+        rt, final = run_graph(caller, max_iterations=3)
+        assert final["outcome"] == "converged" and "hello!" in pathlib.Path("greet.py").read_text()
+        roles = [r for r, _ in caller.log]
+        assert roles.count("reviewer-correctness") == 3                             # the decision ends the pair's rounds
+        assert "ARCHITECT'S INSTRUCTIONS" in [u for r, u in caller.log if r == "writer"][-1]
 
     def test_after_the_fix_only_the_second_developer_reads_and_only_the_fix(self, repo):
         fix = fence({"explanation": "fix greeting", "changes": [{"file": "greet.py", "find": "'hello'", "replace": "'hello, world'"}]})
@@ -146,11 +170,14 @@ class TestLoop:
             "doc-reviewer": [fence({"explanation": "nothing needed", "changes": []})],
         })
         rt, final = run_graph(caller)
-        assert final["outcome"] == "converged" and [r["stage"] for r in final["rounds"]] == ["review", "fix"]
-        asked = [r for r, _ in caller.log if r.startswith("reviewer-") or r == "final-reviewer"]
-        assert asked.count("reviewer-correctness") == 2 and asked.count("reviewer-security") == 1 and len(asked) == 5
+        assert final["outcome"] == "converged" and [r["stage"] for r in final["rounds"]] == ["pair", "fix", "inform"]
+        asked = [r for r, _ in caller.log if r.startswith("reviewer-")]
+        assert asked.count("reviewer-correctness") == 2 and asked.count("reviewer-security") == 1 and len(asked) == 4
+        assert asked.index("reviewer-security") > 1                              # the roles that inform look after the pair is done
         second = [u for r, u in caller.log if r == "reviewer-correctness"][1]
-        assert "hello, world" in second and "def other" not in second          # the correction, not the whole change
+        diff, whole = second.split("## The files this change touches, complete")
+        assert "hello, world" in diff and "def other" not in diff               # the correction, not the whole change
+        assert "def other" in whole                                             # read in the file it touches, shown whole
         assert "returns the wrong greeting" in second                           # and what it was asked to fix
         assert [r for r, _ in caller.log].count("test-steward") == 1            # the tests were judged once
 
@@ -413,7 +440,88 @@ class TestPullRequestMode:
     def test_unfixable_blocking_finding_is_reported_not_hidden(self, pr_repo):
         caller = FakeCaller({"reviewer-correctness": [blocking_finding()], "reviewer-security": [no_findings()]})
         _, final = run_pr_graph(caller, pr_repo)   # the writer never answers
-        assert final["outcome"] == "escalated" and final["rounds"][-1]["findings"]
+        assert final["outcome"] == "escalated" and final["rounds"][0]["findings"]
+
+
+def medium_bug(suggestion="return 'hello, world'", category="bug"):
+    return fence({"summary": "weak", "findings": [{
+        "severity": "medium", "file": "greet.py", "line": 1, "category": category,
+        "evidence": "def greeting", "problem": "the greeting is too short", "suggestion": suggestion}]})
+
+
+class TestAMediumDefectWithItsFixIsAskedForOnce:
+    """A medium finding of category `bug` goes back to the developer once. Kept by the owner's choice; the
+    case it came from (ci-shared #53, first version) was fragile code that behaved right, not a defect."""
+
+    FIX = fence({"explanation": "longer", "changes": [{"file": "greet.py", "find": "'hello'", "replace": "'hello, world'"}]})
+
+    def run(self, **replies):
+        caller = FakeCaller({"writer": [write_change(), self.FIX], "reviewer-security": [no_findings()],
+                             "doc-reviewer": [fence({"explanation": "none", "changes": []})], **replies})
+        rt, final = run_graph(caller)
+        return final, [r for r, _ in caller.log], caller
+
+    def test_it_goes_to_the_developer_the_first_time_the_change_is_read(self, repo):
+        final, roles, caller = self.run(**{"reviewer-correctness": [medium_bug(), no_findings()]})
+        assert final["outcome"] == "converged" and "hello, world" in pathlib.Path("greet.py").read_text()
+        assert "the greeting is too short" in [u for r, u in caller.log if r == "writer"][-1]
+
+    def test_it_is_not_asked_for_twice(self, repo):
+        final, roles, _ = self.run(**{"reviewer-correctness": [medium_bug()]})      # it says the same of the fix
+        assert final["outcome"] == "converged" and roles.count("writer") == 2 and roles.count("reviewer-correctness") == 2
+
+    def test_a_remark_that_is_not_a_defect_stays_a_note(self, repo):
+        final, roles, _ = self.run(**{"reviewer-correctness": [medium_bug(category="scope")]})
+        assert final["outcome"] == "converged" and roles.count("writer") == 1
+
+
+class TestTheCloseSendsBackWhatWasNotDone:
+    """Work the brief asked for and nobody did goes back to the developer once; it never ends a change that works."""
+
+    BRIEF = {"summary": "greet, and pin the library", "developer": {"change_needed": False, "instructions": [], "look_up": []},
+             "acceptance_criteria": [], "tests": {"needed": False, "what": []}, "infrastructure": {"impact": False, "what": ""},
+             "security": {"impact": False, "what": ""}, "docs": {"needed": False, "what": []}, "beyond_the_task": [], "risks": []}
+    MISSING = fence({"story": ["The developer added the greeting."], "missing": ["requirements.txt: add `lib==1`"]})
+    DONE = fence({"story": ["The developer added the greeting and pinned the library."], "missing": []})
+
+    def run(self, caller, base, verify="test -f greet.py"):
+        rt = ap.Runtime(caller, base, verify, 30, 3, 2, 4, "", "", 0, start="verify", fix_kind="fix", architect=True, task="Add greeting")
+        final = ap.build_graph(rt).invoke({"plan": ap.derived_plan("Add greeting", ""), "iteration": 1, "verify_attempts": 0,
+                                           "notes": [], "rounds": [], "journal": []}, config={"recursion_limit": 200})
+        return final, [r for r, _ in caller.log]
+
+    def caller(self, **replies):
+        return FakeCaller({"architect": [fence(self.BRIEF)], "reviewer-correctness": [no_findings()], "reviewer-security": [no_findings()],
+                           "doc-reviewer": [fence({"explanation": "none", "changes": []})], **replies})
+
+    def test_what_is_missing_is_done_checked_and_the_work_closed(self, pr_repo):
+        pin = fence({"explanation": "pin the library", "changes": [{"file": "requirements.txt", "content": "lib==1\n"}]})
+        caller = self.caller(**{"architect-close": [self.MISSING, self.DONE], "writer": [pin]})
+        final, roles = self.run(caller, pr_repo)
+        assert final["outcome"] == "converged" and pathlib.Path("requirements.txt").read_text() == "lib==1\n"
+        assert git_out("status", "--porcelain") == "" and roles.count("architect-close") == 2
+        asked = [u for r, u in caller.log if r == "writer"][-1]
+        assert "requirements.txt: add `lib==1`" in asked and "ARCHITECT'S INSTRUCTIONS" in asked
+        assert roles.count("reviewer-correctness") == 1          # the added piece is checked, not reviewed all over again
+        assert final["story"] == ["The developer added the greeting and pinned the library."]
+
+    def test_it_is_asked_once_and_what_still_lacks_is_reported(self, pr_repo):
+        pin = fence({"explanation": "pin the library", "changes": [{"file": "requirements.txt", "content": "lib==1\n"}]})
+        final, roles = self.run(self.caller(**{"architect-close": [self.MISSING], "writer": [pin]}), pr_repo)
+        assert final["outcome"] == "converged" and roles.count("architect-close") == 2 and roles.count("writer") == 1
+        assert any("the record does not show it done: requirements.txt" in n for n in final["notes"])
+
+    def test_a_developer_that_cannot_do_it_does_not_end_a_change_that_works(self, pr_repo):
+        final, roles = self.run(self.caller(**{"architect-close": [self.MISSING]}), pr_repo)      # the writer never answers
+        assert final["outcome"] == "converged" and roles.count("architect") == 1                    # no second cycle
+        assert any("what the brief still lacked" in n for n in final["notes"])
+
+    def test_a_piece_that_breaks_the_checks_is_taken_back_and_the_change_goes_on(self, pr_repo):
+        breaks = fence({"explanation": "pin", "changes": [{"file": "broken.txt", "content": "x"}]})
+        final, roles = self.run(self.caller(**{"architect-close": [self.MISSING], "writer": [breaks]}), pr_repo,
+                                verify="test -f greet.py && test ! -f broken.txt")
+        assert final["outcome"] == "converged" and not pathlib.Path("broken.txt").exists()
+        assert roles.count("architect") == 1 and git_out("status", "--porcelain") == ""
 
 
 def change_args(**over):
@@ -524,9 +632,9 @@ class TestPublishPr:
 
     def test_comment_says_what_happened(self):
         clean = ap.build_change_comment(self.result(final_sha="abc1234def"), None)
-        assert "Nothing was changed" in clean and "<!-- agent-certified: abc1234def -->" in clean
+        assert "nothing had to be changed" in clean and "<!-- agent-certified: abc1234def -->" in clean
         pushed = ap.build_change_comment(self.result(outcome="converged", commits=2, final_sha="f" * 40), True)
-        assert "pushed 2 commit" in pushed and f"<!-- agent-certified: {'f' * 40} -->" in pushed
+        assert "added 2 commit" in pushed and f"<!-- agent-certified: {'f' * 40} -->" in pushed
         not_pushed = ap.build_change_comment(self.result(outcome="converged", commits=1, final_sha="f" * 40), False)
         assert "could not push" in not_pushed and "agent-certified" not in not_pushed   # nothing certified that is not on the branch
         text = ap.build_change_comment(self.result(outcome="abandoned", findings=[
@@ -538,8 +646,25 @@ class TestPublishPr:
         left = ap.build_change_comment(self.result(final_sha="abc1234def", findings=[
             {"severity": "high", "file": "a.py", "line": 1, "category": "bug", "evidence": "e", "problem": "p",
              "suggestion": "s", "reviewers": ["reviewer-correctness"]}]), None)
-        assert "No blocking findings" not in left and "1 finding(s) of the review were not resolved" in left
+        assert "blocking" not in left.lower() and "1 finding(s) of the review were not resolved" in left
         assert "<!-- agent-certified: abc1234def -->" in left      # it works, so it is certified all the same
+
+    def test_the_comment_tells_the_story_first_and_folds_the_record(self):
+        brief = {"summary": "Add a helper and keep the old one as it was.",
+                 "developer": {"change_needed": True, "instructions": ["app/x.py: restore `<=`"], "look_up": []},
+                 "acceptance_criteria": [], "tests": {"needed": True, "what": ["the limit itself is below nothing"]},
+                 "infrastructure": {"impact": False, "what": []}, "security": {"impact": False, "what": []},
+                 "docs": {"needed": False, "what": []}, "beyond_the_task": ["the MCP tool disagrees with the route"], "risks": []}
+        text = ap.build_change_comment(self.result(
+            outcome="converged", commits=2, final_sha="f" * 40, plan={"brief": brief},
+            story=["A test failed: the comparison had been changed.", "The developer restored it.", "QA added a test for the new helper."],
+            adjudications=[{"verdicts": [{"test": "tests/t.py::t", "classification": "code_defect", "confidence": "high", "reason": "r"}]}],
+            notes=["failure adjudication: tests/t.py::t -> code_defect"]), True)
+        story, record = text.split("<details>", 1)
+        assert "### What happened\n1. A test failed" in story and "3. QA added a test" in story
+        assert "For the developer: app/x.py: restore `<=`" in story and "For QA: the limit itself" in story
+        assert "Outside this task, worth knowing: the MCP tool disagrees" in story
+        assert "code_defect" not in story and "the code was wrong, the test was right (**code_defect**" in record
 
     def args(self):
         return type("A", (), {"repo": "o/r", "pr": 5, "head_ref": "feature"})()

@@ -43,9 +43,11 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TypedDict
+import operator
+from typing import Annotated, TypedDict
 
 from langgraph.graph import END, StateGraph
+from langgraph.types import RetryPolicy
 
 import agent_lib as lib
 from changelog_update import add_entry
@@ -64,9 +66,35 @@ SECOND_DEVELOPER = REVIEWERS[0]
 
 def sends_back(finding: lib.Finding) -> bool:
     return finding.blocking and SECOND_DEVELOPER in finding.reviewers
+
+
+def worth_one_fix(finding: lib.Finding) -> bool:
+    """A defect the second developer weighed as medium and said how to fix. It goes to the developer once,
+    the first time the change is read; it is not asked for twice and it ends nothing. Kept by the owner's
+    choice. The case it was written for (ci-shared #53, first version) turned out to be fragile code that
+    behaved right, not a defect: no run has yet shown a real one caught this way."""
+    return (finding.severity == "medium" and finding.category == "bug" and bool(finding.suggestion.strip())
+            and SECOND_DEVELOPER in finding.reviewers)
+
+
+INFORMERS = ("reviewer-sre", "reviewer-security")     # they look when the facts or the architect call for them
+MAX_PAIR_ROUNDS = 3                                   # the second developer sends back this many times, then the architect decides
+ARCHITECT_FEEDBACK = "ARCHITECT'S INSTRUCTIONS"       # how the writer is told its task comes from the architect
+CODE_CHARS = 200_000                                  # the application and its tests are shown whole up to this size
 # Roles that are shown what the pipeline's tools reported (scans, deploy), next to the diff.
 EVIDENCE_ROLES = frozenset({"reviewer-security", "reviewer-sre"})
 PLANNER_ROUNDS = 6
+ARCHITECT_ROUNDS = 12      # the brief is where the reading is done, so that nobody after it has to do it again
+ARCHITECT_READING = ("\n\nTHIS IS THE READING STEP. Reply with ONE look-up request and nothing else, for something you "
+                     "need and were not shown. When you have read enough to write the brief, reply with exactly "
+                     '{"ready": true}. Do not write the brief yet.')
+WRITER_READS = 8
+WRITER_LATE_READS = 3      # look-ups answered while writing, beyond which the writer must send its change
+WRITER_READING = ("\n\nTHIS IS THE READING STEP. Reply with ONE look-up request and nothing else, for something you need "
+                  'to read before you change anything. When you have read enough, reply with exactly {"ready": true}. '
+                  "Do not send changes yet.")
+ARCHITECT_WRITING = ("\n\nTHIS IS THE WRITING STEP. The reading is done: what you looked up is below the code. "
+                     "Reply with the brief, and no look-up request.")
 RETRY_BOOST = 2
 CERT_MARKER = "agent-certified"
 ABANDON_MARKER = "agent-abandoned"
@@ -83,7 +111,10 @@ TERMINAL_ACTIONS = {
 # recognises its own pushes and does not review them again (no loops).
 AGENT_AUTHOR = "ci-shared agents"
 _BOT_SUBJECT = re.compile(r"^(Done\s+by Github Actions|docs\(changelog\))", re.IGNORECASE)
-_ADD_EXCLUDES = ("--", ".", ":!.ai", ":!.shared")
+# How a run says that the tests of a change were left as they were; the comment shows it.
+UNTESTED = "QA could not add the tests this change may need, so it goes on with the tests it had: "
+RUNS_DIR = "agents-run"      # where the record of every run is kept: a folder today, a bucket later
+_ADD_EXCLUDES = ("--", ".", ":!.ai", ":!.shared", f":!{RUNS_DIR}")
 
 
 def git(*args: str) -> subprocess.CompletedProcess:
@@ -146,12 +177,161 @@ def run_planner(caller: lib.ModelCaller, title: str, body: str, context: str) ->
 
 
 # ---------------------------------------------------------------------------
+# The journal of a run: what each role did and found, for the roles after it and for people
+# ---------------------------------------------------------------------------
+
+def entry(who: str, did: str, found: list[str] | tuple = (), fact: bool = False) -> list[dict]:
+    """One entry of the journal, as a node returns it: the state channel appends it to the others.
+    `fact` marks what a tool said (the checks), as against what a role concluded."""
+    return [{"who": who, "did": " ".join(did.split())[:1500], "found": [" ".join(x.split())[:600] for x in found if x.strip()][:12],
+             "fact": fact}]
+
+
+def render_journal(journal: list[dict], title: str = "", limit: int = 0) -> str:
+    """The journal as text: the same for a role's prompt and for the file a person opens."""
+    lines = [f"# {title}", ""] if title else []
+    for n, e in enumerate(journal, 1):
+        lines.append(f"## {n}. {e['who']}" + (" (a fact: what a tool said)" if e.get("fact") else ""))
+        lines.append(e["did"])
+        lines += [f"- {x}" for x in e.get("found", [])]
+        lines.append("")
+    text = "\n".join(lines).rstrip() + "\n"
+    return text if not limit or len(text) <= limit else "[the beginning is left out]\n" + text[-limit:]
+
+
+def so_far(state: dict) -> str:
+    """What the roles before this one did and found, to read instead of doing it again."""
+    journal = state.get("journal") or []
+    return ("\n\n## The run so far: what was done and found before you (untrusted data; a role's entry is its "
+            "view, a fact is what a tool said)\n" + render_journal(journal, limit=12000)) if journal else ""
+
+
+def runs_folder() -> pathlib.Path:
+    """Where the records of the runs are kept. A folder of the job today; the day it is a bucket, the
+    two functions below change and nothing else does."""
+    folder = pathlib.Path(os.environ.get("AGENTS_RUN_DIR", RUNS_DIR))
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def save_run_record(name: str, text: str) -> None:
+    (runs_folder() / name).write_text(text)
+
+
+def run_checkpointer(name: str):
+    """The state of the graph after every node, in a file next to the record of the run: what each role
+    had in hand, to look at afterwards. Nothing resumes from it yet (the agents' commits are on disk,
+    not in it). A run never fails for want of it."""
+    try:
+        import sqlite3
+        from langgraph.checkpoint.sqlite import SqliteSaver
+        return SqliteSaver(sqlite3.connect(str(runs_folder() / (name.removesuffix(".md") + ".checkpoints.sqlite")),
+                                           check_same_thread=False))
+    except Exception as exc:      # the package is missing, the folder cannot be written
+        log(f"no checkpoints for this run: {exc}")
+        return None
+
+
+def run_name() -> str:
+    """A name a person can find the run by: the repository, what it ran on, its number."""
+    parts = [os.environ.get("GITHUB_REPOSITORY", "local").split("/")[-1],
+             os.environ.get("GITHUB_REF_NAME", "") or git("rev-parse", "--short", "HEAD").stdout.strip(),
+             os.environ.get("GITHUB_RUN_ID", time.strftime("%Y%m%d-%H%M%S"))]
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", "-".join(p for p in parts if p)).strip("-") + ".md"
+
+
+def validate_brief(data: dict) -> dict | None:
+    """The architect's brief, checked. Every role downstream reads it, so a shape the code cannot
+    rely on is refused, and instructions without a change, or a change without instructions, too."""
+    def strings(value) -> list[str] | None:
+        if isinstance(value, str):
+            return [value.strip()] if value.strip() else []
+        if isinstance(value, list) and all(isinstance(x, str) for x in value):
+            return [x.strip() for x in value if x.strip()]
+        return None
+
+    if not isinstance(data, dict) or not isinstance(data.get("summary"), str) or not data["summary"].strip():
+        return None
+    dev = data.get("developer")
+    if not isinstance(dev, dict) or not isinstance(dev.get("change_needed"), bool):
+        return None
+    instructions, look_up = strings(dev.get("instructions", [])), strings(dev.get("look_up", []))
+    if instructions is None or look_up is None or (dev["change_needed"] and not instructions):
+        return None
+    brief: dict = {"summary": data["summary"].strip(),
+                   "developer": {"change_needed": dev["change_needed"],
+                                 "instructions": instructions if dev["change_needed"] else [], "look_up": look_up}}
+    for key in ("acceptance_criteria", "beyond_the_task", "risks", "facts"):
+        value = strings(data.get(key, []))
+        if value is None:
+            return None
+        brief[key] = value
+    for key, flag in (("tests", "needed"), ("infrastructure", "impact"), ("security", "impact"), ("docs", "needed")):
+        part = data.get(key)
+        what = strings(part.get("what", [])) if isinstance(part, dict) else None
+        if what is None or not isinstance(part.get(flag), bool):
+            return None
+        brief[key] = {flag: part[flag], "what": what}
+    return brief
+
+
+def run_architect(rt: "Runtime", plan: dict, facts: str, why: str = "", before: str = "") -> dict | None:
+    """The architect's first pass: the brief every other role works from. It is shown the task, what
+    the tools said and the code, whole when it fits; otherwise it looks up what it needs, as the
+    planner does."""
+    system = lib.load_prompt("architect")
+    diff = diff_since_base(rt.base_sha)
+    code = lib.whole_code(CODE_CHARS)
+    base = (
+        f"## The task\n{rt.task or intent_text(plan)}\n\n"
+        + (f"## The change as submitted (lines are prefixed `L<number>|` with their line number in the new file)\n"
+           f"{lib.annotate_diff(diff)}\n\n" if diff.strip() else "")
+        + f"## What the deterministic tools said\n{facts}\n\n"
+        + (f"## Why the first attempt at this work did not end well\n{why}\n\n" if why else "")
+        + (f"## The code (the application and its tests, complete)\n{code}\n" if code else
+           "## The code\nThe repository is too large to show whole. Its files:\n" + lib.repo_tree()
+           + "\n\nThe files this change touches, complete:\n" + lib.files_whole(changed_files(rt.base_sha), CODE_CHARS) + "\n")
+        + (f"\n## The project, as it describes itself\n{rt.context}\n" if rt.context.strip() else "")
+        + before
+    )
+    # Reading and deciding are two steps. Asking for a file needs no thinking, and ten look-ups made by a
+    # role that thinks before each one took two minutes; so the reading is done at once, without it, and
+    # the thinking is spent once, on the brief, with everything that was read in front of it.
+    history: list[str] = []
+    asked: list[tuple[str, str]] = []
+    for rnd in range(1, ARCHITECT_ROUNDS + 1):
+        reply = rt.caller.call("architect-read", system + ARCHITECT_READING,
+                               base + ("\n## What you already looked up\n" + "\n\n".join(history) if history else ""))
+        request = lib.parse_explore(reply) if reply else None
+        if not request:
+            break
+        if request in asked:      # seen: the same section of a guide asked for twice in a row
+            history.append(f"Look-up {rnd}: you already asked for {{\"{request[0]}\": \"{request[1]}\"}}; its answer is above. "
+                           'Ask for something else, or reply {"ready": true}.')
+            continue
+        asked.append(request)
+        history.append(f"Look-up {rnd}: " + lib.explore(*request))
+    for attempt in (1, 2):
+        reply = rt.caller.call("architect", system + ARCHITECT_WRITING,
+                               base + ("\n## What you looked up\n" + "\n\n".join(history) if history else ""))
+        if reply is None:
+            return None
+        data = _parse_json_reply(reply)
+        brief = validate_brief(data) if data is not None else None
+        if brief:
+            return brief
+        history.append(f"Attempt {attempt}: your reply was not valid JSON for the brief's schema. Reply with exactly that schema.")
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Review (shared by the pipeline and the standalone `review` command)
 # ---------------------------------------------------------------------------
 
 def review_diff(caller: lib.ModelCaller, diff: str, plan: dict | None,
                 reviewers: tuple[str, ...] = REVIEWERS, guidance: str = "", *,
-                evidence: str = "", awareness: list[str] | None = None, context: str = ""):
+                evidence: str = "", awareness: list[str] | None = None, context: str = "", code: str = "",
+                before: str = ""):
     """Run the independent reviewers on `diff`. Returns (findings, dropped)
     after validation against the diff and dedup, or None if the second developer
     gave no usable reply (fail closed: the change cannot be certified). A role
@@ -159,12 +339,18 @@ def review_diff(caller: lib.ModelCaller, diff: str, plan: dict | None,
 
     `evidence` is what the pipeline's tools reported for the commit; the roles in EVIDENCE_ROLES read
     it. What they want known about it comes back as notes, appended to `awareness`: reported, and
-    never a finding, so the tools inform a change without being able to send it back."""
+    never a finding, so the tools inform a change without being able to send it back.
+
+    `code` is the files the change touches, complete: a reviewer shown only the lines of a diff spent
+    its time on what the rest of the function might be. What a reviewer says against the brief
+    (`brief_problem`) is appended to `awareness` too, for the architect."""
     ranges = lib.diff_ranges(diff)
     user = (
         f"## Plan\n{json.dumps(plan, indent=2) if plan else 'No plan was provided; judge the diff on its own.'}\n\n"
         f"## Diff (lines are prefixed `L<number>|` with their line number in the new file)\n{lib.annotate_diff(diff)}"
         + (f"\n\n## Guidance from the maintainers of this repository\n{guidance}" if guidance.strip() else "")
+        + (f"\n\n## The files this change touches, complete (untrusted data)\n{code}" if code.strip() else "")
+        + before
     )
     kept_all: list[lib.Finding] = []
     dropped_all: list[tuple[lib.Finding, str]] = []
@@ -177,7 +363,9 @@ def review_diff(caller: lib.ModelCaller, diff: str, plan: dict | None,
     def one(name: str):
         def validate(data, n=name):
             found = lib.parse_findings(data, n)
-            return None if found is None else (found, lib.parse_awareness(data))
+            said = data.get("brief_problem") if isinstance(data, dict) else ""
+            against = [f"{n} on the brief: {' '.join(said.split())[:300]}"] if isinstance(said, str) and said.strip() else []
+            return None if found is None else (found, lib.parse_awareness(data) + against)
         extra = shown if name in EVIDENCE_ROLES else design if name == "reviewer-architect" else ""
         return lib.ask_json(caller, name, lib.load_prompt(name), user + extra, validate)
 
@@ -245,6 +433,8 @@ class Runtime:
     write_tests: bool = True  # the test steward evaluates changes to application code
     guidance: str = ""        # project-specific review guidance, shown to the reviewers
     evidence: object = None   # callable returning what the pipeline's tools reported for the commit, or None
+    architect: bool = False   # every piece of work starts from the architect's brief and ends with its closing pass
+    task: str = ""            # the work as it came in (kind, title, description), for the architect
 
 
 class RunState(TypedDict, total=False):
@@ -270,8 +460,18 @@ class RunState(TypedDict, total=False):
     spec_tests: list         # test files the writer may not edit: a verdict said the CODE is wrong there
     spec_violations: int
     awareness: list          # what the roles noted about the tools' evidence: reported, never acted on
-    fix_from: str            # the commit the developer agent's one fix starts from
+    fix_from: str            # the commit the developer agent's latest fix starts from
     asked: list              # what the second developer asked it to fix
+    cycle: int               # 1, or 2 when the architect started the work again
+    close_reason: str        # why the first cycle did not end well, for the architect's second brief
+    pair_rounds: int         # how many times the second developer has sent the change back
+    decided: bool            # the architect settled a disagreement of the pair: no further review of it
+    stage: str               # "qa" while the change under verification is the test steward's; "finish" for what the close sent back
+    finishing: bool          # the architect has sent back, once, what its brief asked for and nobody did
+    story: list              # what happened, in plain words, by the architect at the end
+    journal: Annotated[list, operator.add]   # what each role did and found; a node returns its entry, the channel appends it
+    informers: list          # the roles that inform and are called for this change (they run side by side)
+    informed: Annotated[list, operator.add]  # what each of them reported; they write here and nowhere else
 
 
 def is_doc_path(path: str) -> bool:
@@ -297,6 +497,15 @@ def commit_round(message: str) -> bool:
     return True
 
 
+def commit_subject(explanation: str, limit: int = 72) -> str:
+    """The title of an agent's commit: the first sentence of what it did, cut at a word. The whole
+    explanation goes in the body: titles cut mid-word at 120 characters could not be read."""
+    first = " ".join(explanation.split()).split(". ")[0].rstrip(".")
+    if len(first) <= limit:
+        return first
+    return first[:limit].rsplit(" ", 1)[0].rstrip(",;:") + "…"
+
+
 def diff_since_base(base_sha: str) -> str:
     path = OUT_DIR / "diff.txt"
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -308,23 +517,52 @@ def changed_files(base_sha: str) -> list[str]:
     return [n for n in git("diff", "--name-only", f"{base_sha}...HEAD").stdout.split("\n") if n]
 
 
-def run_writer(rt: Runtime, plan: dict, feedback: str):
+def run_writer(rt: Runtime, plan: dict, feedback: str, before: str = ""):
     """One writer turn: optional read-only exploration, then a validated set
-    of changes applied to the working tree. Returns (Applied | None, text)."""
+    of changes applied to the working tree. Returns (Applied | None, text).
+
+    `before` is the journal of the run: what the architect and the others already read and found."""
     system = lib.load_prompt("writer")
+    brief = plan.get("brief") or {}
+    named = sorted({m for i in (brief.get("developer") or {}).get("instructions", [])
+                    for m in re.findall(r"[\w./-]+\.\w+", i) if pathlib.Path(m).is_file()})
     base = (
         f"## Plan\n{json.dumps(plan, indent=2)}\n\n## Repository files\n{lib.repo_tree()}\n\n"
         f"## Project context\n{rt.context}\n"
+        + (f"\n## The files the brief names, complete (copy the text to replace from here)\n{lib.files_whole(named, 60_000)}\n"
+           if named else "")
+        + before
         + (f"\n## {feedback}\n" if feedback else "")
     )
     history: list[str] = []
-    for rnd in range(1, rt.writer_rounds + 1):
-        reply = rt.caller.call("writer", system, base + ("\n## What you already looked up\n" + "\n\n".join(history) if history else ""))
+    said_nothing_to_change = False
+    # As for the architect: asking for a file needs no thinking, writing the change does. The reading has
+    # its own allowance: a writer that read seven files had one round left to write the change.
+    for look in range(1, WRITER_READS + 1):
+        reply = rt.caller.call("writer-read", system + WRITER_READING,
+                               base + ("\n## What you already looked up\n" + "\n\n".join(history) if history else ""))
+        request = lib.parse_explore(reply) if reply else None
+        if not request:
+            break
+        history.append(f"Look-up {look}: " + lib.explore(*request))
+    rnd = late_reads = 0
+    while rnd < rt.writer_rounds:
+        rnd += 1
+        looked = "\n## What you already looked up\n" + "\n\n".join(history) if history else ""
+        reply = rt.caller.call("writer", system, base + looked)
         if reply is None:
             return None, "the model call failed"
         request = lib.parse_explore(reply)
+        if request and late_reads < WRITER_LATE_READS:
+            # A look-up that comes up while writing is answered and does not cost a round: a writer once spent
+            # all eight on reading, for a change of one line. A few of them, then it has to write.
+            late_reads += 1
+            rnd -= 1
+            history.append("Look-up: " + lib.explore(*request))
+            continue
         if request:
-            history.append(f"Round {rnd}: " + lib.explore(*request))
+            history.append(f"Round {rnd}: no more look-ups. With what you have read, send the changes now: the smallest "
+                           "change that makes the failing check pass.")
             continue
         data = _parse_json_reply(reply)
         parsed = lib.parse_changes(data) if data is not None else None
@@ -336,6 +574,14 @@ def run_writer(rt: Runtime, plan: dict, feedback: str):
             )
             continue
         changes, explanation = parsed
+        if not changes and not said_nothing_to_change:
+            # A reply with no changes is the end only when it is meant: a writer that wanted to read a file
+            # first and said so in `explanation`, with no changes, once ended a migration it was half through.
+            said_nothing_to_change = True
+            history.append(f"Round {rnd}: your reply had no changes. To read a file, send that request alone. If you "
+                           "are ready, send the changes. Only if there is truly nothing to change, reply again with "
+                           "no changes and say why.")
+            continue
         if not changes:
             return None, explanation or "the writer found nothing it could change safely"
         problems = lib.validate_patch(changes, plan)
@@ -437,21 +683,79 @@ def uncommitted_sources(applied: dict | None, limit: int = 6000) -> str:
     return "\n\n".join(parts)
 
 
-def build_graph(rt: Runtime):
+def build_graph(rt: Runtime, checkpointer=None):
     def stop(state: RunState, outcome: str, note: str) -> dict:
+        if state.get("stage") == "finish":
+            # The change already works and was through every role: this was the one try at what the brief
+            # asked for and nobody had done. It did not succeed, was taken back, and is reported as missing.
+            return {"route": "close", "applied": None, "notes": state.get("notes", []) + [
+                "the developer agent was asked once for what the brief still lacked and could not do it: " + note[:400]]}
+        if (rt.architect and state.get("cycle", 1) == 1 and outcome in ("escalated", "failed")
+                and not getattr(rt.caller, "out_of_time", False)):
+            # The work did not end well. The architect looks at it again, once, with the reason in hand,
+            # and everything is done again from its new brief. A second cycle that fails is the end.
+            return {"route": "architect", "cycle": 2, "feedback": "", "applied": None,
+                    "close_reason": note + "\nWhatever the developer changed and did not pass the checks was taken back: "
+                                           "the code is as it was submitted, plus what the journal shows as committed.",
+                    "verify_attempts": 0, "pair_rounds": 0, "decided": False, "spec_violations": 0, "own_tests_attempts": 0,
+                    "fix_from": "", "failure_output": "", "stage": "", "tests_done": 0,
+                    "notes": state.get("notes", []) + [note, "the first cycle did not end well: the architect starts a second one"]}
         return {"route": "end", "outcome": outcome, "notes": state.get("notes", []) + [note]}
 
+    def n_architect(state: RunState) -> dict:
+        """The first pass: the facts, then the brief every other role works from."""
+        logs = state.get("failure_output", "") if rt.start == "ci" and state.get("cycle", 1) == 1 else ""
+        if logs:
+            ok, output, facts = False, logs, "The checks of this change FAILED in CI. Their logs:\n" + logs[-20000:]
+        elif rt.start == "review":
+            ok, output, facts = True, "", "No check was run in this job: this is a push to the base branch, whose own pipeline builds and tests it."
+        else:
+            ok, output = lib.run_verify_isolated(rt.verify_command, rt.verify_timeout)
+            log(f"deterministic checks (before the brief): {'passed' if ok else 'FAILED'}")
+            facts = "The checks pass (dependencies, lint, tests, the application starts)." if ok else "The checks FAILED. Their output:\n" + output
+        seen = entry("checks", "passed" if ok else "FAILED: " + output[-600:], fact=True) if rt.start != "review" else []
+        brief = run_architect(rt, state["plan"], facts, state.get("close_reason", ""), so_far(state))
+        if brief is None:
+            return {**stop(state, "escalated", "the architect could not produce a usable brief, so nobody knew what to do"), "journal": seen}
+        plan = {**state["plan"], "brief": brief}
+        notes = state.get("notes", []) + [f"architect: {brief['summary']}"]
+        wrote = seen + entry("architect", "wrote the brief: " + brief["summary"], brief.get("facts", []))
+        here = {"plan": plan, "stage": "", "pair_rounds": 0, "decided": False, "journal": wrote}
+        if not ok:
+            # Who is wrong, the code or the test, is still decided on evidence; the writer then has both
+            # that verdict and the architect's instructions, which are in the plan it is shown.
+            after = handle_failure({**state, "plan": plan, "notes": notes, "journal": (state.get("journal") or []) + wrote}, output, None)
+            return {**here, **after, "journal": wrote + after.get("journal", [])}
+        if brief["developer"]["change_needed"]:
+            return {**here, "notes": notes, "route": "write",
+                    "feedback": ARCHITECT_FEEDBACK + ". Make exactly these changes, and only these:\n"
+                                + "\n".join(f"- {i}" for i in brief["developer"]["instructions"])
+                                + ("\n\nRead first:\n" + "\n".join(f"- {i}" for i in brief["developer"]["look_up"])
+                                   if brief["developer"]["look_up"] else "")}
+        return {**here, "notes": notes, "route": "pair"}
+
     def n_write(state: RunState) -> dict:
-        applied, text = run_writer(rt, state["plan"], state.get("feedback", ""))
-        if applied is None and state.get("feedback", "").startswith(REVIEW_FEEDBACK):
-            # Asked by the review, right after checks that passed, and nothing was changed since: the
-            # change works as it is. It goes on with the findings written in the review.
-            return {"route": "docs", "notes": state.get("notes", []) + [
+        applied, text = run_writer(rt, state["plan"], state.get("feedback", ""), so_far(state))
+        asked_by = state.get("feedback", "")
+        did = entry("developer", (f"changed {', '.join(applied.files)}: {text}" if applied else f"made no change: {text}"))
+        if applied is None and asked_by.startswith(REVIEW_FEEDBACK):
+            # Asked by the second developer, right after checks that passed, and nothing was changed since:
+            # the change works as it is. It goes on with the findings written in the review.
+            return {"route": "tests", "journal": did, "notes": state.get("notes", []) + [
                 f"writer: {text}", "the developer agent produced no fix for the review's findings; the checks pass, "
                                    "so the findings are reported and the change goes on"]}
+        if applied is None and state.get("stage") == "finish":
+            return {"route": "close", "journal": did, "notes": state.get("notes", []) + [
+                f"the developer agent made no change for what the brief still lacked: {text}"]}
+        if applied is None and asked_by.startswith(ARCHITECT_FEEDBACK):
+            # Asked by the architect while the checks pass: the change works as it is. Either the developer
+            # found it already as the brief asks, or it could not do it; the second developer looks next,
+            # unless the architect was settling their disagreement, which is then over.
+            return {"route": "tests" if state.get("decided") else "pair", "journal": did, "notes": state.get("notes", []) + [
+                f"the developer agent made no change for the architect's instructions: {text}"]}
         if applied is None:
             reportable = state.get("committed") or state.get("rounds")
-            return stop(state, "escalated" if reportable else "failed", f"writer: {text}")
+            return {**stop(state, "escalated" if reportable else "failed", f"writer: {text}"), "journal": did}
         rewritten = sorted(set(applied.files) & set(state.get("spec_tests") or []))
         if rewritten:
             # The verdict was that the code is wrong and these tests are right. Changing what they assert makes
@@ -468,7 +772,7 @@ def build_graph(rt: Runtime):
                                 + ". The verdict is that the CODE is wrong and those tests are right: they are the specification. "
                                 "Change the application code so they pass as they are. New tests go in a new file."}
         return {"route": "verify", "applied": {"edited": applied.edited, "created": applied.created},
-                "explanation": text, "applied_kind": None, "own_tests": ""}
+                "explanation": text, "applied_kind": None, "own_tests": "", "journal": did}
 
     def adjudicate(state: RunState, output: str):
         """(verdicts, evidence) for the failing tests in `output`, or None when
@@ -504,6 +808,7 @@ def build_graph(rt: Runtime):
         the code is fixed, never the test."""
         attempts = state.get("verify_attempts", 0) + 1
         notes = list(state.get("notes", []))
+        judged: list[dict] = []
         history = list(state.get("adjudications", []))
         verdict_text = ""
         spec_tests: list[str] = []
@@ -513,12 +818,14 @@ def build_graph(rt: Runtime):
             classes = {v["classification"] for v in verdicts}
             history.append({"iteration": state["iteration"], "verdicts": verdicts})
             notes.append("failure adjudication: " + "; ".join(f"{v['test']} -> {v['classification']}" for v in verdicts))
+            judged = entry("QA", "judged what failed: was the code wrong, or the test?",
+                           [f"{v['test']}: {WHO_WAS_WRONG.get(v['classification'], v['classification'])}. {v.get('reason', '')}" for v in verdicts])
             over = attempts > rt.max_verify_retries
             if classes == {"test_defect"} and rt.write_tests and not over:
                 return {"route": "steward", "verify_attempts": attempts, "failure_output": output,
-                        "verdicts": verdicts, "notes": notes, "adjudications": history}
+                        "verdicts": verdicts, "notes": notes, "adjudications": history, "journal": judged}
             if classes == {"environment"} and not over:
-                return {"route": "verify", "verify_attempts": attempts, "notes": notes, "adjudications": history}
+                return {"route": "verify", "verify_attempts": attempts, "notes": notes, "adjudications": history, "journal": judged}
             spec_tests = sorted({v["test"].split("::")[0] for v in verdicts if v["classification"] == "code_defect"})
             verdict_text = ("\n\nADJUDICATION. Tests are the specification, so the code must satisfy them. "
                             "Verdicts:\n" + json.dumps([v for v in verdicts if v["classification"] != "environment"], indent=2))
@@ -527,16 +834,21 @@ def build_graph(rt: Runtime):
             # Said out loud: the health check looks for this sentence.
             notes.append("tests failed but the failing tests could not be identified, so no verdict was given")
         if applied:
+            # The writer is shown what it had changed: without it, a change that was right in three files and
+            # wrong in a fourth had to be found again from nothing, and the next attempt lost what was right.
+            attempted = git("diff", "HEAD").stdout[:12000]
             lib.revert(applied)
             what = "your previous change (reverted)"
+            output += ("\n\nYOUR PREVIOUS CHANGE, which was reverted. Send it again with what was missing or wrong "
+                       "corrected; keep the parts that were right:\n" + attempted) if attempted.strip() else ""
         else:
             what = "the change as submitted"
         if attempts > rt.max_verify_retries:
             return {**stop(state, "escalated" if state.get("committed") else "failed",
                            f"deterministic checks still failing after {attempts} attempts:\n{output[-1500:]}"),
                     "notes": notes + [f"deterministic checks still failing after {attempts} attempts:\n{output[-1500:]}"],
-                    "adjudications": history}
-        return {"route": "write", "verify_attempts": attempts, "applied": None, "notes": notes, "adjudications": history,
+                    "adjudications": history, "journal": judged}
+        return {"route": "write", "verify_attempts": attempts, "applied": None, "notes": notes, "adjudications": history, "journal": judged,
                 "spec_tests": spec_tests,
                 "feedback": f"FAILED VERIFICATION of {what}. Fix this:\n{output}{verdict_text}"}
 
@@ -545,28 +857,42 @@ def build_graph(rt: Runtime):
         log(f"deterministic checks (iteration {state['iteration']}): {'passed' if ok else 'FAILED'}")
         raw = state.get("applied")
         applied = lib.Applied(raw["edited"], raw["created"]) if raw else None
+        seen = entry("checks", "passed" if ok else "FAILED: " + output[-600:], fact=True)
         if ok:
             if applied:
                 kind = state.get("applied_kind") or (rt.fix_kind if state["iteration"] == 1 else "fix")
-                commit_round(f"{kind}(agent): {state['explanation'][:120]}\n\nIteration {state['iteration']} of the agent pipeline.")
-            needs_tests = rt.write_tests and not state.get("tests_done")      # the test steward judges a change once
-            return {"route": "tests" if needs_tests else "review",
+                commit_round(f"{kind}(agent): {commit_subject(state['explanation'])}\n\n{state['explanation']}\n\n"
+                             f"Iteration {state['iteration']} of the agent pipeline.")
+            # The test steward's tests go on to the roles that inform; a change the architect settled is not
+            # reviewed again; anything else is the developer's, and the second developer reads it.
+            # What the architect sent back at the end, done and checked, returns to it.
+            after = ("close" if state.get("stage") == "finish" else "inform" if state.get("stage") == "qa"
+                     else "tests" if state.get("decided") else "pair")
+            return {"route": after, "journal": seen,
                     "committed": bool(applied) or state.get("committed", False),
                     "verify_attempts": 0, "applied": None, "applied_kind": None, "own_tests": "", "spec_tests": []}
         if state.get("own_tests") and applied:
             # The steward has just written or rewritten these tests and they fail: they assert something the
             # code does not do. A test written a minute ago by a model is not the specification, and the
             # application is never changed to satisfy it (it once removed an app-wide error handler that way).
-            # The steward is told what failed and tries again; if it cannot, the change is not certified.
+            # The steward is told what failed and tries again. When it cannot, its tests are gone and the change
+            # is as it was when the checks passed: it goes on, and what was not tested is said (rule 4: a new
+            # test that does not run says nothing about the application). Once this ended a migration that worked.
             lib.revert(applied)
             tries = state.get("own_tests_attempts", 0) + 1
+            if tries >= 2 and state["own_tests"] == "tests":
+                return {"route": "inform", "stage": "qa", "applied": None, "applied_kind": None, "own_tests": "",
+                        "journal": seen + entry("QA", "could not write a test that runs, twice; its tests were taken out and the change goes on"),
+                        "notes": state.get("notes", []) + [UNTESTED + "the tests it wrote did not pass against the change, twice: "
+                                                           + " ".join(output[-300:].split())]}
             if tries >= 2:
-                return stop(state, "escalated", "the tests the steward wrote for this change do not pass against it, twice, "
-                                                 "so its tests were not evaluated and it is not certified")
-            return {"route": state["own_tests"], "applied": None, "applied_kind": None, "own_tests": "", "own_tests_attempts": tries,
+                return {**stop(state, "escalated", "the tests the steward rewrote do not pass against the change, twice, "
+                                                    "so it is not certified"), "journal": seen}
+            return {"route": state["own_tests"], "journal": seen, "applied": None, "applied_kind": None, "own_tests": "", "own_tests_attempts": tries,
                     "tests_feedback": output[-3000:],
                     "notes": state.get("notes", []) + ["the steward's new tests failed against the change and were discarded; it was asked again"]}
-        return handle_failure(state, output, applied)
+        after = handle_failure(state, output, applied)
+        return {**after, "journal": seen + after.get("journal", [])}
 
     def n_ci_failure(state: RunState) -> dict:
         return handle_failure(state, state.get("failure_output", ""), None)
@@ -650,11 +976,14 @@ def build_graph(rt: Runtime):
 
     def n_tests(state: RunState) -> dict:
         """Proactive: does the change to application code have the tests it needs?"""
-        base = {"tests_done": state["iteration"], "route": "review"}
-        if not any(lib.is_source_path(f) for f in changed_files(rt.base_sha)):
+        base = {"tests_done": state["iteration"], "route": "inform", "stage": "qa"}
+        asked = (state["plan"].get("brief") or {}).get("tests") or {}
+        if not rt.write_tests or (not asked.get("needed") and not any(lib.is_source_path(f) for f in changed_files(rt.base_sha))):
             return base
         user = (f"## Mode\nPROACTIVE: decide whether the tests cover this change.\n\n## Stated intent\n{intent_text(state['plan'])}"
-                f"\n\n## Existing tests\n{lib.test_inventory()}\n\n## How tests are written in this repository\n{lib.test_conventions()}\n\n## Diff\n{diff_since_base(rt.base_sha)[:40000]}")
+                + ("\n\n## What the architect says the tests must check\n" + "\n".join(f"- {w}" for w in asked["what"]) if asked.get("what") else "")
+                + f"\n\n## Existing tests\n{lib.test_inventory()}\n\n## How tests are written in this repository\n{lib.test_conventions()}\n\n## Diff\n{diff_since_base(rt.base_sha)[:40000]}")
+        user += so_far(state)
         if state.get("tests_feedback"):
             user += ("\n\n## The tests you wrote last time FAILED against this change and were discarded\n"
                      "The application is right and is not going to change. Assert only what this output shows the code "
@@ -666,76 +995,151 @@ def build_graph(rt: Runtime):
         notes = list(state.get("notes", []))
         applied, explanation, failure = usable_changes("test-steward", user, lib.is_test_path, not_weaker)
         if failure:
-            # Not certifiable: whether this change has the tests it needs was never established.
-            return stop(state, "escalated", f"the test steward could not produce a usable answer ({failure}), so the "
-                                             "tests of this change were not evaluated and it is not certified")
+            # The checks pass and nothing of the steward's was kept: the change goes on, and it is said that
+            # nobody established whether it has the tests it needs.
+            return {**base, "notes": notes + [UNTESTED + f"it gave no usable answer ({failure})"],
+                    "journal": entry("QA", f"gave no usable answer about the tests of this change ({failure}); the change goes on")}
         if applied is None:
-            return {**base, "notes": notes + [f"tests: {explanation or 'the existing tests already cover this change'}"]}
+            return {**base, "notes": notes + [f"tests: {explanation or 'the existing tests already cover this change'}"],
+                    "journal": entry("QA", "added no test: " + (explanation or "the existing tests already cover this change"))}
         found = lib.discriminating(rt.base_sha, [f for f in applied.files if f.endswith(".py")])
         if found is not None and found[0] == 0:
             notes.append("the new tests also pass without the change, so they may not test it")
-        return {"tests_done": state["iteration"], "route": "verify", "applied": {"edited": applied.edited, "created": applied.created},
-                "applied_kind": "test", "own_tests": "tests", "explanation": f"tests: {explanation}", "notes": notes + [f"tests added/updated: {', '.join(applied.files)}"]}
-
-    def after_review(state: RunState, findings: list[lib.Finding], dropped, label: str) -> dict:
-        in_scope = [f for f in findings if lib.finding_in_scope(f, state["plan"])]
-        out_of_scope = len(findings) - len(in_scope)
-        findings = in_scope
-        blocking = [f for f in findings if sends_back(f)]
-        scope_note = ([f"{out_of_scope} finding(s) concern files the plan declared out of scope and were not acted on"]
-                      if out_of_scope else [])
-        rounds = state.get("rounds", []) + [{
-            "iteration": state["iteration"], "stage": label,
-            "findings": [f.to_dict() for f in findings], "dropped": len(dropped),
-        }]
-        if not blocking or state["iteration"] > 1:
-            # A reviewer asks for a fix once. What it still finds after that is written in the review and
-            # the change goes on: failing checks end a change, a reviewer's finding does not. Changes whose
-            # checks passed were abandoned over findings the developer agent had not resolved.
-            left = ([f"{len(blocking)} finding(s) of the review remain after the developer agent's one fix; the checks "
-                     "pass, so they are reported and the change goes on"] if blocking else [])
-            return {"route": "docs", "rounds": rounds, "notes": state.get("notes", []) + scope_note + left}
-        return {
-            "route": "write", "rounds": rounds, "iteration": state["iteration"] + 1,
-            "fix_from": git("rev-parse", "HEAD").stdout.strip(), "asked": [f.to_dict() for f in blocking],
-            "notes": state.get("notes", []) + scope_note,
-            "feedback": REVIEW_FEEDBACK + " to fix (each is blocking; fix exactly these, minimally):\n"
-                        + lib.findings_for_writer(blocking),
-        }
+        return {"tests_done": state["iteration"], "route": "verify", "stage": "qa", "applied": {"edited": applied.edited, "created": applied.created},
+                "applied_kind": "test", "own_tests": "tests", "explanation": f"tests: {explanation}", "notes": notes + [f"tests added/updated: {', '.join(applied.files)}"],
+                "journal": entry("QA", f"added or updated tests in {', '.join(applied.files)}: {explanation}")}
 
     evidence_read: list[str] = []
 
     def evidence() -> str:
-        # Read once, at the first review: by then the checks that produce it have had the time the
-        # verification and the test steward took.
+        # Read once, when the roles that inform look: by then the checks that produce it have had the
+        # time the developer, the pair and the test steward took.
         if not evidence_read:
             evidence_read.append(rt.evidence() if callable(rt.evidence) else "")
         return evidence_read[0]
 
-    def n_review(state: RunState) -> dict:
-        notes: list[str] = list(state.get("awareness", []))
+    def record(state: RunState, findings: list[lib.Finding], dropped, stage: str) -> tuple[list[lib.Finding], list, list[str]]:
+        in_scope = [f for f in findings if lib.finding_in_scope(f, state["plan"])]
+        left_out = len(findings) - len(in_scope)
+        rounds = state.get("rounds", []) + [{"iteration": state["iteration"], "stage": stage,
+                                             "findings": [f.to_dict() for f in in_scope], "dropped": len(dropped)}]
+        note = [f"{left_out} finding(s) concern files the plan declared out of scope and were not acted on"] if left_out else []
+        return in_scope, rounds, note
+
+    def n_pair(state: RunState) -> dict:
+        """The second developer reads the first one's work: the whole change the first time, then each
+        correction alone. It accepts, or sends the change back with what is wrong; the third time it
+        sends it back the two do not agree, and the architect decides."""
+        said: list[str] = list(state.get("awareness", []))
+        guidance = rt.guidance
         if state.get("fix_from"):
-            # The developer agent has made its one fix. The second developer, who asked for it, reads the
-            # fix and nothing else: the other roles asked for nothing, and the rest of the change they have
-            # read already. All four reading everything again, then a final reviewer reading it once more,
-            # was five model calls (one of 271 seconds) to check a correction of a few lines.
             path = OUT_DIR / "fix.diff"
             build_diff(state["fix_from"], "HEAD", path)
-            if not path.read_text().strip():
-                return {"route": "docs"}
-            result = review_diff(rt.caller, path.read_text(), state["plan"], (SECOND_DEVELOPER,),
-                                 (rt.guidance + "\n\n" if rt.guidance.strip() else "")
-                                 + "This diff is the correction made for the findings below, and nothing else of the "
-                                 "change. Judge whether it resolves them and whether it breaks anything.\n"
-                                 + json.dumps(state.get("asked", []), indent=2))
-            label = "fix"
+            diff, stage = path.read_text(), "fix"
+            guidance = ((guidance + "\n\n" if guidance.strip() else "")
+                        + "This diff is the correction made for the findings below, and nothing else of the change. "
+                        "Judge whether it resolves them and whether it breaks anything.\n" + json.dumps(state.get("asked", []), indent=2))
         else:
-            result = review_diff(rt.caller, diff_since_base(rt.base_sha), state["plan"], guidance=rt.guidance,
-                                 evidence=evidence(), awareness=notes, context=rt.context)
-            label = "review"
+            diff, stage = diff_since_base(rt.base_sha), "pair"
+        if not diff.strip():
+            return {"route": "tests"}
+        touched = sorted(set(re.findall(r"^\+\+\+ b/(.+)$", diff, re.MULTILINE)))
+        result = review_diff(rt.caller, diff, state["plan"], (SECOND_DEVELOPER,), guidance, awareness=said,
+                             code=lib.files_whole(touched, CODE_CHARS // 2), before=so_far(state))
         if result is None:
             return stop(state, "escalated", "the second developer did not return a usable reply, so the change could not be certified")
-        return {**after_review(state, *result, label), "awareness": notes}
+        findings, rounds, note = record(state, *result, stage)
+        notes = state.get("notes", []) + note
+        first_reading = stage == "pair" and not state.get("pair_rounds")
+        back = [f for f in findings if sends_back(f) or (first_reading and worth_one_fix(f))]
+        seen = [f"{f.file}:{f.line} ({f.severity}) {f.problem}" for f in findings]
+        if not back:
+            return {"route": "tests", "rounds": rounds, "notes": notes, "awareness": said,
+                    "journal": entry("second developer", "read the change and accepted it" + (", with notes" if seen else ""), seen)}
+        sent = state.get("pair_rounds", 0) + 1
+        asked = [f.to_dict() for f in back]
+        wrote = entry("second developer", f"sent the change back to the developer (time {sent} of {MAX_PAIR_ROUNDS})", seen)
+        if sent >= MAX_PAIR_ROUNDS:
+            return {"route": "decide", "rounds": rounds, "notes": notes, "awareness": said, "pair_rounds": sent, "asked": asked,
+                    "journal": wrote}
+        return {
+            "route": "write", "rounds": rounds, "notes": notes, "awareness": said, "pair_rounds": sent, "journal": wrote,
+            "iteration": state["iteration"] + 1, "fix_from": git("rev-parse", "HEAD").stdout.strip(), "asked": asked,
+            "feedback": REVIEW_FEEDBACK + " to fix (found by the second developer; fix exactly these, minimally):\n"
+                        + lib.findings_for_writer(back),
+        }
+
+    def n_decide(state: RunState) -> dict:
+        """The two developers did not agree in three rounds. The architect settles it, once: the change
+        goes on as it is, with the objections reported, or one last change is made and not reviewed."""
+        def validate(data: dict):
+            wanted = data.get("instructions", [])
+            if data.get("decision") not in ("accept", "instruct") or not isinstance(wanted, list):
+                return None
+            wanted = [x.strip() for x in wanted if isinstance(x, str) and x.strip()]
+            return None if data["decision"] == "instruct" and not wanted else (data["decision"], str(data.get("reason", ""))[:400], wanted)
+
+        user = (f"## Your brief\n{json.dumps(state['plan'].get('brief') or state['plan'], indent=2)}\n\n"
+                f"## The change as it is now\n{lib.annotate_diff(diff_since_base(rt.base_sha))}\n\n"
+                f"## What the second developer still objects to, after {state.get('pair_rounds', 0)} rounds\n"
+                f"{json.dumps(state.get('asked', []), indent=2)}" + so_far(state))
+        verdict = lib.ask_json(rt.caller, "architect-decide", lib.load_prompt("architect-decide"), user, validate)
+        notes = list(state.get("notes", []))
+        if verdict is None or verdict[0] == "accept":
+            # No answer is an acceptance: the checks pass on the change as it is, and a reviewer's
+            # objection does not end a change that works. The objections stay in the report.
+            notes.append("the two developers did not agree in three rounds; " + (
+                f"the architect accepted the change as it is: {verdict[1]}" if verdict else
+                "the architect gave no decision, and the checks pass, so the change goes on with the objections reported"))
+            return {"route": "tests", "notes": notes, "decided": True,
+                    "journal": entry("architect", "settled the two developers' disagreement: the change goes on as it is. "
+                                     + (verdict[1] if verdict else "(no decision was given; the checks pass)"))}
+        notes.append(f"the two developers did not agree in three rounds; the architect asked for one last change: {verdict[1]}")
+        return {"route": "write", "notes": notes, "decided": True, "iteration": state["iteration"] + 1,
+                "journal": entry("architect", "settled the two developers' disagreement: one last change. " + verdict[1], verdict[2]),
+                "feedback": ARCHITECT_FEEDBACK + " (the architect's decision between the two developers). Make exactly "
+                            "these changes:\n" + "\n".join(f"- {i}" for i in verdict[2])}
+
+    def n_inform(state: RunState) -> dict:
+        """Which of the roles that inform are called for this change: the facts (what it touches) oblige,
+        the architect may add. They then run side by side, each in its own node."""
+        brief = state["plan"].get("brief") or {}
+        wanted = lib.roles_required(changed_files(rt.base_sha))
+        if (brief.get("infrastructure") or {}).get("impact"):
+            wanted.add("reviewer-sre")
+        if (brief.get("security") or {}).get("impact"):
+            wanted.add("reviewer-security")
+        roles = [r for r in INFORMERS if r in wanted] if rt.architect else list(INFORMERS)
+        if not roles or not diff_since_base(rt.base_sha).strip():
+            return {"informers": [], "notes": state.get("notes", []) + (
+                ["SRE and security: nothing in this change touches what they look at"] if rt.architect else []),
+                    "journal": entry("SRE and security", "were not called: nothing in this change touches what they look at")}
+        evidence()      # read once, here, before the two start: they would otherwise both fetch it
+        return {"informers": roles}
+
+    def informer(role: str, who: str):
+        def node(state: RunState) -> dict:
+            said: list[str] = []
+            result = review_diff(rt.caller, diff_since_base(rt.base_sha), state["plan"], (role,), rt.guidance,
+                                 evidence=evidence(), awareness=said, before=so_far(state))
+            findings, dropped = result if result else ([], [])
+            told = said + [f"{f.file}:{f.line} ({f.severity}) {f.problem}" for f in findings]
+            return {"informed": [{"cycle": state.get("cycle", 1), "role": role, "said": said, "dropped": len(dropped),
+                                  "findings": [f.to_dict() for f in findings]}],
+                    "journal": entry(who, "looked at the change and at what the tools reported; it informs, it does not send "
+                                     "the change back" + ("" if told else ": nothing to report"), told)}
+        return node
+
+    def n_informed(state: RunState) -> dict:
+        """What the roles that inform said, gathered into the record of the run."""
+        mine = [r for r in state.get("informed", []) if r["cycle"] == state.get("cycle", 1)]
+        if not mine:
+            return {}
+        findings = lib.dedup_findings([lib.Finding(**f) for r in mine for f in r["findings"]])
+        kept, rounds, note = record(state, findings, [None] * sum(r["dropped"] for r in mine), "inform")
+        known = list(state.get("awareness", []))
+        return {"rounds": rounds, "notes": state.get("notes", []) + note,
+                "awareness": known + [x for r in mine for x in r["said"] if x not in known]}
 
     def n_docs(state: RunState) -> dict:
         notes = list(state.get("notes", []))
@@ -744,7 +1148,7 @@ def build_graph(rt: Runtime):
         # README first: when nothing mentions the change it is the document handed over.
         doc_paths.sort(key=lambda p: (not p.lower().startswith("readme"), p))
         user = (f"## Plan\n{json.dumps(state['plan'], indent=2)}\n\n## Diff\n{diff}\n\n"
-                f"## Documentation files\n{lib.relevant_docs(diff, doc_paths)}")
+                f"## Documentation files\n{lib.relevant_docs(diff, doc_paths)}" + so_far(state))
 
         def validate(data: dict):
             return lib.parse_changes(data, allowed=is_doc_path)
@@ -772,28 +1176,91 @@ def build_graph(rt: Runtime):
             path.write_text(add_entry(path.read_text() if path.is_file() else "", category, summary.rstrip(".") + ref))
             commit_round("docs(changelog): record the agent change")
             notes.append(f"changelog entry added to {rt.changelog_path}")
-        return {"route": "end", "outcome": "converged", "notes": notes}
+        return {"route": "close", "notes": notes, "journal": entry("documentation", notes[len(state.get("notes", [])):][0]
+                                                                   if len(notes) > len(state.get("notes", [])) else "nothing to do")}
+
+    def n_close(state: RunState) -> dict:
+        """The architect's last pass. Whether the change works is not its opinion: every commit that
+        reached this point went through the checks. It says, for a person who was not there, what
+        happened, and what its brief asked for that nobody did; that is reported, and undoes nothing."""
+        notes = list(state.get("notes", []))
+        brief = state["plan"].get("brief")
+        if not rt.architect or not brief:
+            return {"route": "end", "outcome": "converged", "notes": notes}
+
+        def validate(data: dict):
+            story, missing = data.get("story"), data.get("missing", [])
+            if not isinstance(story, list) or not isinstance(missing, list):
+                return None
+            clean = lambda items: [" ".join(x.split())[:400] for x in items if isinstance(x, str) and x.strip()]  # noqa: E731
+            return (clean(story)[:8], clean(missing)[:6]) if clean(story) else None
+
+        record_of_work = {
+            "rounds": [{"stage": r["stage"], "findings": [{k: f.get(k) for k in ("severity", "file", "problem", "reviewers")}
+                                                          for f in r["findings"]]} for r in state.get("rounds", [])],
+            "who_was_wrong_when_a_check_failed": [v for a in state.get("adjudications", []) for v in a["verdicts"]],
+            "what_the_tools_reported": state.get("awareness", []),
+            "notes": notes,
+            "files_changed_by_the_agents": [n for n in git("diff", "--name-only", rt.base_sha, "HEAD").stdout.split("\n") if n],
+        }
+        user = (f"## The task\n{rt.task or intent_text(state['plan'])}\n\n## Your brief\n{json.dumps(brief, indent=2)}\n\n"
+                f"## The record of the work\n{json.dumps(record_of_work, indent=2)[:30000]}" + so_far(state))
+        told = lib.ask_json(rt.caller, "architect-close", lib.load_prompt("architect-close"), user, validate)
+        if told is None:
+            return {"route": "end", "outcome": "converged", "notes": notes}
+        story, missing = told
+        if missing and not state.get("finishing"):
+            # Work the brief asked for and nobody did goes back to the developer, once: it was asked for, it
+            # is not an opinion. What is still missing after that is reported, and the change goes on.
+            return {"route": "write", "stage": "finish", "finishing": True, "verify_attempts": 0, "applied": None,
+                    "iteration": state["iteration"] + 1,
+                    "journal": entry("architect", "read the finished work and sent back what its brief asked for and nobody did", missing),
+                    "notes": notes + ["the architect sent back to the developer agent what the brief asked for and was not done"],
+                    "feedback": ARCHITECT_FEEDBACK + ". The change works and stays as it is. Your brief also asked for the "
+                                "following, which was not done. Do exactly these, and nothing else:\n" + "\n".join(f"- {m}" for m in missing)}
+        return {"route": "end", "outcome": "converged", "story": story,
+                "journal": entry("architect", "closed the work. " + " ".join(story), [f"asked for and not done: {m}" for m in missing]),
+                "notes": notes + [f"the brief asked for this and the record does not show it done: {m}" for m in missing]}
 
     def n_start(state: RunState) -> dict:
-        return {"route": rt.start}
+        if rt.architect:
+            return {"route": "architect"}
+        return {"route": "pair" if rt.start == "review" else rt.start}
 
     graph = StateGraph(RunState)
-    for name, fn in (("start", n_start), ("write", n_write), ("verify", n_verify), ("review", n_review),
-                     ("ci_failure", n_ci_failure), ("steward", n_steward), ("tests", n_tests),
-                     ("docs", n_docs)):
-        graph.add_node(name, fn)
+    # A node whose model call fell is run again by the graph, once (`ModelUnavailable`); a second failure
+    # ends the run, and whoever started it says why.
+    again_if_the_model_fell = RetryPolicy(max_attempts=2, initial_interval=2.0, retry_on=lib.ModelUnavailable)
+    for name, fn in (("start", n_start), ("architect", n_architect), ("write", n_write), ("verify", n_verify),
+                     ("pair", n_pair), ("decide", n_decide), ("ci_failure", n_ci_failure), ("steward", n_steward),
+                     ("tests", n_tests), ("inform", n_inform), ("sre", informer("reviewer-sre", "SRE")),
+                     ("security", informer("reviewer-security", "security")), ("informed", n_informed),
+                     ("docs", n_docs), ("close", n_close)):
+        graph.add_node(name, fn, retry_policy=again_if_the_model_fell)
     graph.set_entry_point("start")
     route = lambda s: s["route"]  # noqa: E731
-    graph.add_conditional_edges("start", route, {"write": "write", "verify": "verify", "review": "review", "ci": "ci_failure"})
-    graph.add_conditional_edges("ci_failure", route, {"write": "write", "steward": "steward", "verify": "verify", "end": END})
-    graph.add_conditional_edges("steward", route, {"verify": "verify", "write": "write", "end": END})
-    graph.add_conditional_edges("tests", route, {"verify": "verify", "review": "review", "end": END})
-    graph.add_conditional_edges("write", route, {"verify": "verify", "write": "write", "docs": "docs", "end": END})
-    graph.add_conditional_edges("verify", route, {"review": "review", "tests": "tests", "write": "write", "steward": "steward",
-                                                  "verify": "verify", "end": END})
-    graph.add_conditional_edges("review", route, {"docs": "docs", "write": "write", "end": END})
-    graph.add_edge("docs", END)
-    return graph.compile()
+    # Any node that can find the work at a dead end can hand it back to the architect, once (see `stop`).
+    again = {"architect": "architect", "end": END}
+    graph.add_conditional_edges("start", route, {"architect": "architect", "write": "write", "verify": "verify", "pair": "pair", "ci": "ci_failure"})
+    graph.add_conditional_edges("architect", route, {"write": "write", "pair": "pair", "steward": "steward", "verify": "verify", **again})
+    graph.add_conditional_edges("ci_failure", route, {"write": "write", "steward": "steward", "verify": "verify", **again})
+    graph.add_conditional_edges("steward", route, {"verify": "verify", "write": "write", **again})
+    graph.add_conditional_edges("write", route, {"verify": "verify", "write": "write", "pair": "pair", "tests": "tests", "close": "close", **again})
+    graph.add_conditional_edges("verify", route, {"pair": "pair", "tests": "tests", "inform": "inform", "write": "write",
+                                                  "steward": "steward", "verify": "verify", "close": "close", **again})
+    graph.add_conditional_edges("pair", route, {"tests": "tests", "write": "write", "decide": "decide", **again})
+    graph.add_conditional_edges("decide", route, {"tests": "tests", "write": "write", **again})
+    graph.add_conditional_edges("tests", route, {"verify": "verify", "inform": "inform", **again})
+    # The SRE and the security role start together, each in its own node, and `informed` gathers them.
+    side_by_side = {"reviewer-sre": "sre", "reviewer-security": "security"}
+    graph.add_conditional_edges("inform", lambda s: [side_by_side[r] for r in s.get("informers") or []] or "informed",
+                                ["sre", "security", "informed"])
+    graph.add_edge("sre", "informed")
+    graph.add_edge("security", "informed")
+    graph.add_edge("informed", "docs")
+    graph.add_conditional_edges("docs", route, {"close": "close", **again})
+    graph.add_conditional_edges("close", route, {"write": "write", "end": END})
+    return graph.compile(checkpointer=checkpointer)
 
 
 # ---------------------------------------------------------------------------
@@ -862,7 +1329,8 @@ def write_result(result: dict) -> None:
     if summary:
         with open(summary, "a", encoding="utf-8") as fh:
             fh.write(f"## Agent pipeline\n\n- outcome: **{result['outcome']}**\n"
-                     + "".join(f"- {n}\n" for n in result.get("notes", [])[:10]))
+                     + ("\n" + render_journal(result["journal"], limit=60000).replace("\n## ", "\n### ") if result.get("journal")
+                        else "".join(f"- {n}\n" for n in result.get("notes", [])[:10])))
 
 
 def settle(outcome: str) -> str:
@@ -1173,18 +1641,46 @@ def cmd_change(args: argparse.Namespace) -> int:
                           "files": [], "cost_usd": 0.0, "cost_by_role": {}, "title": ""})
             return 0
     evidence_repo = os.environ.get("GITHUB_REPOSITORY", "")
+    prefix = getattr(args, "evidence_prefix", "")
+
+    def evidence() -> str:
+        """What the tools reported for this commit and, to compare, for the base commit: a finding that
+        was already there is not news of this change. With nothing on the base there is no baseline yet."""
+        here = lib.fetch_evidence(evidence_repo, head_sha, prefix, getattr(args, "evidence_wait", 0),
+                                  own_run=os.environ.get("GITHUB_RUN_ID", ""))
+        if not here.strip():
+            return here
+        before = lib.fetch_evidence(evidence_repo, args.base_sha, prefix, 0)
+        return (here + "\n\n## The same tools on the base commit (to compare)\n"
+                + (before if before.strip() else "Nothing was found for the base commit: there is no baseline yet, and this run is the first."))
+
+    kind = {"push": "a commit pushed straight to the base branch"}.get(
+        args.mode, "a pull request whose checks failed" if start == "ci" else "a pull request")
     rt = Runtime(caller, args.base_sha, pathlib.Path(args.verify_command_file).read_text() if args.verify_command_file else "",
                  args.verify_timeout, args.max_iterations, args.max_verify_retries, args.writer_rounds,
-                 context, "", 0, start=start, fix_kind="fix",
-                 evidence=lambda: lib.fetch_evidence(evidence_repo, head_sha, getattr(args, "evidence_prefix", ""),
-                                                     getattr(args, "evidence_wait", 0),
-                                                     own_run=os.environ.get("GITHUB_RUN_ID", "")))
-    # One run of the graph. A second attempt with twice the budget once repeated the checks and the test
-    # steward for six minutes to wait again for the same silent reviewer; the loops inside the graph are
-    # what retries, each for its own reason.
-    final = build_graph(rt).invoke({"plan": plan, "iteration": 1, "verify_attempts": 0, "notes": [], "rounds": [],
-                                    "failure_output": failure_output},
-                                   config={"recursion_limit": (rt.max_iterations + 1) * (rt.max_verify_retries + 1) * 6 + 30})
+                 context, "", 0, start=start, fix_kind="fix", evidence=evidence, architect=True,
+                 task=f"Kind: {kind}\nTitle: {lib.sanitize_untrusted(title, 500)}\n\n{lib.sanitize_untrusted(body, 20000)}")
+    # One run of the graph, from the architect's brief to its closing pass. When the work does not end
+    # well the graph itself goes back to the architect, once, with the reason (see `stop`).
+    # The graph is streamed: after every node the journal of the run is written again to its record, so a
+    # run that is cut short leaves what it had done, and one place does the writing.
+    record_name, final = run_name(), {}
+    lib.tool_context.update(base_sha=args.base_sha, evidence=evidence, runs_dir=str(runs_folder()), run_record=record_name)
+    caller.raises = True
+    try:
+        for state in build_graph(rt, run_checkpointer(record_name)).stream(
+                {"plan": plan, "iteration": 1, "verify_attempts": 0, "notes": [], "rounds": [], "journal": [],
+                 "failure_output": failure_output},
+                config={"recursion_limit": (rt.max_iterations + 1) * (rt.max_verify_retries + 1) * 12 + 60,
+                        "configurable": {"thread_id": record_name}}, stream_mode="values"):
+            final = state
+            save_run_record(record_name, render_journal(state.get("journal") or [], f"{title} ({kind})"))
+    except lib.ModelUnavailable as exc:
+        # The graph ran the node again and the model still could not be reached. The run ends here and
+        # says the cause: a comment that named only the role left without an answer hid a spent key.
+        final = {**final, "outcome": "failed", "journal": (final.get("journal") or []) + entry("the model", f"could not be reached, twice: {exc}", fact=True),
+                 "notes": final.get("notes", []) + [f"the model could not be reached, twice, so the work stopped: {exc}"]}
+        save_run_record(record_name, render_journal(final["journal"], f"{title} ({kind})"))
 
     outcome = settle(final.get("outcome", "failed"))
     if getattr(caller, "out_of_time", False) and outcome == "abandoned":
@@ -1202,8 +1698,10 @@ def cmd_change(args: argparse.Namespace) -> int:
     result = {
         "mode": args.mode, "outcome": outcome, "branch": branch, "head_sha": head_sha, "commits": new_commits,
         "final_sha": git("rev-parse", "HEAD").stdout.strip(),
-        "plan": plan, "notes": final.get("notes", []), "rounds": rounds,
-        "findings": rounds[-1]["findings"] if rounds else [], "files": touched_now, "cost_usd": caller.total_cost_usd(),
+        "plan": final.get("plan") or plan, "notes": final.get("notes", []), "rounds": rounds, "story": final.get("story", []),
+        "journal": final.get("journal", []), "run_record": f"{RUNS_DIR}/{record_name}",
+        "findings": lib.merge_finding_dicts([f for r in rounds for f in r["findings"]]), "files": touched_now,
+        "cost_usd": caller.total_cost_usd(),
         "adjudications": final.get("adjudications", []),
         "awareness": final.get("awareness", []),
         "cost_by_role": caller.cost_by_role(),
@@ -1217,7 +1715,17 @@ def cmd_change(args: argparse.Namespace) -> int:
     return 0
 
 
+WHO_WAS_WRONG = {
+    "code_defect": "the code was wrong, the test was right",
+    "test_defect": "the test was out of date: the change says, in its own words, that this behaviour is meant to change",
+    "environment": "neither: the test fails for a reason outside the change",
+    "preexisting": "it was failing before this change",
+}
+
+
 def build_change_comment(result: dict, pushed_ok: bool | None) -> str:
+    """One comment a person can read. First what happened, in plain words (the architect's closing
+    pass writes it); then the brief; the record, with its internal names, is folded underneath."""
     outcome = result["outcome"]
     n = result.get("commits", 0)
     sha = result.get("final_sha", "")
@@ -1225,41 +1733,56 @@ def build_change_comment(result: dict, pushed_ok: bool | None) -> str:
     last_note = (result.get("notes") or ["no detail"])[-1].splitlines()[0][:300]
     left = sum(1 for f in result.get("findings") or [] if f["severity"] in lib.BLOCKING)
     status = {
-        "clean": ("The" if left else "No blocking findings, and the") + " deterministic checks pass. Nothing was changed.",
-        "converged": f"The agent {'worked on' if left else 'fixed'} this and {'pushed' if pushed_ok else 'could not push'} "
-                     f"{n} commit(s) to the branch. " + ("The checks pass." if left else "Checks and every review pass."),
-        "abandoned": f"**The agent abandoned this change** ({last_note}). "
+        "clean": "The checks pass and nothing had to be changed.",
+        "converged": f"The checks pass. The agents {'added' if pushed_ok else 'could not push'} {n} commit(s) to this branch.",
+        "abandoned": f"**The agents abandoned this change** ({last_note}). "
                      "Nothing was merged and the base branch is untouched.",
     }.get(outcome, outcome)
     if left and outcome in ("clean", "converged"):
-        status += (f" {left} finding(s) of the review were not resolved: they are below for the people responsible for "
-                   "the project, and did not hold the change, because it works.")
+        status += (f" {left} finding(s) of the review were not resolved: they are in the details, for the people responsible "
+                   "for the project, and did not hold the change, because it works.")
     if certified:
-        status += f" **Certified at `{sha[:7]}`**: it merges automatically once its CI is green."
+        status += f" **Certified at `{sha[:7]}`**: it merges by itself once its CI is green."
     abandoned_head = result.get("head_sha", "") if outcome == "abandoned" else ""
     parts = ["<!-- agent-pr -->" + (f"\n<!-- {CERT_MARKER}: {sha} -->" if certified else "")
              + (f"\n<!-- {ABANDON_MARKER}: {abandoned_head} -->" if abandoned_head else ""), "## Agent review", status]
+    if result.get("story"):
+        parts.append("### What happened\n" + "\n".join(f"{i}. {x}" for i, x in enumerate(result["story"], 1)))
+    brief = (result.get("plan") or {}).get("brief")
+    if brief:
+        asked = [f"**The architect's brief.** {brief['summary']}"]
+        asked += [f"- For the developer: {x}" for x in brief["developer"]["instructions"]]
+        for key, flag, who in (("tests", "needed", "QA"), ("infrastructure", "impact", "the SRE"),
+                               ("security", "impact", "security"), ("docs", "needed", "the documentation")):
+            if brief[key][flag]:
+                asked.append(f"- For {who}: " + ("; ".join(brief[key]["what"]) or "to look at this change"))
+        asked += [f"- Outside this task, worth knowing: {x}" for x in brief.get("beyond_the_task", [])]
+        parts.append("\n".join(asked))
+    detail = []
     rounds = result.get("rounds", [])
     if rounds:
-        table = ["| Iteration | Stage | Findings | Blocking | Dropped (not on a changed line) |", "|---|---|---|---|---|"]
+        table = ["| Round | Step | Findings | Sent back to the developer | Dropped (not on a changed line) |", "|---|---|---|---|---|"]
         for r in rounds:
-            blocking = sum(1 for f in r["findings"] if f["severity"] in lib.BLOCKING)
-            table.append(f"| {r['iteration']} | {r['stage']} | {len(r['findings'])} | {blocking} | {r['dropped']} |")
-        parts.append("\n".join(table))
+            back = sum(1 for f in r["findings"] if f["severity"] in lib.BLOCKING and SECOND_DEVELOPER in (f.get("reviewers") or []))
+            table.append(f"| {r['iteration']} | {r['stage']} | {len(r['findings'])} | {back} | {r['dropped']} |")
+        detail.append("\n".join(table))
     if result.get("adjudications"):
-        lines = [f"- `{v['test']}`: **{v['classification']}** ({v['confidence']}): {v['reason']}"
+        lines = [f"- `{v['test']}`: {WHO_WAS_WRONG.get(v['classification'], v['classification'])} "
+                 f"(**{v['classification']}**, {v['confidence']}). {v['reason']}"
                  for a in result["adjudications"] for v in a["verdicts"]]
-        parts.append("### Who was wrong, the code or the test?\n" + "\n".join(lines))
+        detail.append("### A check failed: was the code wrong, or the test?\n" + "\n".join(lines))
     if result.get("findings"):
-        parts.append("### Findings at the last round\n" + lib.render_findings_md([lib.Finding(**f) for f in result["findings"]]))
+        detail.append("### Findings\n" + lib.render_findings_md([lib.Finding(**f) for f in result["findings"]]))
     if result.get("awareness"):
-        parts.append("### Awareness (not blocking)\nWhat the pipeline's tools reported that matters for this change. "
-                     "It is here to be known; it did not hold the change.\n"
-                     + "\n".join(f"- {x}" for x in result["awareness"]))
+        detail.append("### What the tools reported\nIt is here to be known; it did not hold the change.\n"
+                      + "\n".join(f"- {x}" for x in result["awareness"]))
     if result.get("notes"):
-        parts.append("### Notes\n" + "\n".join(f"- {x}" for x in result["notes"]))
-    parts.append(f"_Reviewed independently by four roles: developer (correctness), security, SRE and architect. "
-                 f"Model cost ${result.get('cost_usd', 0):.4f}._")
+        detail.append("### Notes of the run\n" + "\n".join(f"- {x}" for x in result["notes"]))
+    if detail:
+        parts.append("<details><summary>Details: findings, what the tools reported, notes</summary>\n\n"
+                     + "\n\n".join(detail) + "\n\n</details>")
+    parts.append(f"_An architect wrote the brief and closed the work; a developer and a second developer, QA, SRE, security "
+                 f"and documentation did the rest. Model cost ${result.get('cost_usd', 0):.4f}._")
     return "\n\n".join(parts)
 
 
@@ -1702,7 +2225,7 @@ def main() -> int:
 
     def model_args(p: argparse.ArgumentParser) -> None:
         p.add_argument("--ai-script", required=True)
-        p.add_argument("--max-chars", type=int, default=140_000)
+        p.add_argument("--max-chars", type=int, default=400_000)
         p.add_argument("--timeout", type=int, default=180)
 
     g = sub.add_parser("guard")

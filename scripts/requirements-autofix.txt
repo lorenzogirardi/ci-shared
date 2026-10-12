@@ -3,3 +3,7 @@
 # autofix paths) stays stdlib-only. Installed as a separate step so a caller
 # that never enables autofix never pays for it.
 langgraph>=1.2.0,<2.0.0
+# The state of the graph after every node, as a file next to the record of the run.
+langgraph-checkpoint-sqlite>=3.1.0,<4.0.0
+# The architect's import check: imported names that no longer exist, calls whose arguments do not fit.
+pylint>=3.3,<5.0

@@ -1,6 +1,6 @@
 # Status — AI-native pipeline
 
-Written 2026-10-11 as a handoff and brought up to date on 2026-10-12 06:30 UTC: the work continues from another machine with no memory of
+Written 2026-10-11 as a handoff and brought up to date on 2026-10-12 21:00 UTC: the work continues from another machine with no memory of
 this session. Read `CLAUDE.md` first (intent, rules, tools, the 38 team actions), then this file.
 
 Engine: `lorenzogirardi/ci-shared` (tag `v2`, moved only by `release-tag.yml`).
@@ -29,25 +29,71 @@ merged · abandoned · reverted        + warnings and every role's verdict visib
 |---|---|
 | `ci-shared` `main` and `v2` (what every consumer runs) | equal after every release; check with `git fetch --tags -f origin && git rev-parse origin/main v2^{commit}` |
 | Seen on the consumer on 2026-10-11/12 | a real change to the app through the whole graph, merged with no person in 6 minutes (flask #302); two changes to workflow files merged by the agents (flask #306, #307); the canary with one pull request (flask #305) |
-| The dependency bot | since flask #307 the graph reviews its pull requests too, next to the sweep. **Not seen**: needs its next pull request. If the graph posts its verdict there, the sweep is reduced to asking for a rebase |
+| The dependency bot | since flask #307 the graph reviews its pull requests too, next to the sweep. Seen on flask #313: reviewed and merged by the graph in 3 minutes, with two comments because both engines worked on it |
+| **Branch `feat/architect-first`, local, not pushed** | the new strategy the owner asked for on 2026-10-12: every change enters at the architect and is closed by it. See the section below. Released `v2` does not have it |
 | The model key | its monthly limit was reached on 2026-10-11 and every pull request was abandoned until the owner raised it; the comment said "the test steward could not produce a usable answer", the cause was only in the log. A commit abandoned for that is not tried again without a new push |
 | ci-shared #50 `feat/risk-level` | **closed by accident** on 2026-10-11 (the commit message of #58 said "resolved (#50": GitHub took it as a closing word). The branch is there. Not to be merged as it is: once the owner puts `risk-confirmed` on a pull request, every later commit merges without asking again. Step 4 of the plan |
 | flask-test-api | `main` green, no open pull request |
 
+## The architect first (branch `feat/architect-first`, 2026-10-12)
+
+The owner's strategy, replacing "the reviewers each read the diff": the architect reads the code and the
+facts and writes a brief; developer 1 (always the agent) does it; developer 2 pairs, three rounds at
+most, then the architect decides; QA, SRE and security in parallel, documents; the architect closes.
+`docs/architecture.md` describes it; the approved plan is in the owner's session, not in the repository.
+
+What is on the branch, all of it with unit tests (504 passing):
+
+- the graph above, with a second cycle from the architect when the work reaches a dead end;
+- a record of every run in `agents-run/` (journal and the graph's state after every node), node retries
+  by LangGraph, SRE and security as two parallel nodes;
+- nine tools the architect chooses among, next to list/find/grep/read: `docs`, `usages`, `imports`,
+  `signature`, `history`, `tests`, `api`, `evidence`, `runs`. The owner's words: it must have the tools,
+  and it decides whether to use them;
+- QA thinks before it writes; a test it cannot write no longer ends a change that works;
+- what the brief asked for and nobody did goes back to the developer once, from the close.
+
+Seen, locally, on the replay of flask #118 (Renovate, `mcp` 1 to 2, checks red), the case the released
+graph abandoned in 41 seconds:
+
+| Run | What was different | Outcome |
+|---|---|---|
+| 1 to 3 | architect without tools | abandoned |
+| 4 | same | converged in the second cycle, 430 s |
+| 5 | with the tools; QA with no thinking | brief right at once, checks passed at the first change; abandoned, 413 s, because QA wrote a test that did not run, three times |
+| 6 | QA thinks | converged in one cycle, 162 s |
+| 7 | QA cannot end a change; `docs` reads several sections | converged in one cycle, 190 s; QA changed a test and it passed |
+
+In runs 5 to 7 the architect opened the library's migration guide by itself (`docs`) and its brief
+named the test file the earlier briefs had missed.
+
+Not seen: the integration test of that change executed (no PostgreSQL and Redis locally); the close
+sending work back; QA failing and the change going on; a feature and a bug through the new graph
+(`~/ci-exp/run-cases.sh` replays flask #302 and the first version of ci-shared #53; it needs the model
+key in the terminal that starts it, the session may not type it); any of this in the pipeline.
+
+A warning the runs raised and nothing acts on: `mcp` 2 refuses requests whose Host is not local, so
+`/api/mcp` may stop answering behind an ingress. Only the deploy check of the real pipeline can say.
+
 ## Next actions, in order
 
-1. **The dependency bot's next pull request on flask.** Look for the graph's comment on it (marker
-   `<!-- agent-pr -->`) next to the sweep's. If it is there, reduce the sweep to asking for a rebase
-   (step 5); if it is not, the `pull_request` run of a bot author still has a token that cannot write,
-   and the graph has to be started another way for those pull requests.
-2. **#50 (risk level).** Closed by accident, the branch is there. Fix the confirmation first: it must
-   be bound to the commit that asked for it. It touches `reusable_agent-change.yml`: the agents merge
-   it now.
-3. **The consumer's release notes** (`release-notes.yml`): the one model call left outside the graph.
+1. **Finish and publish `feat/architect-first`**: the two local replays above, then ONE pull request on
+   ci-shared (every release opens a canary pull request on the consumer). The agents that review it run
+   the released engine; the canary judges the new one. The consumer's `docs/13-agent-pipeline.md` after it.
+2. **Remove the sweep** once a dependency update with red checks is seen repaired by the released graph:
+   flask `renovate.json` (`rebaseWhen`, drop the workflow `automerge` rule), `agent-ci-failure.yml`
+   (drop the `renovate/` exclusion), delete `ai-review-sweep.yml`; here the Renovate exclusion in
+   `cmd_merge_gate`, `reusable_pr-review-sweep.yml`, the review part of `pr_review_sweep.py`,
+   `planner.md`, `reviewer-architect.md`, `invoke_with_retry`.
+3. **#50 (risk level).** Closed by accident, the branch is there. Fix the confirmation first: it must
+   be bound to the commit that asked for it.
+4. **The consumer's release notes** (`release-notes.yml`): the one model call left outside the graph.
    The owner has not said whether it stays.
-4. What a run does when the model cannot be reached (row 36 of `CLAUDE.md`): say the cause in the
-   comment, and try the commit again by itself.
-5. Update the state column of the 38 actions in `CLAUDE.md` in each change that moves one.
+5. Readable messages still to do: the canary's label and closing comment; awareness limited to what is
+   new against the base.
+6. Later, by the owner's choice: a subgraph for the developer pair; resuming from the checkpoints when
+   `agents-run` is a bucket; the issue entry; interrupts for the risk level.
+7. Update the state column of the 38 actions in `CLAUDE.md` in each change that moves one.
 
 ## The plan and what is done
 
@@ -115,10 +161,13 @@ Outside the plan, each for a defect seen in a real run:
 `~/ci-exp` on the owner's machine, not in the repository):
 
 - With thinking on, no wording of the prompt gave both speed and sight: seven versions, the owner's and
-  the caveman skill included, either gave no answer on a large diff or stopped seeing the real defect.
+  the caveman skill included, either gave no answer on a large diff or stopped making the remark on #53 (see the correction below).
   Giving it the surrounding code, before or after the change, did not shorten it.
-- With thinking off it answered in 1 to 16 seconds every time and saw the real defect of #53 every time,
-  but marked `high` what was not: 9 false `high` in 10 runs on two correct changes.
+- With thinking off it answered in 1 to 16 seconds every time and remarked on the first version of #53
+  every time, but marked `high` what was not: 9 false `high` in 10 runs on two correct changes.
+  **Corrected on 2026-10-12**: what #53 held was not a defect. It tested the first finding's reviewer
+  where the fix tests the reviewer being read; every list holds one reviewer's findings, so the two behave
+  the same. "Saw the real defect" in these measures means "made that remark", nothing more.
 - Deciding `severity` last in the answer brought that to 3 in 10, with no finding contradicting itself.
 
 Hence: that reviewer answers with no thinking and decides severity last; and a reviewer asks for a fix
@@ -176,7 +225,6 @@ How to look at a run:
 
 ## Not verified in a real run
 
-- The graph on a pull request opened by the dependency bot (flask #307).
 - The dependency bot waiting for the status `agent-review` before merging a workflow pull request.
 - A base-image update (`Dockerfile`, Python 3.15 when its image is published) taken to merge by the
   agents alone.
@@ -188,6 +236,9 @@ How to look at a run:
 - The security role reporting the SBOM.
 
 ## Left for the owner
+
+- **Rotate the model key.** It was pasted in a chat session on 2026-10-11; `OPENROUTER_API_KEY` is to be
+  replaced in both repositories.
 
 - Issues (actions 30-33 in `CLAUDE.md`): out of this plan by choice on 2026-10-11; `planner.md` and
   the issue flow of the engine are kept for it.

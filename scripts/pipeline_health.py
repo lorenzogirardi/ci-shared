@@ -36,6 +36,8 @@ BOOKKEEPING = re.compile(r"^(Done\s+by Github Actions|docs\(changelog\))", re.IG
 DEGRADED_NOTES = (
     "could not produce a usable answer",
     "could not be identified, so no verdict was given",
+    # A change that works is no longer ended for this; it is merged and said, and seen here.
+    "QA could not add the tests this change may need",
     # Wording of engine versions before an agent's failure blocked the certification.
     "returned no usable reply",
     "were not applicable",

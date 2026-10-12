@@ -119,7 +119,7 @@ class TestAwarenessIsANoteNeverAFinding:
         comment = ap.build_change_comment(
             {"outcome": "clean", "commits": 0, "final_sha": "a" * 40, "notes": [], "rounds": [],
              "awareness": ["Trivy: one critical vulnerability in the base image"]}, None)
-        assert "### Awareness (not blocking)" in comment and "Trivy: one critical" in comment
+        assert "### What the tools reported" in comment and "did not hold the change" in comment and "Trivy: one critical" in comment
         assert "Certified at" in comment
 
 
