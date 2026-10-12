@@ -211,7 +211,8 @@ Each step reuses or replaces something; none adds a layer.
 
 - Tests: `pytest tests/` (needs `scripts/requirements-autofix.txt`). The unit tests do not show what
   a model does with a real pull request: after an engine change, the consumer's canary is the proof.
-- Releases: `v2` moves by itself after the tests and the consumer's canary pass. Never move it by hand.
+- Releases: `v3` moves by itself after the tests and the consumer's canary pass. Never move it by hand.
+  `v2` is frozen at the first commit of the architect-first graph (`62b6f7f`), `v1` before the agents.
   Every release runs the canary, which opens a pull request on the consumer: group the changes to the
   engine into few pull requests.
 - Before an engine change goes into the pipeline, run the new engine on a real pull request locally

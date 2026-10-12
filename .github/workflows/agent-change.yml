@@ -1,7 +1,7 @@
 name: Agent Change
 
 # This repository under its own pipeline: every pull request here is reviewed, repaired and certified by
-# the agents it defines. They run at the published tag (v2), never at the pull request's own code, so a
+# the agents it defines. They run at the published tag (v3), never at the pull request's own code, so a
 # change that breaks a reviewer is still judged by the reviewer that works.
 # No agent edits a workflow file, here as everywhere. A pull request that touches .github/workflows/ is
 # reviewed and merged like any other.
@@ -26,7 +26,7 @@ jobs:
       contents: read
       pull-requests: write
       actions: write
-    uses: lorenzogirardi/ci-shared/.github/workflows/reusable_agent-change.yml@v2
+    uses: lorenzogirardi/ci-shared/.github/workflows/reusable_agent-change.yml@v3
     with:
       mode: pr
       base_branch: main

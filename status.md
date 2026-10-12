@@ -3,7 +3,7 @@
 Written 2026-10-11 as a handoff and brought up to date on 2026-10-12 21:00 UTC: the work continues from another machine with no memory of
 this session. Read `CLAUDE.md` first (intent, rules, tools, the 38 team actions), then this file.
 
-Engine: `lorenzogirardi/ci-shared` (tag `v2`, moved only by `release-tag.yml`).
+Engine: `lorenzogirardi/ci-shared` (tag `v3`, moved only by `release-tag.yml`; `v2` is frozen at `62b6f7f`).
 Consumer and proving ground: `lorenzogirardi/flask-test-api`.
 
 ## Target
@@ -27,10 +27,10 @@ merged · abandoned · reverted        + warnings and every role's verdict visib
 
 | Thing | State |
 |---|---|
-| `ci-shared` `main` and `v2` (what every consumer runs) | equal after every release; check with `git fetch --tags -f origin && git rev-parse origin/main v2^{commit}` |
+| `ci-shared` `main` and `v3` (what every consumer runs) | equal after every release; check with `git fetch --tags -f origin && git rev-parse origin/main v2^{commit}` |
 | Seen on the consumer on 2026-10-11/12 | a real change to the app through the whole graph, merged with no person in 6 minutes (flask #302); two changes to workflow files merged by the agents (flask #306, #307); the canary with one pull request (flask #305) |
 | The dependency bot | since flask #307 the graph reviews its pull requests too, next to the sweep. Seen on flask #313: reviewed and merged by the graph in 3 minutes, with two comments because both engines worked on it |
-| **Branch `feat/architect-first`, local, not pushed** | the new strategy the owner asked for on 2026-10-12: every change enters at the architect and is closed by it. See the section below. Released `v2` does not have it |
+| **The architect-first graph** | released on 2026-10-12 21:20 UTC (`62b6f7f`), pushed to `main` with no pull request by the owner's decision. Its first real run is the release canary, flask #314: the architect named the planted defect in its brief, the developer fixed it, QA added tests, certified in about two minutes. See the section below |
 | The model key | its monthly limit was reached on 2026-10-11 and every pull request was abandoned until the owner raised it; the comment said "the test steward could not produce a usable answer", the cause was only in the log. A commit abandoned for that is not tried again without a new push |
 | ci-shared #50 `feat/risk-level` | **closed by accident** on 2026-10-11 (the commit message of #58 said "resolved (#50": GitHub took it as a closing word). The branch is there. Not to be merged as it is: once the owner puts `risk-confirmed` on a pull request, every later commit merges without asking again. Step 4 of the plan |
 | flask-test-api | `main` green, no open pull request |
@@ -68,18 +68,18 @@ In runs 5 to 7 the architect opened the library's migration guide by itself (`do
 named the test file the earlier briefs had missed.
 
 Not seen: the integration test of that change executed (no PostgreSQL and Redis locally); the close
-sending work back; QA failing and the change going on; a feature and a bug through the new graph
-(`~/ci-exp/run-cases.sh` replays flask #302 and the first version of ci-shared #53; it needs the model
-key in the terminal that starts it, the session may not type it); any of this in the pipeline.
+sending work back; QA failing and the change going on. A feature (flask #302) and a fix (the first
+version of ci-shared #53) were replayed too and converged (`~/ci-exp/run-cases.sh`; it needs the model
+key in the terminal that starts it, the session may not type it). In the pipeline: only the canary.
 
 A warning the runs raised and nothing acts on: `mcp` 2 refuses requests whose Host is not local, so
 `/api/mcp` may stop answering behind an ingress. Only the deploy check of the real pipeline can say.
 
 ## Next actions, in order
 
-1. **Finish and publish `feat/architect-first`**: the two local replays above, then ONE pull request on
-   ci-shared (every release opens a canary pull request on the consumer). The agents that review it run
-   the released engine; the canary judges the new one. The consumer's `docs/13-agent-pipeline.md` after it.
+1. **Watch the new graph on real pull requests of the consumer**, and bring its `docs/13-agent-pipeline.md`
+   up to date. Not yet seen released: a dependency update with red checks, the architect's tools in use,
+   SRE and security side by side, the close sending work back, QA failing without ending a change.
 2. **Remove the sweep** once a dependency update with red checks is seen repaired by the released graph:
    flask `renovate.json` (`rebaseWhen`, drop the workflow `automerge` rule), `agent-ci-failure.yml`
    (drop the `renovate/` exclusion), delete `ai-review-sweep.yml`; here the Renovate exclusion in
@@ -206,8 +206,8 @@ Practical facts that cost time to learn:
   a change that removes a protection of the pipeline: the owner then runs the command with `!`.
 - A commit the agents abandoned is not reviewed again by a re-run: push a commit, an empty one will do.
 - A reusable workflow that needs a new permission or input: change the consumer's caller first, then
-  let `v2` move. Never move `v2` by hand.
-- The agents reviewing a pull request of this repository run at the released `v2`, not at the pull
+  let `v3` move. Never move `v3` by hand.
+- The agents reviewing a pull request of this repository run at the released `v3`, not at the pull
   request's own code. New engine behaviour is first seen in the release canary.
 - In flask-test-api never `git add -A`: the untracked `.claude/` holds the owner's local files.
 - Tests here: `uv run --no-project --python 3.12 --with pytest --with-requirements scripts/requirements-autofix.txt pytest tests -q`.

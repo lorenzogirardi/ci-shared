@@ -36,14 +36,14 @@ consumers; a breaking change instead gets a new `v2` tag (and its own
 `ref: v2` literal) so existing `@v1` consumers are unaffected until they bump
 on purpose.
 
-`v2` is not moved by hand. `release-tag.yml` moves it to a commit of `main`,
+`v3` is not moved by hand. `release-tag.yml` moves it to a commit of `main`,
 forwards only, after two things: `Test scripts` has passed on that exact
 commit, and the consumer's canary has passed against it. For the second, the
-commit is published as `v2-next` and the canary of the repository named in the
+commit is published as `v3-next` and the canary of the repository named in the
 variable `ENGINE_GATE_REPO` is started in candidate mode: its pull requests
 target a base branch named `canary/next-*`, and for those the agent workflows
-check out the scripts and prompts at `v2-next`. If a scenario does not hold,
-`v2` stays where it is and the run is red. Until `ENGINE_GATE_REPO` is set
+check out the scripts and prompts at `v3-next`. If a scenario does not hold,
+`v3` stays where it is and the run is red. Until `ENGINE_GATE_REPO` is set
 (`owner/repo`; `ENGINE_GATE_WORKFLOW` names the canary workflow, default
 `pipeline-canary.yml`) that second step is skipped and the tag moves after the
 tests alone; a manual run of `release-tag.yml` with the `consumer` input checks
@@ -52,11 +52,12 @@ does with a real pull request; this does. A consumer whose workflow grants fewer
 permissions than a reusable workflow asks for does not start at all: when a
 change needs a new permission, update the callers first, then merge here.
 
-## v2: role-based agents
+## v3: role-based agents, the architect first
 
-`v2` adds the agents below on top of everything `v1` does; `v1` stays frozen
-for repos that have not moved. All reusable workflows in `v2` check out
-`ref: v2`.
+`v3` is the tag that moves. It carries the agents below on top of everything `v1`
+does, with the graph that enters at the architect. `v2` (the same agents, frozen at
+the first commit of that graph) and `v1` stay where they are for repos that have not
+moved. All reusable workflows in `v3` check out `ref: v3`.
 
 | Workflow | Roles | Writes? |
 |---|---|---|
@@ -287,7 +288,7 @@ Nothing needs to be configured in this repo per consumer — it's stateless.
 
 Pull requests here go through the same loop they define: `agent-change.yml` and `agent-ci-failure.yml`
 review and repair them, `agent-merge.yml` merges a certified pull request once `Test scripts` is green on
-the same commit, and `release-tag.yml` then moves `v2`, once the canary of the consumer repository has
+the same commit, and `release-tag.yml` then moves `v3`, once the canary of the consumer repository has
 passed against the merged commit. The agents run at the published tag, never at the
 pull request's own code, so a change that breaks a reviewer is still judged by the reviewer that works.
 

@@ -33,7 +33,7 @@ ci-shared/
 │   ├── reusable_agent-review.yml      the four reviewers only, one comment
 │   ├── reusable_pr-diff-review.yml    single-reviewer comment on a diff
 │   ├── agent-change.yml, agent-ci-failure.yml, agent-merge.yml   this repository under its own loop
-│   ├── release-tag.yml                moves v2 after the tests and the consumer's canary pass
+│   ├── release-tag.yml                moves v3 after the tests and the consumer's canary pass
 │   └── test.yml                       this repository's tests
 ├── prompts/
 │   ├── agents/*.md                    one prompt per agent role
@@ -321,15 +321,15 @@ the branches. Because the merge gate only merges into its own base branch, a can
 
 ## Releasing this repository
 
-Consumers call the workflows at the tag `v2`, and those workflows check the scripts and prompts out at
+Consumers call the workflows at the tag `v3`, and those workflows check the scripts and prompts out at
 the same tag, so a consumer always runs one coherent version. `release-tag.yml` moves the tag, forwards
 only, in two steps:
 
 1. `Test scripts` passed on that exact commit of `main`.
-2. The consumer's canary passed against it. The commit is published as `v2-next`; the canary of the
+2. The consumer's canary passed against it. The commit is published as `v3-next`; the canary of the
    repository named in the variable `ENGINE_GATE_REPO` is started in candidate mode
    (`repository_dispatch`); its pull requests target a base branch named `canary/next-*`, and for those
-   `reusable_agent-change.yml` checks the scripts out at `v2-next`. If a scenario does not hold, `v2`
+   `reusable_agent-change.yml` checks the scripts out at `v3-next`. If a scenario does not hold, `v3`
    stays where it is and the run is red.
 
 Step 2 exists because unit tests do not show what a model does with a real pull request.
@@ -411,7 +411,7 @@ and the reason a release waits for it.
   before a release.
 - A description is part of the input. One that promises behaviour the code does not have sends the
   agents looking for it; the rules keep the outcome safe, but the change may be abandoned.
-- `v2` is a moving tag that receives the consumers' secrets: what lands on `main` here and passes the
+- `v3` is a moving tag that receives the consumers' secrets: what lands on `main` here and passes the
   release steps runs with their credentials.
 - When the model cannot be reached (the key's limit, the provider down) a change ends abandoned, with the
   cause. A commit abandoned this way is not tried again until a new commit is pushed.

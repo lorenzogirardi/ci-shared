@@ -20,7 +20,7 @@ on:
         type: string
         default: ''
       candidate:
-        description: 'Run the scenarios against the engine about to be released (tag v2-next) instead of v2. The pull requests are then opened against a base branch named canary/next-*, which is what makes the agent workflows pick the candidate.'
+        description: 'Run the scenarios against the engine about to be released (tag v3-next) instead of v3. The pull requests are then opened against a base branch named canary/next-*, which is what makes the agent workflows pick the candidate.'
         required: false
         type: boolean
         default: false
@@ -46,7 +46,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: lorenzogirardi/ci-shared
-          ref: v2
+          ref: v3
           path: .shared
           persist-credentials: false
       - uses: actions/setup-python@v7

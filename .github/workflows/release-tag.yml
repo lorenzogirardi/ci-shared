@@ -1,16 +1,17 @@
 name: Release tag
 
-# The consumers of this repository call its workflows at the tag `v2`, and those workflows check the
+# The consumers of this repository call its workflows at the tag `v3`, and those workflows check the
 # scripts out at the same tag. The tag follows main by itself, in two steps:
 #   1. the tests of that exact commit have passed (this workflow starts from that);
 #   2. the canary of the consumer repository has passed AGAINST THAT COMMIT. The commit is published as
-#      `v2-next`, the consumer's canary is started in candidate mode (its pull requests are then judged by
-#      the scripts and prompts at v2-next), and only if every scenario holds does `v2` move.
+#      `v3-next`, the consumer's canary is started in candidate mode (its pull requests are then judged by
+#      the scripts and prompts at v3-next), and only if every scenario holds does `v3` move.
 # Step 2 exists because unit tests do not see what a model does with a real pull request: an engine that
 # passed every test once rewrote application code to satisfy a test it had just written.
 # Step 2 is on when the repository variable ENGINE_GATE_REPO names the consumer (owner/repo); without it
 # the tag moves after step 1 alone.
-# A change that breaks callers still becomes a new tag (v3) by hand; that is a decision, not a routine.
+# A change that breaks callers still becomes a new tag (v4) by hand; that is a decision, not a routine.
+# `v2` and `v1` are frozen: `v2` at the first commit of the architect-first graph, for callers that have not moved.
 
 on:
   workflow_run:
@@ -71,11 +72,11 @@ jobs:
           if ! git merge-base --is-ancestor "$TESTED" origin/main; then
             echo "::notice::$TESTED is not on main any more; nothing to do"; exit 0
           fi
-          current="$(git rev-parse -q --verify refs/tags/v2 || true)"
+          current="$(git rev-parse -q --verify refs/tags/v3 || true)"
           if [ -n "$current" ] && ! git merge-base --is-ancestor "$current" "$TESTED"; then
-            echo "::notice::v2 ($current) is already ahead of $TESTED; nothing to do"; exit 0
+            echo "::notice::v3 ($current) is already ahead of $TESTED; nothing to do"; exit 0
           fi
-          if [ "$current" = "$TESTED" ]; then echo "v2 is already at $TESTED"; exit 0; fi
+          if [ "$current" = "$TESTED" ]; then echo "v3 is already at $TESTED"; exit 0; fi
           echo "release=true" >> "$GITHUB_OUTPUT"
 
       - name: The consumer's canary, against this commit
@@ -89,9 +90,9 @@ jobs:
           GH_TOKEN: ${{ secrets.AUTOFIX_PUSH_TOKEN }}
         run: |
           set -euo pipefail
-          git push --force origin "$TESTED:refs/tags/v2-next"
+          git push --force origin "$TESTED:refs/tags/v3-next"
           gh api -X POST "repos/$CONSUMER/dispatches" -f event_type=engine-candidate -f "client_payload[sha]=$TESTED"
-          echo "candidate $TESTED published as v2-next; waiting for the canary of $CONSUMER"
+          echo "candidate $TESTED published as v3-next; waiting for the canary of $CONSUMER"
           errors=0
           for i in $(seq 1 120); do
             sleep 30
@@ -112,19 +113,19 @@ jobs:
                 echo "### Canary passed against \`${TESTED:0:7}\` ($url)" >> "$GITHUB_STEP_SUMMARY"
                 exit 0
               fi
-              echo "### Canary FAILED against \`${TESTED:0:7}\`: v2 stays where it is ($url)" >> "$GITHUB_STEP_SUMMARY"
-              echo "::error::the canary did not pass against $TESTED; v2 is not moved"
+              echo "### Canary FAILED against \`${TESTED:0:7}\`: v3 stays where it is ($url)" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::the canary did not pass against $TESTED; v3 is not moved"
               exit 1
             fi
           done
-          echo "::error::no canary result for $TESTED after 60 minutes; v2 is not moved"
+          echo "::error::no canary result for $TESTED after 60 minutes; v3 is not moved"
           exit 1
 
-      - name: Move v2
+      - name: Move v3
         if: steps.plan.outputs.release == 'true'
         env:
           TESTED: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
-          git push --force origin "$TESTED:refs/tags/v2"
-          echo "### v2 moved to \`${TESTED:0:7}\`" >> "$GITHUB_STEP_SUMMARY"
+          git push --force origin "$TESTED:refs/tags/v3"
+          echo "### v3 moved to \`${TESTED:0:7}\`" >> "$GITHUB_STEP_SUMMARY"
