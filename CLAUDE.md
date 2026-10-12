@@ -58,7 +58,7 @@ These exist in the consumer today. They are the evidence; use them before anythi
 | Trivy (image, CRITICAL) | PR `image`, `main`; never fails; warning and run summary | known vulnerabilities in the image | yes, as awareness |
 | Checkov (helm, SARIF) | PR `awareness`, `main`; never fails; warning and run summary | misconfiguration of the chart | yes, as awareness |
 | TruffleHog | PR `awareness`, `main` `secrets`; never fails; warning and run summary | secrets in the commits (found or not, never the value) | yes, as awareness |
-| SBOM (anchore) | `main` only, never fails | what the image contains | **no** |
+| SBOM (anchore) | PR `image`, `main`; never fails; run summary | what the image contains | yes, as awareness |
 
 ## Roles and nodes: where we are
 
@@ -80,8 +80,9 @@ after the one fix is a note, and no finding ends a change whose checks pass (rul
 Known departures from the rules, to remove rather than extend:
 
 - `scripts/pr_review_sweep.py` is a second engine for the dependency bot's pull requests.
-- `reusable_ci-analysis.yml`, release notes and changelog are model calls outside the graph; the
-  first one receives the Trivy, Checkov and deploy output and acts on none of it.
+- The consumer's release notes (`release-notes.yml`) are a model call outside the graph: a comment on
+  a merged pull request, which judges and changes nothing. The changelog is not: `changelog_update.py`
+  is deterministic. The analysis after the pipeline on `main` (`ci-analysis`) was removed on 2026-10-12.
 - A change to `.github/workflows/` was merged by a person until 2026-10-11: the merge gate refused it
   before trying. The owner gave the agents' token the `workflow` permission and the gate now attempts
   the merge like any other, gated by the same required checks; not yet seen in a real run.
@@ -137,7 +138,7 @@ State: **yes** handled · **part** handled in part, outside the graph, or never 
 | # | Action | Roles | State |
 |---|---|---|---|
 | 25 | Version number (patch, minor, major) | architect | no: nobody decides it |
-| 26 | Changelog and release notes | doc writer | part: automatic, outside the graph |
+| 26 | Changelog and release notes | doc writer | part: the changelog is deterministic; the release notes are a model call outside the graph |
 | 27 | Build and publish the image, SBOM | SRE | yes: deterministic |
 | 28 | Update the deploy manifest | SRE | yes: deterministic |
 | 29 | Rollback in production | SRE | no: outside the pipeline |
@@ -169,7 +170,7 @@ architect (8, 25, 31, 37). Those are the roles the graph lacks.
 Each step reuses or replaces something; none adds a layer.
 
 1. Done: Trivy, Checkov and TruffleHog output is evidence for `reviewer-security`, which reports what
-   they found without blocking (rule 4). Still to do: remove `ci-analysis`.
+   they found without blocking (rule 4). `ci-analysis` is removed.
 2. Done: `reviewer-sre` reads the build and deploy evidence of the `image` job.
 3. Done: `reviewer-architect` reviews every change.
 4. The dependency bot's pull requests go through the same graph; the sweep only picks the pull

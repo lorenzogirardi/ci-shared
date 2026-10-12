@@ -28,7 +28,6 @@ ci-shared/
 │   ├── reusable_pipeline-health.yml   the loop checks itself (no model)
 │   ├── reusable_pipeline-canary.yml   known changes through the real loop, outcome checked
 │   ├── reusable_changelog.yml         deterministic changelog entry
-│   ├── reusable_ci-analysis.yml       informative report after a pipeline run
 │   ├── reusable_docs-architect.yml    documentation proposal, plan only
 │   ├── reusable_agent-pipeline.yml    the engine started from a written request (planner first)
 │   ├── reusable_agent-review.yml      reviewers A and B only, one comment
@@ -322,9 +321,6 @@ These are the reasons behind choices that otherwise look arbitrary.
   the line is compared whole, because a substring match would read a sentence that merely mentions a
   verdict as the verdict.
 - **`changelog_update.py`**: one entry per push to the base branch, from the commit subject, no model.
-- **`reusable_ci-analysis.yml`**: downloads the context artifacts earlier jobs of the same run
-  uploaded, asks for a security and quality report, writes it to the job summary. It never gates
-  anything.
 
 ## Tests
 
