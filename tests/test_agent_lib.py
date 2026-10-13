@@ -427,3 +427,16 @@ class TestTheApplicationHasItsOwnInterpreter:
         monkeypatch.setattr(lib.subprocess, "run", run)
         assert lib.run_pytest(["tests/test_x.py"], tmp_path)[0] == "pass"
         assert seen["cmd"][0] == str(app / "bin" / "python") and seen["env"]["PATH"].startswith(str(app / "bin"))
+
+    def test_a_library_installed_outside_the_usual_folders_is_still_listed(self, app, tmp_path, monkeypatch):
+        """An editable or .pth-added install keeps its metadata outside purelib/platlib; the application
+        interpreter's own sys.path is scanned, as the no-argument form scans this one's, so it is found."""
+        import pr_review_sweep as sweep
+        elsewhere = tmp_path / "elsewhere"
+        meta = elsewhere / "editableonly-1.0.dist-info"
+        meta.mkdir(parents=True)
+        (meta / "METADATA").write_text("Metadata-Version: 2.1\nName: editableonly\nVersion: 1.0\n"
+                                       "Project-URL: Documentation, https://docs.editableonly.example/\n")
+        exe = str(app / "bin" / "python")
+        monkeypatch.setitem(sweep._app_paths, exe, {**sweep._app_paths[exe], "syspath": [str(elsewhere)]})
+        assert lib._declared_urls("editableonly") == ("1.0", {"Documentation": "https://docs.editableonly.example/"})

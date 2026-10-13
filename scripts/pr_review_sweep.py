@@ -280,7 +280,7 @@ def app_paths() -> dict[str, str]:
         return sysconfig.get_paths()
     if exe not in _app_paths:
         try:
-            done = subprocess.run([exe, "-c", "import json, sysconfig; print(json.dumps(sysconfig.get_paths()))"],
+            done = subprocess.run([exe, "-c", "import json, sys, sysconfig; p = sysconfig.get_paths(); p['syspath'] = sys.path; print(json.dumps(p))"],
                                   capture_output=True, text=True, timeout=30)
             _app_paths[exe] = json.loads(done.stdout) if done.returncode == 0 else {}
         except (OSError, ValueError, subprocess.TimeoutExpired):

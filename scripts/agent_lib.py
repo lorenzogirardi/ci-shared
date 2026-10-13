@@ -382,7 +382,12 @@ def _distributions() -> list:
     if app_python() == sys.executable:
         return list(importlib.metadata.distributions())
     paths = app_paths()
-    folders = list(dict.fromkeys(paths[k] for k in ("purelib", "platlib") if paths.get(k)))
+    # The application's whole import search path, not just purelib/platlib: an editable or .pth-added
+    # install keeps its metadata outside those two folders, and the no-argument form finds it because it
+    # walks sys.path. Scan the application interpreter's sys.path the same way.
+    folders = list(dict.fromkeys(p for p in paths.get("syspath", []) if p and os.path.isdir(p)))
+    if not folders:
+        folders = list(dict.fromkeys(paths[k] for k in ("purelib", "platlib") if paths.get(k)))
     return list(importlib.metadata.distributions(path=folders)) if folders else []
 
 
