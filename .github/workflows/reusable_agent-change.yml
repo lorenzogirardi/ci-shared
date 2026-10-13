@@ -157,12 +157,32 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Python $version"
 
-      - uses: actions/setup-python@v7
+      - name: The application's Python (its checks and tests run on it)
+        # Installed without touching PATH: the engine is told where it is and puts it first for the
+        # verify command and for pytest, and reads the application's libraries from it.
+        id: app-python
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ steps.python.outputs.version }}
+          update-environment: false
+
+      - name: The engine's own Python
+        # Apart from the application's. With one interpreter for both, an image that moved to a Python
+        # a library of the engine has no build for left no agent job able to start (the consumer's
+        # #316, Python 3.15). The engine moves to a new Python when this line does, and its tests pass on it.
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
 
       - name: Install agent dependencies
-        run: pip install -q -r .shared/scripts/requirements-autofix.txt
+        env:
+          APP_PYTHON: ${{ steps.app-python.outputs.python-path }}
+        run: |
+          set -euo pipefail
+          pip install -q -r .shared/scripts/requirements-autofix.txt
+          [ -x "$APP_PYTHON" ] || { echo "::error::the application's Python was not installed ($APP_PYTHON)"; exit 1; }
+          echo "AGENT_APP_PYTHON=$APP_PYTHON" >> "$GITHUB_ENV"
+          echo "engine: $(python3 --version) | application: $("$APP_PYTHON" --version)"
 
       - name: Did CI fail in the runner rather than in the code? (re-run it once, do not repair)
         id: infra

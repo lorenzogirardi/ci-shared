@@ -148,7 +148,7 @@ State: **yes** handled · **part** handled in part, outside the graph, or never 
 |---|---|---|---|
 | 19 | Patch or minor update of a library | developer, QA | yes, in the second engine (sweep); the graph reviewed and merged one too (flask #313), so both engines comment |
 | 20 | Major update with a changed API | developer (migration) | yes, in the sweep; by the graph with the architect only on a local replay (mcp 2) |
-| 21 | Base image or runtime | SRE, QA | part: one source for the version, not yet seen in a real run |
+| 21 | Base image or runtime | SRE, QA | part: seen once (flask #316, Python 3.15): repaired and merged with green checks, by the sweep and not by the graph, whose job could not install on 3.15. The agents' job now has its own Python; the consumer holds the image at 3.14 until that is released |
 | 22 | Versions of GitHub Actions | SRE | part: reviewed, the bot's wait for `agent-review` not verified |
 | 23 | Vulnerability found in a dependency already on the main branch (no pull request exists) | security | no: Trivy sees it, nobody acts |
 | 24 | Secret committed | security | part: TruffleHog reports it on the run and to the security role; nothing removes it |
