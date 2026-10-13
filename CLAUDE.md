@@ -93,11 +93,8 @@ every node): read it before guessing why a run went as it did.
 
 Known departures from the rules, to remove rather than extend:
 
-- `scripts/pr_review_sweep.py` is a second engine for the dependency bot's pull requests. With the
-  architect's tools the graph did the mcp-2 migration the sweep was kept for, locally (three runs,
-  two converged in one cycle after QA was given thinking); the sweep goes once that is seen released.
-- The issue flow and the sweep still build the graph without the architect (`planner.md`,
-  `reviewer-architect.md`, `invoke_with_retry`): to delete with them.
+- The issue flow still builds the graph without the architect (`planner.md`, `reviewer-architect.md`,
+  `invoke_with_retry`). It is out of use; it goes, or moves to the architect, when the issue entry is decided.
 - The consumer's release notes (`release-notes.yml`) are a model call outside the graph: a comment on
   a merged pull request, which judges and changes nothing. The changelog is not: `changelog_update.py`
   is deterministic. The analysis after the pipeline on `main` (`ci-analysis`) was removed on 2026-10-12.
@@ -146,9 +143,9 @@ State: **yes** handled · **part** handled in part, outside the graph, or never 
 
 | # | Action | Roles | State |
 |---|---|---|---|
-| 19 | Patch or minor update of a library | developer, QA | yes, in the second engine (sweep); the graph reviewed and merged one too (flask #313), so both engines comment |
-| 20 | Major update with a changed API | developer (migration) | yes, in the sweep; by the graph with the architect only on a local replay (mcp 2) |
-| 21 | Base image or runtime | SRE, QA | part: seen once (flask #316, Python 3.15): repaired and merged with green checks, by the sweep and not by the graph, whose job could not install on 3.15. The agents' job now has its own Python; the consumer holds the image at 3.14 until that is released |
+| 19 | Patch or minor update of a library | developer, QA | yes: reviewed and merged by the graph (flask #313) |
+| 20 | Major update with a changed API | developer (migration) | part: by the graph with the architect only on a local replay (mcp 2); not yet seen released |
+| 21 | Base image or runtime | SRE, QA | part: seen once (flask #316, Python 3.15), repaired and merged by the sweep while the graph's job could not install on 3.15. The agents' job has its own Python since (tried on flask #322); the graph repairing such an update is not yet seen |
 | 22 | Versions of GitHub Actions | SRE | part: reviewed, the bot's wait for `agent-review` not verified |
 | 23 | Vulnerability found in a dependency already on the main branch (no pull request exists) | security | no: Trivy sees it, nobody acts |
 | 24 | Secret committed | security | part: TruffleHog reports it on the run and to the security role; nothing removes it |
@@ -192,15 +189,15 @@ Each step reuses or replaces something; none adds a layer.
    they found without blocking (rule 4). `ci-analysis` is removed.
 2. Done: `reviewer-sre` reads the build and deploy evidence of the `image` job.
 3. Done: `reviewer-architect` reviews every change.
-4. The dependency bot's pull requests go through the same graph. First step done on the consumer
-   (flask #307): the graph reviews them, next to the sweep; not yet seen. Then the sweep keeps only
-   the request to rebase.
+4. Done (2026-10-13): the dependency bot's pull requests go through the same graph, and the sweep, the
+   second engine, is removed. Still to see: a bot's pull request with red checks repaired by the graph.
 5. Optional: a risk score computed from facts (files touched, size, tool findings) that chooses
    between merge and abandon.
 
 ## Layout
 
 - `scripts/agent_pipeline.py` — the graph. `scripts/agent_lib.py` — what the nodes share.
+  `scripts/pr_review_sweep.py` — what is left of the old sweep: helpers both import (GitHub, logs, look-ups).
 - `prompts/agents/` — one prompt per role.
 - `.github/workflows/reusable_*.yml` — what a consumer calls. A consumer's workflow only wires
   inputs; logic lives here.

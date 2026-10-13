@@ -7,7 +7,6 @@ a PR the model flagged, or blocks one it cleared. No network, no `gh`.
 import pathlib
 import subprocess
 import sys
-import types
 
 import pytest
 
@@ -15,30 +14,18 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
 
 import pr_review_sweep  # noqa: E402
 from pr_review_sweep import (  # noqa: E402
-    MAX_FIND_CHARS,
-    MAX_FIX_EDITS,
-    _autofix_report,
-    _comment_marker,
     apply_fix,
-    build_context,
     checks_state,
-    comment_body,
     error_region,
     find_matching_paths,
     grep_matching_lines,
-    harness_version_changed,
     list_directory,
-    may_auto_merge,
     parse_find_request,
-    parse_fix,
     parse_grep_request,
     parse_list_request,
     parse_read_request,
     resolve_readable_dir,
     resolve_readable_path,
-    split_verdict,
-    touches_workflow_files,
-    workflow_pr_action,
     try_merge,
 )
 
@@ -57,31 +44,6 @@ def test_error_region_keeps_the_error_and_drops_the_middle_noise():
     assert "..." in region  # and the elision is visible
 
 
-class TestRunVerify:
-    """run_verify is what makes autofix agentic: it proves an edit works, in
-    this job, before anything is pushed — instead of finding out a CI round
-    trip later, the way the first version worked."""
-
-    def test_empty_command_means_no_local_verification(self):
-        # Preserves the original behavior when a consumer configures nothing.
-        assert pr_review_sweep.run_verify("", timeout=5) == (True, "")
-
-    def test_passing_command_reports_ok(self):
-        ok, detail = pr_review_sweep.run_verify("exit 0", timeout=5)
-        assert ok is True and detail == ""
-
-    def test_failing_command_reports_the_real_output(self):
-        ok, detail = pr_review_sweep.run_verify(
-            "echo 'ResolutionImpossible: pydantic conflict' >&2; exit 1", timeout=5)
-        assert ok is False
-        assert "ResolutionImpossible" in detail
-
-    def test_timeout_is_reported_as_a_failure_not_a_crash(self):
-        ok, detail = pr_review_sweep.run_verify("sleep 5", timeout=1)
-        assert ok is False
-        assert "exceeded" in detail
-
-
 class TestAutofixGuardrails:
     """These are the rules that stand between model output and a pushed commit.
 
@@ -94,61 +56,6 @@ class TestAutofixGuardrails:
         import json as _json
         return "```json\n" + _json.dumps({"explanation": explanation, "edits": edits}) + "\n```"
 
-    def test_accepts_a_well_formed_manifest_edit(self):
-        parsed = parse_fix(self._reply(
-            [{"file": "requirements.txt", "find": "pydantic==2.11.7",
-              "replace": "pydantic==2.13.4"}]))
-        assert parsed is not None
-        edits, explanation = parsed
-        assert edits[0]["file"] == "requirements.txt"
-        assert explanation == "because"
-
-    def test_reads_bare_json_without_a_fence(self):
-        import json as _json
-        parsed = parse_fix(_json.dumps({"explanation": "x", "edits": []}))
-        assert parsed == ([], "x")
-
-    @pytest.mark.parametrize("path", [
-        ".github/workflows/pipeline.yml",       # push would be rejected regardless
-        ".github/workflows/nested/reused.yml",  # same, one level deeper
-        "../../etc/passwd",                     # traversal
-        "/etc/passwd",                          # absolute
-    ])
-    def test_rejects_workflow_files_and_path_games(self, path):
-        assert parse_fix(self._reply(
-            [{"file": path, "find": "a", "replace": "b"}])) is None
-
-    @pytest.mark.parametrize("path", [
-        "requirements.txt",       # still fine, unrestricted now covers it too
-        "app/main.py",            # application code -- allowed since the real
-        "app/mcp/tools.py",       # test suite gates correctness, not file type
-        "tests/test_storage.py",  # a fix can legitimately touch its own test
-        "setup.py",
-    ])
-    def test_accepts_any_file_outside_workflows(self, path):
-        """A dependency major bump can break at the API level, not just at
-        install time (real incident: mcp 2.x renamed FastMCP to MCPServer,
-        breaking app/mcp/tools.py) -- a pin revert alone can't fix that, so
-        autofix is not restricted to manifests. What gates a wrong fix is the
-        real test suite in required_checks, not a file-type allowlist."""
-        assert parse_fix(self._reply(
-            [{"file": path, "find": "a", "replace": "b"}])) is not None
-
-    def test_rejects_malformed_or_oversized_replies(self):
-        assert parse_fix("not json at all") is None
-        assert parse_fix('```json\n{"edits": []}\n```') is None       # no explanation
-        assert parse_fix('```json\n{"explanation": "x"}\n```') is None  # no edits
-        # A no-op edit would produce an empty commit.
-        assert parse_fix(self._reply(
-            [{"file": "requirements.txt", "find": "a", "replace": "a"}])) is None
-        # Too many edits stops "minimal fix" turning into a rewrite.
-        assert parse_fix(self._reply(
-            [{"file": "requirements.txt", "find": f"x{i}", "replace": "y"}
-             for i in range(MAX_FIX_EDITS + 1)])) is None
-        # An oversized anchor is not a targeted change.
-        assert parse_fix(self._reply(
-            [{"file": "requirements.txt", "find": "x" * (MAX_FIND_CHARS + 1),
-              "replace": "y"}])) is None
 
     def test_applies_a_unique_anchor(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -220,19 +127,6 @@ class TestAutofixGuardrails:
         ])
         assert changed == [] and "Dockerfile" in error
         assert (tmp_path / "requirements.txt").read_text() == "a==1\n"
-
-
-class TestAutofixReporting:
-    def test_a_pushed_fix_is_declared_as_unreviewed_machine_output(self):
-        text = _autofix_report("pushed", "bumped pydantic")
-        assert "not reviewed by a human" in text
-        assert "bumped pydantic" in text
-        # The comment must not imply the fix is validated — CI decides after.
-        assert "merges only if" in text
-
-    @pytest.mark.parametrize("outcome", ["declined", "rejected", "failed", "skipped"])
-    def test_a_non_push_says_the_pr_still_needs_a_human(self, outcome):
-        assert "needs a human" in _autofix_report(outcome, "some reason")
 
 
 def test_ansi_codes_are_stripped_from_logs():
@@ -335,214 +229,6 @@ def test_required_check_skipped_is_not_success(monkeypatch):
         {"name": "checks", "status": "completed", "conclusion": "skipped"},
     ])
     assert checks_state("o/r", "sha", ("checks",))[0] == "failing"
-
-
-@pytest.mark.parametrize(
-    "review, expected_clean",
-    [
-        ("All good.\n\nVERDICT: CLEAN", True),
-        ("- [Critical] bad thing\n\nVERDICT: NEEDS_REVIEW", False),
-        # The reason this is an exact last-line match and not a grep for
-        # "[Critical]": a clean review that *mentions* the tag in prose must
-        # still read as clean.
-        ("No [Critical] issues found.\n\nVERDICT: CLEAN", True),
-        # Fail safe: a model that ignores the format is never treated as clean.
-        ("Looks fine to me.", False),
-        ("", False),
-        # Only the LAST line counts; the string appearing earlier means nothing.
-        ("VERDICT: CLEAN appears mid-text\n\nVERDICT: NEEDS_REVIEW", False),
-        ("ok\n\nVERDICT: CLEAN\n\n", True),
-        # Near-misses are not the contract, so they are not clean.
-        ("ok\n\nVERDICT: clean", False),
-        ("ok\n\n**VERDICT: CLEAN**", False),
-    ],
-)
-def test_split_verdict_clean_flag(review, expected_clean):
-    is_clean, _ = split_verdict(review)
-    assert is_clean is expected_clean
-
-
-@pytest.mark.parametrize("tag", ["VERDICT: CLEAN", "VERDICT: NEEDS_REVIEW"])
-def test_verdict_line_is_stripped_from_body(tag):
-    _, body = split_verdict(f"Some findings here.\n\n{tag}")
-    assert body == "Some findings here."
-    assert "VERDICT" not in body
-
-
-def test_unrecognized_last_line_is_left_in_body():
-    _, body = split_verdict("Some findings here.")
-    assert body == "Some findings here."
-
-
-def test_comment_body_carries_marker_and_sha_for_dedup():
-    sha = "0123456789abcdef0123456789abcdef01234567"
-    body = comment_body("AI Review", "findings", sha, is_clean=True, merge_outcome="merged")
-    assert "<!-- ai-review-sweep -->" in body
-    # The sweep skips a PR when this exact line already matches its head SHA.
-    assert f"<!-- reviewed-sha: {sha} -->" in body
-    assert "## AI Review" in body
-    assert "findings" in body
-
-
-def test_comment_reports_what_happened_not_what_was_intended():
-    sha = "a" * 40
-    assert "clean — merged" in comment_body("h", "x", sha, is_clean=True, merge_outcome="merged")
-    # A clean review whose merge GitHub refused (e.g. the diff touches
-    # .github/workflows/) must not claim it merged.
-    refused = comment_body("h", "x", sha, is_clean=True, merge_outcome="failed")
-    assert "refused" in refused
-    assert "merged" not in refused
-    # auto_merge off: clean, with no claim either way.
-    assert "clean" in comment_body("h", "x", sha, is_clean=True, merge_outcome="not attempted")
-    assert "needs a human" in comment_body("h", "x", sha, is_clean=False)
-    # CI is the gate: a clean review with red CI must say so, not claim a merge.
-    red = comment_body("h", "x", sha, is_clean=True, merge_outcome="checks failing")
-    assert "CI is failing" in red and "merged" not in red
-
-
-def test_triage_comment_attributes_the_finding_to_ci_not_the_model():
-    sha = "c" * 40
-    body = comment_body("AI Review — CI failure", "what failed…", sha,
-                        is_clean=False, merge_outcome="checks failing")
-    assert "CI is failing" in body
-    # "needs a human" would credit the model with a call CI actually made.
-    assert "needs a human" not in body
-    # Marked distinctly so a later sweep can tell a stale CI verdict from a
-    # real review finding, and re-review once CI goes green at the same SHA.
-    assert "<!-- verdict: ci-failure -->" in body
-
-
-def test_review_finding_and_ci_failure_are_marked_differently():
-    sha = "d" * 40
-    review_finding = comment_body("h", "x", sha, is_clean=False)
-    assert "<!-- verdict: needs-review -->" in review_finding
-    assert "<!-- verdict: ci-failure -->" not in review_finding
-
-
-def test_verdict_marker_lets_the_next_sweep_retry_a_pending_merge():
-    """A clean review whose CI hadn't finished must be retryable without
-    re-running the model, so the marker records the verdict, not just the SHA."""
-    sha = "b" * 40
-    pending = comment_body("h", "x", sha, is_clean=True, merge_outcome="checks pending")
-    assert "<!-- verdict: clean -->" in pending
-    assert "<!-- verdict: clean -->" not in comment_body("h", "x", sha, is_clean=False)
-
-
-class TestAutoMergeAuthors:
-    """Lets --authors sweep (review/autofix) a wider set of PRs than
-    --auto-merge is allowed to touch -- e.g. the repo owner's own PRs get
-    autofixed on red CI but are never merged unattended, only Renovate's are."""
-
-    def test_no_restriction_when_auto_merge_authors_is_empty(self):
-        """Unchanged behavior for callers that never set --auto-merge-authors."""
-        assert may_auto_merge(True, set(), "anyone-at-all") is True
-
-    def test_auto_merge_off_blocks_regardless_of_author(self):
-        assert may_auto_merge(False, set(), "renovate[bot]") is False
-        assert may_auto_merge(False, {"renovate[bot]"}, "renovate[bot]") is False
-
-    def test_listed_author_is_allowed(self):
-        assert may_auto_merge(True, {"renovate[bot]"}, "renovate[bot]") is True
-
-    def test_unlisted_author_is_blocked(self):
-        """The whole point: a human's PR can be reviewed/autofixed but never merged."""
-        assert may_auto_merge(True, {"renovate[bot]"}, "lorenzogirardi") is False
-
-
-class TestHarnessVersionMarker:
-    """Real gap this closes: PR #118's stale "ci-failure" verdict needed its
-    comment deleted by hand three separate times in one session before a
-    harness bugfix in ci-shared got a fresh autofix attempt -- the dedup
-    cache had no notion of "the harness itself changed since this was
-    cached". embedding the harness's own commit SHA in the comment lets the
-    next sweep detect that automatically."""
-
-    def test_marker_present_when_a_version_is_given(self):
-        body = comment_body("h", "x", "a" * 40, is_clean=False,
-                             merge_outcome="checks failing", harness_version="abc123")
-        assert "<!-- harness-version: abc123 -->" in body
-
-    def test_marker_absent_when_no_version_is_given(self):
-        """Default behavior, unchanged for callers that don't pass one."""
-        body = comment_body("h", "x", "a" * 40, is_clean=False, merge_outcome="checks failing")
-        assert "harness-version" not in body
-
-    def test_extracts_a_present_marker(self):
-        body = comment_body("h", "x", "a" * 40, is_clean=False,
-                             merge_outcome="checks failing", harness_version="eb19afb")
-        assert _comment_marker(body, "harness-version") == "eb19afb"
-
-    def test_extracting_an_absent_marker_is_none_not_empty_string(self):
-        body = comment_body("h", "x", "a" * 40, is_clean=False, merge_outcome="checks failing")
-        assert _comment_marker(body, "harness-version") is None
-
-    def test_never_stale_on_this_basis_when_the_caller_opts_out(self):
-        """Empty current_version = unchanged prior behavior."""
-        body = comment_body("h", "x", "a" * 40, is_clean=False,
-                             merge_outcome="checks failing", harness_version="old-sha")
-        assert harness_version_changed(body, "") is False
-
-    def test_same_version_is_not_stale(self):
-        body = comment_body("h", "x", "a" * 40, is_clean=False,
-                             merge_outcome="checks failing", harness_version="eb19afb")
-        assert harness_version_changed(body, "eb19afb") is False
-
-    def test_different_version_is_stale(self):
-        body = comment_body("h", "x", "a" * 40, is_clean=False,
-                             merge_outcome="checks failing", harness_version="f8e0868")
-        assert harness_version_changed(body, "eb19afb") is True
-
-    def test_a_comment_predating_this_feature_is_stale_too(self):
-        """An accumulated backlog of old ci-failure comments gets one fresh
-        re-review the first time this ships, not just PRs going forward."""
-        body = comment_body("h", "x", "a" * 40, is_clean=False, merge_outcome="checks failing")
-        assert harness_version_changed(body, "eb19afb") is True
-
-
-class TestWorkflowFileMerge:
-    """GITHUB_TOKEN can never merge a change to .github/workflows/ -- GitHub
-    requires the `workflow` OAuth scope for that regardless of any
-    `permissions:` block. Real incident: Renovate's own action-version bumps
-    (actions/upload-artifact, step-security/harden-runner) reviewed clean and
-    green, then GitHub refused the merge outright."""
-
-    def _fake_diff(self, monkeypatch, files, returncode=0):
-        result = subprocess.CompletedProcess(
-            args=["gh"], returncode=returncode, stdout="\n".join(files), stderr="",
-        )
-        monkeypatch.setattr(pr_review_sweep, "run", lambda *a, **k: result)
-
-    def test_detects_a_workflow_file_in_the_diff(self, monkeypatch):
-        self._fake_diff(monkeypatch, ["requirements.txt", ".github/workflows/pipeline.yml"])
-        assert touches_workflow_files("o/r", 1) is True
-
-    def test_manifest_only_diff_is_not_flagged(self, monkeypatch):
-        self._fake_diff(monkeypatch, ["requirements.txt", "pyproject.toml"])
-        assert touches_workflow_files("o/r", 1) is False
-
-    def test_a_failed_diff_call_does_not_block_the_merge_path(self, monkeypatch):
-        """If we can't tell, don't invent a reason to skip -- fail open to the
-        normal CI-gated path rather than stalling every PR on a `gh` hiccup."""
-        self._fake_diff(monkeypatch, [], returncode=1)
-        assert touches_workflow_files("o/r", 1) is False
-
-    def test_a_change_to_a_workflow_file_is_merged_like_any_other_when_ci_is_green(self, monkeypatch):
-        """It used to be refused before any check: the agents' token could not merge it. The owner gave the
-        token that permission on 2026-10-11, so a change to the pipeline is gated by CI like any other."""
-        monkeypatch.setattr(pr_review_sweep, "touches_workflow_files", lambda repo, number: True)
-        monkeypatch.setattr(pr_review_sweep, "checks_state", lambda *a, **k: ("green", "all passed"))
-        calls = []
-        monkeypatch.setattr(pr_review_sweep, "run", lambda cmd, **k: calls.append(cmd) or types.SimpleNamespace(returncode=0, stdout="", stderr=""))
-        assert try_merge("o/r", 1, "sha", "squash") == "merged"
-        assert any(cmd[:3] == ["gh", "pr", "merge"] for cmd in calls)
-
-    def test_workflow_file_outcome_reads_as_clean_but_unmerged(self):
-        body = comment_body("h", "x", "c" * 40, is_clean=True, merge_outcome="workflow-file")
-        assert "the dependency bot merges that itself" in body
-        assert "needs a human" not in body
-        # Still marked clean, so a later sweep retries the merge (cheaply, no
-        # model call) instead of treating a workflow-only bump as a finding.
-        assert "<!-- verdict: clean -->" in body
 
 
 class TestAutofixRead:
@@ -708,83 +394,10 @@ class TestAutofixExplore:
         assert list_directory("does/not/exist") is None
 
 
-class TestBuildContext:
-    """Real incident: keeping only the last round's result meant a model
-    that read file A, then file B, then needed A again had no way to know
-    it had already seen it -- it just re-read A a third time and burned
-    the whole attempt budget without ever proposing an edit."""
-
-    def test_all_rounds_appear_when_they_fit(self):
-        history = ["Round 1: saw A", "Round 2: saw B", "Round 3: saw C"]
-        context = build_context(history, budget=1000)
-        assert "Round 1: saw A" in context
-        assert "Round 2: saw B" in context
-        assert "Round 3: saw C" in context
-
-    def test_rounds_stay_in_original_order(self):
-        history = ["Round 1: saw A", "Round 2: saw B"]
-        context = build_context(history, budget=1000)
-        assert context.index("Round 1") < context.index("Round 2")
-
-    def test_drops_the_oldest_whole_entry_when_over_budget(self):
-        history = ["Round 1: " + "x" * 50, "Round 2: " + "y" * 50, "Round 3: " + "z" * 50]
-        # Each entry is 59 chars; 120 fits the last two but not all three.
-        context = build_context(history, budget=120)
-        assert "Round 1" not in context
-        assert "Round 2" in context
-        assert "Round 3" in context
-
-    def test_never_truncates_a_single_entry_mid_content(self):
-        """A half-shown file reads as a shorter, wrong file -- worse than
-        not showing it at all."""
-        history = ["Round 1: " + "x" * 500]
-        context = build_context(history, budget=50)
-        assert context == history[0]  # kept whole, even though it's over budget alone
-
-    def test_empty_history_is_empty_context(self):
-        assert build_context([]) == ""
-
-
-class TestWorkflowPrsBelongToTheBot:
-    """No agent can edit or merge a workflow file, so such a PR is never waited on by a person:
-    green or running it is reviewed and is the bot's to merge, red on current code it is abandoned."""
-
-    def test_the_verdict_is_a_status_the_bot_waits_for(self, monkeypatch):
-        calls = []
-        monkeypatch.setattr(pr_review_sweep, "run", lambda cmd, **kw: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", ""))
-        pr_review_sweep.set_review_status("o/r", "abc1234", "success", "reviewed clean")
-        assert "repos/o/r/statuses/abc1234" in calls[0]
-        assert "state=success" in calls[0] and "context=agent-review" in calls[0]
-
-    def test_a_status_that_cannot_be_written_does_not_stop_the_sweep(self, monkeypatch, capsys):
-        monkeypatch.setattr(pr_review_sweep, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "Resource not accessible"))
-        pr_review_sweep.set_review_status("o/r", "abc1234", "pending", "waiting")
-        assert "could not set" in capsys.readouterr().out
-
-    def test_a_long_verdict_description_is_truncated_for_the_status_api(self, monkeypatch):
-        calls = []
-        monkeypatch.setattr(pr_review_sweep, "run",
-                            lambda cmd, **kw: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", ""))
-        pr_review_sweep.set_review_status("o/r", "abc1234", "failure", "x" * 300)
-        description = [arg for arg in calls[0] if arg.startswith("description=")][0]
-        assert description == "description=" + "x" * 140
-
-    @pytest.mark.parametrize("state", ["green", "pending", "none"])
-    def test_left_to_the_bot_unless_red(self, state):
-        assert workflow_pr_action(state) == "leave"
-
-    def test_red_on_current_code_is_abandoned(self):
-        assert workflow_pr_action("failing") == "abandon"
-
-    def test_no_text_hands_the_pr_to_a_person(self):
-        for outcome in ("workflow-file",):
-            for clean in (True, False):
-                assert "needs a human" not in comment_body("h", "x", "c" * 40, is_clean=clean, merge_outcome=outcome)
-
-
 class TestMergeStartsThePushWorkflows:
     """A merge made with the job's own GITHUB_TOKEN starts no workflow on the base branch (no image build, no
     deploy check, no changelog, a blind guard). Real incident: PRs #183, #185 and #186 of flask-test-api."""
+
 
     def _merge(self, monkeypatch, update_token):
         seen = {}
@@ -794,7 +407,6 @@ class TestMergeStartsThePushWorkflows:
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
         monkeypatch.setattr(pr_review_sweep, "run", fake_run)
-        monkeypatch.setattr(pr_review_sweep, "touches_workflow_files", lambda repo, number: False)
         monkeypatch.setattr(pr_review_sweep, "checks_state", lambda *a, **k: ("green", "ok"))
         monkeypatch.setenv("GH_TOKEN", "job-token")
         if update_token:

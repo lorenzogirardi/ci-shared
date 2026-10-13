@@ -84,8 +84,6 @@ How it fits together:
 - One loop: only the developer who reviews correctness sends a change back, once, and rereads the
   fix; the other roles inform. Failing checks are retried within `max_verify_retries` and the writer
   within `writer_rounds`. When a run stops without converging, the PR says so.
-- `reusable_pr-review-sweep.yml` gained `skip_head_prefixes` so the sweep
-  leaves `agent/` branches to the pipeline that certifies them.
 - Cost per role is recorded (`.ai/agents/*.usage.json`) and shown in the PR.
 - Every change ends merged, abandoned or reverted; none waits for a person.
   The rules that make that safe are code, not prompt: tests are the
@@ -123,62 +121,12 @@ Output: `clean` — `"true"` only if the review ran and its **exact last line**
 was `VERDICT: CLEAN` (not a substring match — see architecture.md for why
 that distinction is load-bearing).
 
-### `reusable_pr-review-sweep.yml`
+### `reusable_pr-review-sweep.yml` (removed)
 
-The main event. A **scheduled** sweep (called from a `schedule` +
-`workflow_dispatch` trigger, not `pull_request`) over open PRs: review the
-ones not yet reviewed at their current head SHA, merge the clean ones whose
-CI actually passed, and — opt-in — repair the broken ones.
-
-| Input | Default | Purpose |
-|---|---|---|
-| `authors` | `''` (all) | Comma-separated PR author logins to sweep |
-| `max_prs` | `10` | Cap per run |
-| `auto_merge` | `false` | Merge PRs whose review + CI are both clean |
-| `auto_merge_authors` | `''` (no restriction beyond `auto_merge`) | Comma-separated logins allowed to actually be merged. Lets `authors` be wider than this — e.g. autofix/review a human's PRs too, but only ever auto-merge a dependency bot's. |
-| `required_checks` | `''` | Check-run names that must have **succeeded** before merge — see below, this is not optional in practice |
-| `merge_method` | `squash` | |
-| `merge_poll_seconds` | `90` | After a fresh push, wait up to this long in this job for required checks to settle before deferring the merge to the next sweep. `0` disables polling. |
-| `merge_poll_interval` | `15` | Seconds between polls while waiting on `merge_poll_seconds` |
-| `triage_on_failure` | `false` | On red CI, explain the failure instead of reviewing the diff |
-| `autofix` | `false` | On red CI, push a verified fix instead of only explaining. Implies `triage_on_failure`. No file-type restriction beyond `.github/workflows/**`; a reply may also list a directory, find a file by name, grep file contents, or read a real file (repo, installed package, or stdlib) before proposing an edit — see architecture.md. |
-| `python_version` | `3.12` | Interpreter `verify_command` runs under — **must match the real CI gate's version** |
-| `python_version_dockerfile` | — | Path of the caller's Dockerfile. When set, the version is read from its `FROM python:<major.minor>` line and `python_version` is ignored: one source for the interpreter, nothing to keep in step by hand |
-| `verify_command` | `''` | Shell command proving an autofix edit works, run before pushing anything |
-| `verify_timeout_seconds` | `180` | |
-| `max_autofix_attempts` | `3` | Propose→verify rounds tried locally before giving up on one PR — a `{"read": ...}` reply costs a round too, so code-level migrations need more than a manifest revert does |
-
-Secrets: `openrouter_api_key` (required), `autofix_push_token` (optional — see architecture.md; without it, autofix's push authenticates as `GITHUB_TOKEN` and GitHub silently suppresses the resulting CI run).
-
-**The merge gate is CI, not the review verdict.** `required_checks` names
-checks that must show `conclusion: success` — not merely "didn't fail".
-Without it, the fallback only requires *some* check to have succeeded, which
-is close to vacuous: a PR whose only check is `ai-review.yml` reporting
-`skipped` (it skips bot authors) used to read as green and get merged with
-nothing tested. Two dependency bumps that a clean AI review waved through
-broke `main` in one session — a resolver conflict and a runtime 500 — both
-things a command proves in seconds and a diff review can only guess at.
-
-**Autofix is agentic, not one-shot.** On a red PR it proposes an edit
-(strict-JSON, `{file, find, replace}`, validated in code: manifest files
-only, unique anchor, ≤5 edits, never a fork), applies it, and runs
-`verify_command` **in this job** before pushing anything. A pass commits
-(with an explicit git identity — a fresh checkout has none) and pushes
-immediately; a failure reverts the edit, feeds the real verification output
-back into the next prompt, and retries. Nothing reaches the PR branch until
-one attempt verifies or every attempt is exhausted. The commit and PR
-comment both say plainly that a machine wrote it, unreviewed, and that the
-real CI on the pushed commit — not this loop — decides whether it merges.
-The repair loop is the same engine as every other change (`scripts/agent_pipeline.py`),
-started from the failing CI logs: writer, deterministic checks in a secret-free
-process, failure adjudication (is the code or the test wrong), the reviewers;
-retried once with twice the budget, then the PR is abandoned. Before
-the model reads anything, the checks run once on the PR as the bot left it, so
-the NEW dependency version is installed and its source can be read. The push
-token is taken out of `.git/config` while the PR's code runs and put back only
-for the push. There used to be a separate `autofix_core.py` graph and a
-`reusable_main-autofix.yml` for a red base branch; both are gone: a red base
-branch is handled by `reusable_agent-main-guard.yml` (re-run once, then revert).
+The scheduled sweep over a dependency bot's pull requests (review, triage, repair, merge) was a second
+engine. The graph does all of it since `v3`: the bot's pull requests are reviewed, repaired and merged
+by `reusable_agent-change.yml` and `reusable_agent-merge.yml`, like any other. The workflow and its
+script are still there at the frozen tags `v1` and `v2`, for a consumer that has not moved.
 
 ## Consumer wrapper examples
 
@@ -198,48 +146,9 @@ jobs:
       openrouter_api_key: ${{ secrets.OPENROUTER_API_KEY }}
 ```
 
-Scheduled sweep with merge + self-repair, for a dependency bot only:
-
-```yaml
-on:
-  schedule: [{cron: '0 4,16 * * *'}]
-  workflow_dispatch:
-
-permissions: {}
-
-jobs:
-  sweep:
-    if: vars.AI_ENABLED == 'true'
-    permissions:
-      contents: write
-      pull-requests: write
-    uses: lorenzogirardi/ci-shared/.github/workflows/reusable_pr-review-sweep.yml@v1
-    with:
-      authors: 'renovate[bot]'
-      auto_merge: true
-      required_checks: 'checks,workflows'   # your pr-checks.yml job names
-      triage_on_failure: true
-      autofix: true
-      python_version_dockerfile: Dockerfile  # the interpreter the image runs; or python_version: "3.14"
-      verify_command: |
-        set -euo pipefail
-        pip install --dry-run -r requirements.txt
-        pip install -q -r requirements.txt
-        uvicorn app.main:app --host 127.0.0.1 --port 8000 &
-        UVICORN_PID=$!
-        trap 'kill $UVICORN_PID 2>/dev/null || true' EXIT
-        for i in $(seq 1 30); do
-          curl -sf -o /dev/null http://127.0.0.1:8000/api/mgmt/ready && exit 0
-          sleep 1
-        done
-        exit 1
-    secrets:
-      openrouter_api_key: ${{ secrets.OPENROUTER_API_KEY }}
-```
-
 See `flask-test-api/.github/workflows/` for the real wrappers: `agent-change.yml`,
 `agent-ci-failure.yml`, `agent-merge.yml`, `agent-main-guard.yml`,
-`ai-review-sweep.yml`, `pipeline-health.yml`, `pipeline-canary.yml` and
+`pipeline-health.yml`, `pipeline-canary.yml` and
 `pipeline.yml`. Its `release-notes.yml` does not fit a
 reusable shape: it checks this repo out at `.shared` and calls
 `.shared/scripts/openrouter_ai.py` directly.
@@ -254,10 +163,14 @@ reusable shape: it checks this repo out at `.shared` and calls
    the *base* branch, not the PR (fixed by explicitly checking out
    `head.sha`) — and it still can't retroactively fire for PRs opened before
    the workflow existed.
-3. **Scheduled sweep** (current) — a `schedule` run has no PR actor at all,
+3. **Scheduled sweep** — a `schedule` run has no PR actor at all,
    so #1 doesn't exist to begin with, and it picks up a whole backlog on its
    first run. Confirmed by reading `openwrt/openwrt`'s real
    `llm-review.yml`: cron + `workflow_dispatch`, no `pull_request` trigger.
+4. **The graph** (current, `v3`) — the bot's `pull_request` run was seen with the
+   secrets and a token that writes (flask-test-api #313, 2026-10-12), so the limit
+   of #1 no longer holds there. The sweep, a second engine, was removed: one graph
+   reviews, repairs and merges every pull request.
 
 ## Per-repo setup
 
