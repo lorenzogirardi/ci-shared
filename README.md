@@ -214,10 +214,10 @@ the merge gate merges them like any other change), and a breaking change that ne
 pytest tests/ -v
 ```
 
-About 490 tests, no network, no real `gh` calls — `checks_state`, verdict parsing,
+About 411 tests, no network, no real `gh` calls — `checks_state`,
 the engine's graph against real throwaway git repositories and a scripted
-model, failure adjudication, the weakening guard, the merge gate and the main
-guard (with a local bare remote), terminal states, and `auto_merge_authors`
-gating are all exercised against fakes.
+model, failure adjudication, the weakening guard, terminal states, the merge
+gate and the main guard (with a local bare remote) are all exercised against
+fakes.
 `.github/workflows/test.yml` runs them on every push/PR to this repo
 (installing `scripts/requirements-autofix.txt` first, for the graph tests).

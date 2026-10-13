@@ -384,7 +384,7 @@ These are the reasons behind choices that otherwise look arbitrary.
 
 ## Tests
 
-`pytest tests/`, about 490 tests, no network. The engine's graph runs against real throwaway git
+`pytest tests/`, 411 tests, no network. The engine's graph runs against real throwaway git
 repositories with a scripted model; the merge gate and the guard against a local bare remote; the
 health check and the canary on recorded shapes of the API. A test enumerates the terminal states and
 fails if one of them hands work to a person.
