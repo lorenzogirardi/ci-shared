@@ -27,9 +27,9 @@ merged · abandoned · reverted        + warnings and every role's verdict visib
 
 | Thing | State |
 |---|---|
-| `ci-shared` `main` and `v3` (what every consumer runs) | equal after every release; check with `git fetch --tags -f origin && git rev-parse origin/main v2^{commit}` |
+| `ci-shared` `main` and `v3` (what every consumer runs) | equal after every release; check with `git fetch --tags -f origin && git rev-parse origin/main v3^{commit}` |
 | Seen on the consumer on 2026-10-11/12 | a real change to the app through the whole graph, merged with no person in 6 minutes (flask #302); two changes to workflow files merged by the agents (flask #306, #307); the canary with one pull request (flask #305) |
-| The dependency bot | one engine since 2026-10-13: the graph reviews, repairs and merges its pull requests; the sweep is deleted (ci-shared #69, #70, flask #326). Seen: a bot's pull request reviewed and merged by the graph (flask #313). Not seen: one with red checks repaired by the graph |
+| The dependency bot | one engine since 2026-10-13: the graph reviews, repairs and merges its pull requests; the sweep is being removed (ci-shared #69, #70, flask #326), and `scripts/pr_review_sweep.py` and `tests/test_pr_review_sweep.py` are still present in this tree until the removal lands. Seen: a bot's pull request reviewed and merged by the graph (flask #313). Not seen: one with red checks repaired by the graph |
 | **The night of 2026-10-13** | see the section "2026-10-13" below: the tag `v3`, an image update that stopped the agents, two interpreters in the agents' job, the canary failing twice for a missing test |
 | **The architect-first graph** | released on 2026-10-12 21:20 UTC (`62b6f7f`), pushed to `main` with no pull request by the owner's decision. Its first real run is the release canary, flask #314: the architect named the planted defect in its brief, the developer fixed it, QA added tests, certified in about two minutes. See the section below |
 | The model key | its monthly limit was reached on 2026-10-11 and every pull request was abandoned until the owner raised it; the comment said "the test steward could not produce a usable answer", the cause was only in the log. A commit abandoned for that is not tried again without a new push |
@@ -84,7 +84,7 @@ A warning the runs raised and nothing acts on: `mcp` 2 refuses requests whose Ho
 | A base-image update with green checks stopped every agent job | flask #316: Python 3.15, repaired and merged by the sweep; a library of the engine (`ormsgpack`, for LangGraph) has no build for 3.15, and the job ran on the Dockerfile's Python | flask went back to 3.14 (#319). The agents' job installs two interpreters, the engine's own (3.13) and the application's (#65, #67). Tried before release on flask #322, against a throwaway base branch, with the image on 3.15 |
 | The release canary failed twice for the same reason | flask #320, #323: the pull request adds a function, the brief asked for no test, QA answered "covered" | a function a change adds that no test names is a fact computed from the diff: the brief asks for its test whatever the architect wrote, and QA that answers "covered" is asked once more (#66, #68). `v3` did not move either time: the gate held |
 | An agents' run of this repository ended at its 15 minutes | ci-shared #65, first attempt: the second developer found three real defects, the developer was fixing them, time ran out | corrected by hand and pushed again; merged. The budget and the 70 seconds of this repository's checks are a tight fit |
-| The second engine | | removed in three steps (ci-shared #69, flask #326, ci-shared #70): 2,474 lines deleted here |
+| The second engine | | being removed in three steps (ci-shared #69, flask #326, ci-shared #70): 2,474 lines to delete, and `scripts/pr_review_sweep.py` and `tests/test_pr_review_sweep.py` are still present in this tree until the removal lands |
 
 A change to a reusable workflow file is not exercised by the canary: the consumer pins the workflow at
 the tag, and the candidate mode only changes which scripts are checked out. It is tried first on the
