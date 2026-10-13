@@ -1,5 +1,6 @@
 """Strictness of everything that turns model text into an action."""
 
+import os
 import pathlib
 import subprocess
 import sys
@@ -313,7 +314,7 @@ class TestArchitectTools:
 
         class Dist:
             metadata = {"Name": "somelib"}
-        monkeypatch.setattr(lib.importlib.metadata, "distributions", lambda: [Dist()])
+        monkeypatch.setattr(lib, "_distributions", lambda: [Dist()])
         asked = []
 
         def fetch(url):
@@ -340,3 +341,65 @@ class TestArchitectTools:
     def test_a_page_on_a_private_address_is_never_fetched(self, monkeypatch):
         monkeypatch.setattr(lib.socket, "getaddrinfo", lambda host, port: [(2, 1, 6, "", ("10.0.0.5", 443))])
         assert lib.fetch_page("https://docs.somelib.example/") is None
+
+
+class TestTheApplicationHasItsOwnInterpreter:
+    """flask-test-api #316: the image moved to a Python a library of the engine has no build for, and with
+    one interpreter for both no agent job could start. The engine runs on its own; what runs or reads the
+    application uses the application's."""
+
+    @pytest.fixture
+    def app(self, tmp_path, monkeypatch):
+        """A stand-in for another interpreter: a folder with a `python`, and libraries of its own."""
+        import pr_review_sweep as sweep
+        home = tmp_path / "app-python"
+        site = home / "lib" / "site-packages"
+        (site / "onlyintheapp" / "sub").mkdir(parents=True)
+        (site / "onlyintheapp" / "__init__.py").write_text("from .sub.thing import Thing\n")
+        (site / "onlyintheapp" / "sub" / "__init__.py").write_text("")
+        (site / "onlyintheapp" / "sub" / "thing.py").write_text("class Thing:\n    def __init__(self, size: int):\n        pass\n")
+        meta = site / "onlyintheapp-2.0.dist-info"
+        meta.mkdir()
+        (meta / "METADATA").write_text("Metadata-Version: 2.1\nName: onlyintheapp\nVersion: 2.0\nProject-URL: Documentation, https://docs.onlyintheapp.example/\n")
+        (home / "bin").mkdir()
+        exe = home / "bin" / "python"
+        exe.write_text("#!/bin/sh\n")
+        monkeypatch.setenv(sweep.APP_PYTHON_ENV, str(exe))
+        monkeypatch.setitem(sweep._app_paths, str(exe), {"purelib": str(site), "platlib": str(site)})
+        return home
+
+    def test_with_no_other_interpreter_named_nothing_changes(self, monkeypatch):
+        import pr_review_sweep as sweep
+        monkeypatch.delenv(sweep.APP_PYTHON_ENV, raising=False)
+        assert lib.app_python() == sys.executable and lib.app_env({"PATH": "/usr/bin"}) == {"PATH": "/usr/bin"}
+
+    def test_the_checks_find_the_applications_python_first(self, app, monkeypatch):
+        monkeypatch.setenv("PATH", "/usr/bin")
+        monkeypatch.setenv("pythonLocation", "/engine")
+        env = lib.scrubbed_env()
+        assert env["PATH"].split(os.pathsep)[0] == str(app / "bin") and "/usr/bin" in env["PATH"]
+        assert env["LD_LIBRARY_PATH"].split(os.pathsep)[0] == str(app / "lib") and "pythonLocation" not in env
+
+    def test_its_libraries_are_read_by_name_and_never_imported(self, app, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        assert "onlyintheapp" not in sys.modules
+        assert "class Thing" in lib.explore("read", "onlyintheapp.sub.thing")
+        assert "def __init__(self, size: int)" in lib.explore("signature", "onlyintheapp.Thing")      # followed from the package
+        about = lib.tool_docs("onlyintheapp", fetch=lambda url: None, release_notes=lambda *a: "", guides=lambda *a: [])
+        assert "version 2.0" in about and "https://docs.onlyintheapp.example/" in about
+        assert lib._page_allowed("https://docs.onlyintheapp.example/migration")
+        assert "onlyintheapp" not in sys.modules
+
+    def test_the_import_check_is_shown_the_applications_libraries_last(self, app):
+        hook = lib._lint_sees_the_app()
+        assert len(hook) == 1 and hook[0].startswith("--init-hook=import sys; sys.path.extend(") and "site-packages" in hook[0]
+
+    def test_a_test_is_run_by_the_applications_python(self, app, tmp_path, monkeypatch):
+        seen = {}
+
+        def run(cmd, **kw):
+            seen["cmd"], seen["env"] = cmd, kw["env"]
+            return subprocess.CompletedProcess(cmd, 0, "1 passed", "")
+        monkeypatch.setattr(lib.subprocess, "run", run)
+        assert lib.run_pytest(["tests/test_x.py"], tmp_path)[0] == "pass"
+        assert seen["cmd"][0] == str(app / "bin" / "python") and seen["env"]["PATH"].startswith(str(app / "bin"))
