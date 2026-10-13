@@ -24,7 +24,6 @@ ci-shared/
 │   ├── reusable_agent-change.yml      review, repair, certify a pull request or a push (the engine)
 │   ├── reusable_agent-merge.yml       merge gate: certified and green on the same commit
 │   ├── reusable_agent-main-guard.yml  base branch red after a merge: re-run once, then revert
-│   ├── reusable_pr-review-sweep.yml   dependency-bot pull requests: review, repair, merge
 │   ├── reusable_pipeline-health.yml   the loop checks itself (no model)
 │   ├── reusable_pipeline-canary.yml   known changes through the real loop, outcome checked
 │   ├── reusable_changelog.yml         deterministic changelog entry
@@ -41,7 +40,7 @@ ci-shared/
 ├── scripts/
 │   ├── agent_pipeline.py    the engine: a LangGraph state machine, and the commands around it
 │   ├── agent_lib.py         parsing, patches, guards, evidence, isolated verification
-│   ├── pr_review_sweep.py   the dependency sweep, and helpers the engine reuses
+│   ├── pr_review_sweep.py   what is left of the dependency sweep: helpers the engine uses
 │   ├── pipeline_health.py   the health check
 │   ├── pipeline_canary.py   the canary
 │   ├── openrouter_ai.py     the model client
@@ -166,10 +165,10 @@ checkpoints yet: the agents' commits are on disk, not in them.
 
 ### The older path
 
-The issue flow (`reusable_agent-pipeline.yml`, out of use) and the dependency sweep still build the
+The issue flow (`reusable_agent-pipeline.yml`, out of use) still builds the
 graph without the architect: `start` goes to `write` or `verify`, the reviewers run as one step, and a
-run that does not converge is tried a second time with twice the budget (`invoke_with_retry`). It goes
-when the sweep does.
+run that does not converge is tried a second time with twice the budget (`invoke_with_retry`). It is
+kept for the issue entry, which the owner has left for later.
 
 ### How an agent's reply is used
 
@@ -275,39 +274,22 @@ flowchart LR
     CERT --> MG{merge gate}
     CI[required checks green on the same commit] --> MG
     MG -->|yes| MERGED[squash merge with the push token]
-    BOT[dependency-bot PR] --> SW[review sweep]
-    SW -->|clean and green| MERGED
     MERGED --> PIPE[pipeline on the base branch]
     PIPE -->|fails| GUARD[main guard]
     GUARD --> RERUN[re-run failed jobs once]
     RERUN -->|fails again| REVERT[revert to last green, tell the PR]
 ```
 
-## The dependency sweep
+## The dependency bot's pull requests
 
-`pr_review_sweep.py` handles the pull requests of a dependency bot. It is a second engine, to be reduced
-to asking for a rebase: a consumer's caller for `mode: pr` may leave those pull requests to it, or have
-the graph review them too (flask-test-api does since 2026-10-12, with the sweep still merging). For each
-open pull request of the configured authors:
+They go through the graph like any other: reviewed and certified by `reusable_agent-change.yml`
+(`mode: pr`), repaired from the failing logs when their checks are red (`mode: ci`), merged by the
+gate. The sweep that used to do this (`pr_review_sweep.py`, a second engine, with its own review,
+triage, repair and merge) was removed on 2026-10-13; the file keeps the helpers the engine imports.
 
-1. **Behind the base branch** (counted from the commits through the compare API, ignoring bookkeeping
-   commits): the bot is asked to rebase its own branch (label `rebase`), and the pull request is
-   judged after its CI has run on current code.
-2. **Touches `.github/workflows/`** (`workflow_prs_to_bot`): abandoned if its checks are red on
-   current code. Otherwise it is reviewed like any other (steps 3 and 4) and the agents repair what
-   is outside the workflow files; only the merge is left to the bot's own automerge, which has the
-   permission. The verdict is written as the commit status `agent-review` (pending, success,
-   failure), so the bot, which merges only when every check is green, waits for it.
-3. **CI red**: the engine is started at `ci_failure` with the failing logs, with guidance for a
-   dependency migration (fix the call site rather than the pin; grep for every use of a renamed
-   symbol). The push token is taken out of `.git/config` while the pull request's code runs.
-4. **CI green**: the reviewers judge the diff with the results of the deterministic checks of that
-   commit as evidence. A blocking finding goes to the writer loop (`fix_findings`); a clean verdict
-   merges.
-5. `max_autofix_commits` automatic fixes in a row that did not help: abandoned and closed.
-
-Each pull request has one comment, updated in place, with the reviewed commit and the verdict, so a
-sweep that finds nothing new costs nothing.
+Seen: a bot's pull request reviewed and merged by the graph (the consumer's #313). Not seen yet: one
+with red checks repaired by the graph. The last one of that kind (#316, a base image) was repaired by
+the sweep while the graph could not start, which is what gave the agents' job its own Python.
 
 ## Who watches the loop
 
@@ -369,10 +351,10 @@ These are the reasons behind choices that otherwise look arbitrary.
   rewrite the CI that controls it cannot be left alone. Merging a certified, green change to them is
   another matter: until 2026-10-11 the merge gate refused it and a person merged; it now merges it with
   the push token, when the owner has given that token the permission.
-- **A `pull_request` run for a bot author gets a read-only token and no secrets.** That is why the
-  dependency sweep is triggered by CI completion, pushes and a schedule, never by the bot's own
-  `pull_request` event. Whether it still holds for the graph's own run on such a pull request is not
-  verified: the consumer's next pull request from the bot shows it.
+- **A `pull_request` run for a bot author was given a read-only token and no secrets** when this was
+  built, which is why a scheduled sweep once handled the dependency bot. It no longer held on
+  2026-10-12: the graph's own run on the bot's pull request had the secrets and a token that writes
+  (the consumer's #313).
 - **A reusable workflow cannot be granted more than its caller grants, and a caller that grants less
   does not start.** When a change here needs a new permission, the callers are updated first.
 - **Inside a reusable workflow there is no context for "the ref this file was fetched at"**
@@ -402,7 +384,7 @@ These are the reasons behind choices that otherwise look arbitrary.
 
 ## Tests
 
-`pytest tests/`, about 490 tests, no network. The engine's graph runs against real throwaway git
+`pytest tests/`, 411 tests, no network. The engine's graph runs against real throwaway git
 repositories with a scripted model; the merge gate and the guard against a local bare remote; the
 health check and the canary on recorded shapes of the API. A test enumerates the terminal states and
 fails if one of them hands work to a person.
