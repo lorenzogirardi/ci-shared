@@ -179,7 +179,9 @@ class TestLoop:
         assert "hello, world" in diff and "def other" not in diff               # the correction, not the whole change
         assert "def other" in whole                                             # read in the file it touches, shown whole
         assert "returns the wrong greeting" in second                           # and what it was asked to fix
-        assert [r for r, _ in caller.log].count("test-steward") == 1            # the tests were judged once
+        # The tests were judged once, after the pair: two calls of one judgement, since no test names what
+        # the change adds and the steward that answers "covered" is asked a second time.
+        assert [r for r, _ in caller.log].count("test-steward") == 2
 
     def test_a_fix_the_developer_agent_cannot_write_does_not_end_a_change_that_works(self, repo):
         caller = FakeCaller({
@@ -504,6 +506,13 @@ class TestTheCloseSendsBackWhatWasNotDone:
         assert "requirements.txt: add `lib==1`" in asked and "ARCHITECT'S INSTRUCTIONS" in asked
         assert roles.count("reviewer-correctness") == 1          # the added piece is checked, not reviewed all over again
         assert final["story"] == ["The developer added the greeting and pinned the library."]
+
+    def test_a_new_function_no_test_names_puts_its_test_in_the_brief_whatever_the_architect_said(self, pr_repo):
+        caller = self.caller(**{"architect-close": [self.DONE]})          # the brief says: no test needed
+        final, _ = self.run(caller, pr_repo)
+        tests = final["plan"]["brief"]["tests"]
+        assert tests["needed"] is True and any("greeting (greet.py)" in w for w in tests["what"])
+        assert "named by no test file" in [u for r, u in caller.log if r == "architect"][0]
 
     def test_it_is_asked_once_and_what_still_lacks_is_reported(self, pr_repo):
         pin = fence({"explanation": "pin the library", "changes": [{"file": "requirements.txt", "content": "lib==1\n"}]})

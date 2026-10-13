@@ -400,6 +400,39 @@ class TestProactiveSteward:
         _, final = run(repo, caller, "docs: readme")
         assert final["outcome"] == "converged" and "test-steward" not in [r for r, _ in caller.log]
 
+    def test_a_new_function_no_test_names_is_asked_for_a_second_time(self, repo):
+        """Release canaries of 2026-10-13 (the consumer's #320, #323): the pull request added a function, the
+        steward answered that the existing tests covered the change, and no test named the function."""
+        pathlib.Path("calc.py").write_text(GOOD + "\n\ndef sub(a, b):\n    return a - b\n")
+        commit_all("feat: add sub")
+        nothing = fence({"explanation": "the existing tests cover this change", "changes": []})
+        test = fence({"explanation": "sub is tested", "changes": [{"file": "tests/test_sub.py",
+                      "content": "from calc import sub\n\n\ndef test_sub():\n    assert sub(3, 1) == 2\n"}]})
+        caller = FakeCaller({"test-steward": [nothing, test], **reviewers_ok()})
+        _, final = run(repo, caller, "feat: add sub")
+        asked = [user for role, user in caller.log if role == "test-steward"]
+        assert final["outcome"] == "converged" and pathlib.Path("tests/test_sub.py").is_file()
+        assert "named by no test file" in asked[0] and "- calc.py: sub" in asked[0]
+        assert "Your first answer added no test" in asked[1] and "calc.py: sub" in asked[1]
+
+    def test_a_second_nothing_is_its_answer_and_the_change_goes_on(self, repo):
+        pathlib.Path("calc.py").write_text(GOOD + "\n\ndef sub(a, b):\n    return a - b\n")
+        commit_all("feat: add sub")
+        nothing = fence({"explanation": "the existing tests cover this change", "changes": []})
+        caller = FakeCaller({"test-steward": [nothing], **reviewers_ok()})
+        _, final = run(repo, caller, "feat: add sub")
+        assert final["outcome"] == "converged" and [r for r, _ in caller.log].count("test-steward") == 2
+        assert any("it was asked once more" in n for n in final["notes"])
+
+    def test_a_change_whose_new_function_has_its_test_is_asked_once(self, repo):
+        pathlib.Path("calc.py").write_text(GOOD + "\n\ndef sub(a, b):\n    return a - b\n")
+        pathlib.Path("tests/test_sub.py").write_text("from calc import sub\n\n\ndef test_sub():\n    assert sub(3, 1) == 2\n")
+        commit_all("feat: add sub, with its test")
+        nothing = fence({"explanation": "the existing tests cover this change", "changes": []})
+        caller = FakeCaller({"test-steward": [nothing], **reviewers_ok()})
+        _, final = run(repo, caller, "feat: add sub, with its test")
+        assert final["outcome"] == "converged" and [r for r, _ in caller.log].count("test-steward") == 1
+
     def test_a_steward_that_deletes_tests_is_refused(self, repo):
         pathlib.Path("calc.py").write_text(GOOD + "\n\ndef sub(a, b):\n    return a - b\n")
         commit_all("feat: add sub")
