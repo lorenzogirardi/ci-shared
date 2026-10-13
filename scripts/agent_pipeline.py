@@ -721,6 +721,13 @@ def build_graph(rt: Runtime, checkpointer=None):
         brief = run_architect(rt, state["plan"], facts, state.get("close_reason", ""), so_far(state))
         if brief is None:
             return {**stop(state, "escalated", "the architect could not produce a usable brief, so nobody knew what to do"), "journal": seen}
+        if untested:
+            # A fact obliges, as the files touched oblige the roles: the architect may ask for more tests,
+            # not for none where a function it was told is new has no test that names it.
+            asked = " ".join(brief["tests"]["what"])
+            brief["tests"] = {"needed": True, "what": brief["tests"]["what"] + [
+                f"{u.split(': ', 1)[1]} ({u.split(': ', 1)[0]}): new in this change, and no test names it"
+                for u in untested if u.split(": ", 1)[1] not in asked]}
         plan = {**state["plan"], "brief": brief}
         notes = state.get("notes", []) + [f"architect: {brief['summary']}"]
         wrote = seen + entry("architect", "wrote the brief: " + brief["summary"], brief.get("facts", []))
@@ -1003,6 +1010,18 @@ def build_graph(rt: Runtime, checkpointer=None):
 
         notes = list(state.get("notes", []))
         applied, explanation, failure = usable_changes("test-steward", user, lib.is_test_path, not_weaker)
+        if applied is None and not failure and untested:
+            # It answered that the tests cover the change while no test names what the change adds (twice on
+            # the release canary). It is asked once more, with that said; a second "nothing" is its answer.
+            said = explanation or "the existing tests already cover this change"
+            applied, again, failure = usable_changes(
+                "test-steward", user + "\n\n## Your first answer added no test\nYou answered: " + said
+                + "\nNo test file contains the name of: " + "; ".join(untested) + ". A test that does not name a function "
+                "does not call it. Write the tests for them now, in a test file, following the conventions shown above.",
+                lib.is_test_path, not_weaker)
+            explanation = again or explanation
+            notes.append("QA first answered that the tests covered the change while no test named what it adds: "
+                         + "; ".join(untested) + "; it was asked once more")
         if failure:
             # The checks pass and nothing of the steward's was kept: the change goes on, and it is said that
             # nobody established whether it has the tests it needs.
