@@ -1924,11 +1924,12 @@ def is_abandoned(comments: list[dict], head_sha: str) -> bool:
 def cmd_merge_gate(args: argparse.Namespace) -> int:
     """Run the merge gate on one pull request, or (--pr 0) on every open one. The sweep over all of them
     is what makes the gate impossible to miss: whichever finishes first, certification or CI, and whatever
-    event is lost, the next push or the schedule picks it up. Renovate's PRs belong to the sweep."""
+    event is lost, the next push or the schedule picks it up. The dependency bot's are judged like any
+    other: the graph certifies them, and one engine merges (they used to be left to the sweep)."""
     numbers = [args.pr]
     if not args.pr:
         listed = gh_json([f"repos/{args.repo}/pulls?state=open&per_page=100"]) or []
-        numbers = [p["number"] for p in listed if not ((p.get("user") or {}).get("login") or "").lower().startswith("renovate")]
+        numbers = [p["number"] for p in listed]
     for number in numbers:
         log(f"PR #{number}: {merge_one(args, number)}")
     if not numbers:
@@ -2337,7 +2338,7 @@ def main() -> int:
 
     mg = sub.add_parser("merge-gate", help="merge a certified PR whose CI is green")
     mg.add_argument("--repo", required=True)
-    mg.add_argument("--pr", type=int, default=0, help="0 = every open pull request (except Renovate's)")
+    mg.add_argument("--pr", type=int, default=0, help="0 = every open pull request")
     mg.add_argument("--base-branch", default="main")
     mg.add_argument("--required-checks", default="")
     mg.add_argument("--merge-method", default="squash", choices=("merge", "squash", "rebase"))

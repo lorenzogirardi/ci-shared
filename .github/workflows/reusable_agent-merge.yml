@@ -16,7 +16,7 @@ on:
   workflow_call:
     inputs:
       pr_number:
-        description: 'The pull request to judge, or 0 for every open one except those of Renovate, which the sweep owns.'
+        description: 'The pull request to judge, or 0 for every open one, the dependency bot''s included.'
         required: false
         type: number
         default: 0
