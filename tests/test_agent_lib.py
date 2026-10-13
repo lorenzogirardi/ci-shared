@@ -309,12 +309,16 @@ class TestArchitectTools:
         assert "No earlier run on record" in lib.explore("runs", "app/other.py")
 
     def test_docs_reads_only_the_pages_a_library_names_for_itself(self, monkeypatch):
-        monkeypatch.setattr(lib, "_declared_urls", lambda name: ("2.0.0", {
-            "Documentation": "https://docs.somelib.example/", "Repository": "https://github.com/someone/somelib"}) if name == "somelib" else None)
+        import email.message
+        meta = email.message.Message()
+        for key, value in (("Name", "somelib"), ("Version", "2.0.0"), ("Project-URL", "Documentation, https://docs.somelib.example/"),
+                           ("Project-URL", "Repository, https://github.com/someone/somelib"), ("Project-URL", "Old, http://plain.example/")):
+            meta[key] = value
 
         class Dist:
-            metadata = {"Name": "somelib"}
-        monkeypatch.setattr(lib, "_distributions", lambda: [Dist()])
+            metadata = meta
+        scans = []
+        monkeypatch.setattr(lib, "_distributions", lambda: scans.append(1) or [Dist()])
         asked = []
 
         def fetch(url):
@@ -337,6 +341,9 @@ class TestArchitectTools:
             assert "cannot be read" in lib.tool_docs(refused, fetch=fetch)
         assert len(asked) == before
         assert "No installed library is named" in lib.tool_docs("not-installed-anywhere", fetch=fetch)
+        scans.clear()
+        assert lib._page_allowed("https://docs.somelib.example/x") and len(scans) == 1      # the libraries are read once per page
+        assert "http://plain.example/" not in lib.tool_docs("somelib", fetch=fetch, release_notes=lambda *a: "", guides=lambda *a: [])
 
     def test_a_page_on_a_private_address_is_never_fetched(self, monkeypatch):
         monkeypatch.setattr(lib.socket, "getaddrinfo", lambda host, port: [(2, 1, 6, "", ("10.0.0.5", 443))])
@@ -384,11 +391,28 @@ class TestTheApplicationHasItsOwnInterpreter:
         monkeypatch.chdir(tmp_path)
         assert "onlyintheapp" not in sys.modules
         assert "class Thing" in lib.explore("read", "onlyintheapp.sub.thing")
+        (tmp_path / "local").mkdir()
+        (tmp_path / "local" / "__init__.py").write_text("")
+        (tmp_path / "local" / "store.py").write_text("def save(item, *, retries: int = 2):\n    return True\n")
+        assert "def save" in lib.explore("read", "local.store")                # the repository's own modules, by name too
+        assert "def save(item, *, retries: int=2)" in lib.explore("signature", "local.store.save")
         assert "def __init__(self, size: int)" in lib.explore("signature", "onlyintheapp.Thing")      # followed from the package
         about = lib.tool_docs("onlyintheapp", fetch=lambda url: None, release_notes=lambda *a: "", guides=lambda *a: [])
         assert "version 2.0" in about and "https://docs.onlyintheapp.example/" in about
         assert lib._page_allowed("https://docs.onlyintheapp.example/migration")
         assert "onlyintheapp" not in sys.modules
+
+    def test_with_one_interpreter_every_installed_library_is_listed_as_before(self, monkeypatch):
+        import pr_review_sweep as sweep
+        monkeypatch.delenv(sweep.APP_PYTHON_ENV, raising=False)
+        seen = {}
+        monkeypatch.setattr(lib.importlib.metadata, "distributions", lambda **kw: seen.update(kw) or [])
+        assert lib._distributions() == [] and seen == {}       # no explicit path: wherever the interpreter looks
+
+    def test_a_virtual_environment_of_the_application_is_named(self, app, monkeypatch):
+        (app / "pyvenv.cfg").write_text("home = /usr\n")
+        monkeypatch.setenv("VIRTUAL_ENV", "/engine/venv")
+        assert lib.scrubbed_env()["VIRTUAL_ENV"] == str(app)
 
     def test_the_import_check_is_shown_the_applications_libraries_last(self, app):
         hook = lib._lint_sees_the_app()

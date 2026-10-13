@@ -301,7 +301,10 @@ def app_env(env: dict[str, str]) -> dict[str, str]:
     lib = str(pathlib.Path(folder).parent / "lib")
     out["LD_LIBRARY_PATH"] = lib + (os.pathsep + out["LD_LIBRARY_PATH"] if out.get("LD_LIBRARY_PATH") else "")
     for key in ("pythonLocation", "Python_ROOT_DIR", "Python3_ROOT_DIR", "VIRTUAL_ENV"):
-        out.pop(key, None)
+        out.pop(key, None)      # they name the engine's interpreter
+    home = pathlib.Path(folder).parent
+    if (home / "pyvenv.cfg").is_file():
+        out["VIRTUAL_ENV"] = str(home)
     return out
 
 
@@ -319,11 +322,11 @@ def readable_roots() -> list[pathlib.Path]:
 
 
 def module_file(dotted: str) -> pathlib.Path | None:
-    """The file of a module, found by its name under the application's libraries, without importing
-    anything: `a.b.c` is `a/b/c.py` or `a/b/c/__init__.py`. Importing would run the package's code in the
-    engine's interpreter, which may not be the one it was installed for."""
+    """The file of a module, found by its name in this repository and under the application's libraries,
+    without importing anything: `a.b.c` is `a/b/c.py` or `a/b/c/__init__.py`. Importing would run the
+    package's code in the engine's interpreter, which may not be the one it was installed for."""
     parts = dotted.split(".")
-    for root in readable_roots()[1:]:
+    for root in readable_roots():
         for candidate in (root.joinpath(*parts).with_suffix(".py"), root.joinpath(*parts, "__init__.py")):
             if candidate.is_file():
                 return candidate

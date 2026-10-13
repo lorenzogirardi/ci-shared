@@ -377,27 +377,36 @@ def _cut(text: str, limit: int = MAX_TOOL_CHARS) -> str:
 
 
 def _distributions() -> list:
-    """The libraries installed for the application: read from their metadata files, never imported."""
+    """The libraries installed for the application: read from their metadata files, never imported. With
+    one interpreter for the engine and the application, every place that interpreter looks, as before."""
+    if app_python() == sys.executable:
+        return list(importlib.metadata.distributions())
     paths = app_paths()
-    folders = [paths[k] for k in ("purelib", "platlib") if paths.get(k)]
-    return list(importlib.metadata.distributions(path=list(dict.fromkeys(folders)))) if folders else []
+    folders = list(dict.fromkeys(paths[k] for k in ("purelib", "platlib") if paths.get(k)))
+    return list(importlib.metadata.distributions(path=folders)) if folders else []
+
+
+def _name_of(meta) -> str:
+    return re.sub(r"[-_.]+", "-", str(meta.get("Name", "") or "")).lower()
+
+
+def _urls_of(meta) -> dict[str, str]:
+    """The https pages one distribution's metadata names for itself."""
+    urls = {}
+    for line in (meta.get_all("Project-URL") if hasattr(meta, "get_all") else None) or []:
+        label, _, url = line.partition(",")
+        if url.strip().startswith("https://"):
+            urls[label.strip()] = url.strip()
+    if str(meta.get("Home-page", "") or "").startswith("https://"):
+        urls.setdefault("Homepage", meta.get("Home-page"))
+    return urls
 
 
 def _declared_urls(package: str) -> tuple[str, dict[str, str]] | None:
     """The version of an installed distribution and the pages its own metadata names."""
     wanted = re.sub(r"[-_.]+", "-", package).lower()
-    meta = next((d.metadata for d in _distributions()
-                 if re.sub(r"[-_.]+", "-", d.metadata.get("Name", "") or "").lower() == wanted), None)
-    if meta is None:
-        return None
-    urls = {}
-    for line in meta.get_all("Project-URL") or []:
-        label, _, url = line.partition(",")
-        if url.strip().startswith("https://"):
-            urls[label.strip()] = url.strip()
-    if str(meta.get("Home-page", "")).startswith("https://"):
-        urls.setdefault("Homepage", meta["Home-page"])
-    return meta.get("Version", "?"), urls
+    meta = next((d.metadata for d in _distributions() if _name_of(d.metadata) == wanted), None)
+    return None if meta is None else (meta.get("Version", "?"), _urls_of(meta))
 
 
 def _github_repo(urls: dict[str, str]) -> str:
@@ -415,14 +424,12 @@ def _page_allowed(url: str) -> bool:
     if parsed.scheme != "https" or not parsed.hostname:
         return False
     host, path = parsed.hostname.lower(), parsed.path
-    for dist in _distributions():
-        declared = _declared_urls(dist.metadata.get("Name", "") or "")
-        if not declared:
-            continue
-        repo = _github_repo(declared[1])
+    for dist in _distributions():      # read once: each distribution's own pages, from its own metadata
+        urls = _urls_of(dist.metadata)
+        repo = _github_repo(urls)
         if repo and host in ("github.com", "raw.githubusercontent.com") and path.lower().startswith(f"/{repo.lower()}/"):
             return True
-        for known in declared[1].values():
+        for known in urls.values():
             known_host = (urllib.parse.urlparse(known).hostname or "").lower()
             if known_host == host and host not in ("github.com", "raw.githubusercontent.com", "pypi.org"):
                 return True
