@@ -282,7 +282,7 @@ class TestMergeEverythingOpen:
         assert ap.is_certified([cert(login="github-actions[bot]")], HEAD, {"owner", "github-actions[bot]"})
         assert not ap.is_certified([cert(login="github-actions[bot]")], HEAD, {"owner"})      # not trusted unless named
 
-    def test_pr_zero_judges_every_open_pr_except_renovates(self, monkeypatch):
+    def test_pr_zero_judges_every_open_pr_the_dependency_bots_too(self, monkeypatch):
         judged = []
 
         def fake_gh_json(args):
@@ -294,7 +294,7 @@ class TestMergeEverythingOpen:
         monkeypatch.setattr(ap, "gh_json", fake_gh_json)
         monkeypatch.setattr(ap, "merge_one", lambda args, n: judged.append(n) or "ok")
         assert ap.cmd_merge_gate(gate_args(pr=0)) == 0
-        assert judged == [5, 7]                                  # Renovate's PR belongs to the sweep
+        assert judged == [5, 6, 7]                               # one engine merges: the bot's are judged like any other
 
     def test_with_nothing_open_it_just_says_so(self, monkeypatch):
         monkeypatch.setattr(ap, "gh_json", lambda a: [])
