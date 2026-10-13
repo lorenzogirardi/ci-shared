@@ -714,6 +714,10 @@ def build_graph(rt: Runtime, checkpointer=None):
             log(f"deterministic checks (before the brief): {'passed' if ok else 'FAILED'}")
             facts = "The checks pass (dependencies, lint, tests, the application starts)." if ok else "The checks FAILED. Their output:\n" + output
         seen = entry("checks", "passed" if ok else "FAILED: " + output[-600:], fact=True) if rt.start != "review" else []
+        untested = lib.untested_new_functions(diff_since_base(rt.base_sha))
+        if untested:
+            facts += ("\n\nNew in this change and named by no test file (a fact, from the diff and the tests): "
+                      + "; ".join(untested) + ".")
         brief = run_architect(rt, state["plan"], facts, state.get("close_reason", ""), so_far(state))
         if brief is None:
             return {**stop(state, "escalated", "the architect could not produce a usable brief, so nobody knew what to do"), "journal": seen}
@@ -983,6 +987,11 @@ def build_graph(rt: Runtime, checkpointer=None):
         user = (f"## Mode\nPROACTIVE: decide whether the tests cover this change.\n\n## Stated intent\n{intent_text(state['plan'])}"
                 + ("\n\n## What the architect says the tests must check\n" + "\n".join(f"- {w}" for w in asked["what"]) if asked.get("what") else "")
                 + f"\n\n## Existing tests\n{lib.test_inventory()}\n\n## How tests are written in this repository\n{lib.test_conventions()}\n\n## Diff\n{diff_since_base(rt.base_sha)[:40000]}")
+        untested = lib.untested_new_functions(diff_since_base(rt.base_sha))
+        if untested:
+            user += ("\n\n## New in this change and named by no test file (a fact, from the diff and the tests)\n"
+                     + "\n".join(f"- {u}" for u in untested)
+                     + "\nThe existing tests cannot cover what they do not name: these need a test.")
         user += so_far(state)
         if state.get("tests_feedback"):
             user += ("\n\n## The tests you wrote last time FAILED against this change and were discarded\n"

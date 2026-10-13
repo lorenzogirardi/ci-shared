@@ -1345,6 +1345,32 @@ def discriminating(base_sha: str, files: list[str], timeout: int = 300) -> tuple
         subprocess.run(["git", "worktree", "remove", "--force", tmp], capture_output=True)
 
 
+def untested_new_functions(diff: str) -> list[str]:
+    """The functions and classes a change adds to application code whose name no test file mentions: a
+    fact from the diff and the test files, for the architect and the test steward. On a release canary
+    the architect's brief asked for no test and the steward found the change covered, while the function
+    the pull request added had none."""
+    added: list[tuple[str, str]] = []
+    removed: set[str] = set()
+    path = ""
+    for line in diff.split("\n"):
+        if line.startswith("+++ "):
+            path = line[6:] if line.startswith("+++ b/") else ""
+            continue
+        found = re.match(r"^([+-])\s*(?:async\s+def|def|class)\s+([A-Za-z]\w*)\b", line)
+        if not found or not is_source_path(path) or not path.endswith(".py"):
+            continue
+        (added.append((path, found.group(2))) if found.group(1) == "+" else removed.add(found.group(2)))
+    wanted = [(f, n) for f, n in dict.fromkeys(added) if n not in removed and not n.startswith("_")]
+    if not wanted:
+        return []
+    tests = "\n".join(pathlib.Path(f).read_text(errors="replace")
+                      for f in subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+                                              capture_output=True, text=True).stdout.split("\n")
+                      if f.endswith(".py") and is_test_path(f) and pathlib.Path(f).is_file())
+    return [f"{f}: {n}" for f, n in wanted if not re.search(rf"(?<![\w]){re.escape(n)}(?![\w])", tests)]
+
+
 def test_inventory(max_files: int = 60) -> str:
     """The test files and the test functions in them, so the steward knows what
     is already covered without reading every file."""

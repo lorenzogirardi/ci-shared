@@ -440,3 +440,33 @@ class TestTheApplicationHasItsOwnInterpreter:
         exe = str(app / "bin" / "python")
         monkeypatch.setitem(sweep._app_paths, exe, {**sweep._app_paths[exe], "syspath": [str(elsewhere)]})
         assert lib._declared_urls("editableonly") == ("1.0", {"Documentation": "https://docs.editableonly.example/"})
+
+
+class TestNewFunctionsWithNoTest:
+    """Release canary of 2026-10-13: a pull request added `below_limit`, the brief asked for no test and
+    the steward answered that the existing tests covered the change."""
+
+    DIFF = ("diff --git a/app/canary.py b/app/canary.py\n--- a/app/canary.py\n+++ b/app/canary.py\n@@ -1,4 +1,12 @@\n"
+            " def within_limit(value):\n-    return value <= 3\n+    return value < 3\n+\n+\n+def below_limit(value):\n+    return value < 3\n"
+            "+\n+\n+def _helper():\n+    pass\n+\n+\n+class Gauge:\n+    pass\n"
+            "diff --git a/tests/test_canary.py b/tests/test_canary.py\n--- a/tests/test_canary.py\n+++ b/tests/test_canary.py\n@@ -1 +1,2 @@\n+def added_in_a_test():\n+    pass\n")
+
+    @pytest.fixture(autouse=True)
+    def project(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_canary.py").write_text("from app.canary import within_limit\n\n\ndef test_limit():\n    assert within_limit(3)\n")
+        subprocess.run(["git", "init", "-q"], check=True)
+        self.tests = tmp_path / "tests"
+
+    def test_names_what_was_added_and_no_test_mentions(self):
+        assert lib.untested_new_functions(self.DIFF) == ["app/canary.py: below_limit", "app/canary.py: Gauge"]
+
+    def test_a_test_that_names_it_is_enough_even_before_it_is_committed(self):
+        (self.tests / "test_new.py").write_text("from app.canary import below_limit, Gauge\n")
+        assert lib.untested_new_functions(self.DIFF) == []
+
+    def test_a_function_only_changed_or_moved_is_not_new(self):
+        moved = self.DIFF.replace(" def within_limit(value):", "-def below_limit(value):\n def within_limit(value):")
+        assert lib.untested_new_functions(moved) == ["app/canary.py: Gauge"]
+        assert lib.untested_new_functions("") == []
