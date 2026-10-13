@@ -261,18 +261,76 @@ def build_context(history: list[str], budget: int = MAX_CONTEXT_CHARS) -> str:
 _DOTTED_MODULE_RE = re.compile(r"^[A-Za-z_][\w]*(\.[A-Za-z_][\w]*)*$")     # `mcp.server.x`, and a top-level package: `mcp`
 
 
+APP_PYTHON_ENV = "AGENT_APP_PYTHON"
+_app_paths: dict[str, dict[str, str]] = {}
+
+
+def app_python() -> str:
+    """The interpreter the APPLICATION runs on. The engine has its own: a library the engine needs had no
+    build for the Python an image moved to, and with one interpreter for both no agent job could start
+    (flask-test-api #316, Python 3.15). The job names the application's in AGENT_APP_PYTHON; without it
+    they are the same one, as in a local run."""
+    return os.environ.get(APP_PYTHON_ENV) or sys.executable
+
+
+def app_paths() -> dict[str, str]:
+    """Where the application's interpreter keeps its libraries, asked of that interpreter once."""
+    exe = app_python()
+    if exe == sys.executable:
+        return sysconfig.get_paths()
+    if exe not in _app_paths:
+        try:
+            done = subprocess.run([exe, "-c", "import json, sys, sysconfig; p = sysconfig.get_paths(); p['syspath'] = sys.path; print(json.dumps(p))"],
+                                  capture_output=True, text=True, timeout=30)
+            _app_paths[exe] = json.loads(done.stdout) if done.returncode == 0 else {}
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            _app_paths[exe] = {}
+    return _app_paths[exe]
+
+
+def app_env(env: dict[str, str]) -> dict[str, str]:
+    """`env`, with the application's interpreter first on PATH: `python`, `pip` and what pip installs
+    (pytest, flake8) are then the application's, whatever the engine runs on."""
+    exe = app_python()
+    if exe == sys.executable:
+        return env
+    folder = str(pathlib.Path(exe).parent)
+    out = dict(env)
+    out["PATH"] = folder + os.pathsep + out.get("PATH", "")
+    # An interpreter from the runner's tool cache finds its own shared library through this.
+    lib = str(pathlib.Path(folder).parent / "lib")
+    out["LD_LIBRARY_PATH"] = lib + (os.pathsep + out["LD_LIBRARY_PATH"] if out.get("LD_LIBRARY_PATH") else "")
+    for key in ("pythonLocation", "Python_ROOT_DIR", "Python3_ROOT_DIR", "VIRTUAL_ENV"):
+        out.pop(key, None)      # they name the engine's interpreter
+    home = pathlib.Path(folder).parent
+    if (home / "pyvenv.cfg").is_file():
+        out["VIRTUAL_ENV"] = str(home)
+    return out
+
+
 def readable_roots() -> list[pathlib.Path]:
     """Everywhere a read/find/grep/list request may look: this repo's
-    checkout, the interpreter's installed third-party packages, and its
-    standard library -- so a break rooted in stdlib behavior can be read
-    too, not just third-party dependencies."""
+    checkout, the installed third-party packages of the application's
+    interpreter, and its standard library -- so a break rooted in stdlib
+    behavior can be read too, not just third-party dependencies."""
     roots = [pathlib.Path.cwd().resolve()]
+    paths = app_paths()
     for key in ("purelib", "platlib", "stdlib", "platstdlib"):
-        try:
-            roots.append(pathlib.Path(sysconfig.get_paths()[key]).resolve())
-        except KeyError:
-            continue
+        if paths.get(key):
+            roots.append(pathlib.Path(paths[key]).resolve())
     return roots
+
+
+def module_file(dotted: str) -> pathlib.Path | None:
+    """The file of a module, found by its name in this repository and under the application's libraries,
+    without importing anything: `a.b.c` is `a/b/c.py` or `a/b/c/__init__.py`. Importing would run the
+    package's code in the engine's interpreter, which may not be the one it was installed for."""
+    parts = dotted.split(".")
+    for root in readable_roots():
+        for candidate in (root.joinpath(*parts).with_suffix(".py"), root.joinpath(*parts, "__init__.py")):
+            if candidate.is_file():
+                return candidate
+    return None
 
 
 def _parse_json_reply(text: str) -> dict | None:
@@ -439,13 +497,19 @@ def resolve_readable_path(path: str) -> pathlib.Path | None:
     traversal attempt is judged on where it actually lands, not on the
     string itself.
     """
-    if _DOTTED_MODULE_RE.match(path):
-        try:
-            spec = importlib.util.find_spec(path)
-        except (ImportError, ValueError, ModuleNotFoundError):
-            spec = None
-        if spec is not None and spec.origin and spec.origin not in ("built-in", "frozen"):
-            path = spec.origin
+    if _DOTTED_MODULE_RE.match(path) and not pathlib.Path(path).is_file():
+        found = module_file(path)
+        if found is None and app_python() == sys.executable:
+            # One interpreter for the engine and the application: what the name search misses (a
+            # namespace package, an editable install) the import machinery still finds.
+            try:
+                spec = importlib.util.find_spec(path)
+            except (ImportError, ValueError, ModuleNotFoundError):
+                spec = None
+            if spec is not None and spec.origin and spec.origin not in ("built-in", "frozen"):
+                found = pathlib.Path(spec.origin)
+        if found is not None:
+            path = str(found)
     try:
         target = pathlib.Path(path).resolve()
     except (OSError, ValueError):

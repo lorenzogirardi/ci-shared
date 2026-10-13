@@ -1,5 +1,6 @@
 """Strictness of everything that turns model text into an action."""
 
+import os
 import pathlib
 import subprocess
 import sys
@@ -308,12 +309,16 @@ class TestArchitectTools:
         assert "No earlier run on record" in lib.explore("runs", "app/other.py")
 
     def test_docs_reads_only_the_pages_a_library_names_for_itself(self, monkeypatch):
-        monkeypatch.setattr(lib, "_declared_urls", lambda name: ("2.0.0", {
-            "Documentation": "https://docs.somelib.example/", "Repository": "https://github.com/someone/somelib"}) if name == "somelib" else None)
+        import email.message
+        meta = email.message.Message()
+        for key, value in (("Name", "somelib"), ("Version", "2.0.0"), ("Project-URL", "Documentation, https://docs.somelib.example/"),
+                           ("Project-URL", "Repository, https://github.com/someone/somelib"), ("Project-URL", "Old, http://plain.example/")):
+            meta[key] = value
 
         class Dist:
-            metadata = {"Name": "somelib"}
-        monkeypatch.setattr(lib.importlib.metadata, "distributions", lambda: [Dist()])
+            metadata = meta
+        scans = []
+        monkeypatch.setattr(lib, "_distributions", lambda: scans.append(1) or [Dist()])
         asked = []
 
         def fetch(url):
@@ -336,7 +341,102 @@ class TestArchitectTools:
             assert "cannot be read" in lib.tool_docs(refused, fetch=fetch)
         assert len(asked) == before
         assert "No installed library is named" in lib.tool_docs("not-installed-anywhere", fetch=fetch)
+        scans.clear()
+        assert lib._page_allowed("https://docs.somelib.example/x") and len(scans) == 1      # the libraries are read once per page
+        assert "http://plain.example/" not in lib.tool_docs("somelib", fetch=fetch, release_notes=lambda *a: "", guides=lambda *a: [])
 
     def test_a_page_on_a_private_address_is_never_fetched(self, monkeypatch):
         monkeypatch.setattr(lib.socket, "getaddrinfo", lambda host, port: [(2, 1, 6, "", ("10.0.0.5", 443))])
         assert lib.fetch_page("https://docs.somelib.example/") is None
+
+
+class TestTheApplicationHasItsOwnInterpreter:
+    """flask-test-api #316: the image moved to a Python a library of the engine has no build for, and with
+    one interpreter for both no agent job could start. The engine runs on its own; what runs or reads the
+    application uses the application's."""
+
+    @pytest.fixture
+    def app(self, tmp_path, monkeypatch):
+        """A stand-in for another interpreter: a folder with a `python`, and libraries of its own."""
+        import pr_review_sweep as sweep
+        home = tmp_path / "app-python"
+        site = home / "lib" / "site-packages"
+        (site / "onlyintheapp" / "sub").mkdir(parents=True)
+        (site / "onlyintheapp" / "__init__.py").write_text("from .sub.thing import Thing\n")
+        (site / "onlyintheapp" / "sub" / "__init__.py").write_text("")
+        (site / "onlyintheapp" / "sub" / "thing.py").write_text("class Thing:\n    def __init__(self, size: int):\n        pass\n")
+        meta = site / "onlyintheapp-2.0.dist-info"
+        meta.mkdir()
+        (meta / "METADATA").write_text("Metadata-Version: 2.1\nName: onlyintheapp\nVersion: 2.0\nProject-URL: Documentation, https://docs.onlyintheapp.example/\n")
+        (home / "bin").mkdir()
+        exe = home / "bin" / "python"
+        exe.write_text("#!/bin/sh\n")
+        monkeypatch.setenv(sweep.APP_PYTHON_ENV, str(exe))
+        monkeypatch.setitem(sweep._app_paths, str(exe), {"purelib": str(site), "platlib": str(site)})
+        return home
+
+    def test_with_no_other_interpreter_named_nothing_changes(self, monkeypatch):
+        import pr_review_sweep as sweep
+        monkeypatch.delenv(sweep.APP_PYTHON_ENV, raising=False)
+        assert lib.app_python() == sys.executable and lib.app_env({"PATH": "/usr/bin"}) == {"PATH": "/usr/bin"}
+
+    def test_the_checks_find_the_applications_python_first(self, app, monkeypatch):
+        monkeypatch.setenv("PATH", "/usr/bin")
+        monkeypatch.setenv("pythonLocation", "/engine")
+        env = lib.scrubbed_env()
+        assert env["PATH"].split(os.pathsep)[0] == str(app / "bin") and "/usr/bin" in env["PATH"]
+        assert env["LD_LIBRARY_PATH"].split(os.pathsep)[0] == str(app / "lib") and "pythonLocation" not in env
+
+    def test_its_libraries_are_read_by_name_and_never_imported(self, app, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        assert "onlyintheapp" not in sys.modules
+        assert "class Thing" in lib.explore("read", "onlyintheapp.sub.thing")
+        (tmp_path / "local").mkdir()
+        (tmp_path / "local" / "__init__.py").write_text("")
+        (tmp_path / "local" / "store.py").write_text("def save(item, *, retries: int = 2):\n    return True\n")
+        assert "def save" in lib.explore("read", "local.store")                # the repository's own modules, by name too
+        assert "def save(item, *, retries: int=2)" in lib.explore("signature", "local.store.save")
+        assert "def __init__(self, size: int)" in lib.explore("signature", "onlyintheapp.Thing")      # followed from the package
+        about = lib.tool_docs("onlyintheapp", fetch=lambda url: None, release_notes=lambda *a: "", guides=lambda *a: [])
+        assert "version 2.0" in about and "https://docs.onlyintheapp.example/" in about
+        assert lib._page_allowed("https://docs.onlyintheapp.example/migration")
+        assert "onlyintheapp" not in sys.modules
+
+    def test_with_one_interpreter_every_installed_library_is_listed_as_before(self, monkeypatch):
+        import pr_review_sweep as sweep
+        monkeypatch.delenv(sweep.APP_PYTHON_ENV, raising=False)
+        seen = {}
+        monkeypatch.setattr(lib.importlib.metadata, "distributions", lambda **kw: seen.update(kw) or [])
+        assert lib._distributions() == [] and seen == {}       # no explicit path: wherever the interpreter looks
+
+    def test_a_virtual_environment_of_the_application_is_named(self, app, monkeypatch):
+        (app / "pyvenv.cfg").write_text("home = /usr\n")
+        monkeypatch.setenv("VIRTUAL_ENV", "/engine/venv")
+        assert lib.scrubbed_env()["VIRTUAL_ENV"] == str(app)
+
+    def test_the_import_check_is_shown_the_applications_libraries_last(self, app):
+        hook = lib._lint_sees_the_app()
+        assert len(hook) == 1 and hook[0].startswith("--init-hook=import sys; sys.path.extend(") and "site-packages" in hook[0]
+
+    def test_a_test_is_run_by_the_applications_python(self, app, tmp_path, monkeypatch):
+        seen = {}
+
+        def run(cmd, **kw):
+            seen["cmd"], seen["env"] = cmd, kw["env"]
+            return subprocess.CompletedProcess(cmd, 0, "1 passed", "")
+        monkeypatch.setattr(lib.subprocess, "run", run)
+        assert lib.run_pytest(["tests/test_x.py"], tmp_path)[0] == "pass"
+        assert seen["cmd"][0] == str(app / "bin" / "python") and seen["env"]["PATH"].startswith(str(app / "bin"))
+
+    def test_a_library_installed_outside_the_usual_folders_is_still_listed(self, app, tmp_path, monkeypatch):
+        """An editable or .pth-added install keeps its metadata outside purelib/platlib; the application
+        interpreter's own sys.path is scanned, as the no-argument form scans this one's, so it is found."""
+        import pr_review_sweep as sweep
+        elsewhere = tmp_path / "elsewhere"
+        meta = elsewhere / "editableonly-1.0.dist-info"
+        meta.mkdir(parents=True)
+        (meta / "METADATA").write_text("Metadata-Version: 2.1\nName: editableonly\nVersion: 1.0\n"
+                                       "Project-URL: Documentation, https://docs.editableonly.example/\n")
+        exe = str(app / "bin" / "python")
+        monkeypatch.setitem(sweep._app_paths, exe, {**sweep._app_paths[exe], "syspath": [str(elsewhere)]})
+        assert lib._declared_urls("editableonly") == ("1.0", {"Documentation": "https://docs.editableonly.example/"})

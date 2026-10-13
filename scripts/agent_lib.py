@@ -43,6 +43,9 @@ from pr_review_sweep import (
     apply_fix,
     find_matching_paths,
     grep_matching_lines,
+    app_env,
+    app_paths,
+    app_python,
     list_directory,
     parse_find_request,
     parse_grep_request,
@@ -373,20 +376,42 @@ def _cut(text: str, limit: int = MAX_TOOL_CHARS) -> str:
     return text if len(text) <= limit else text[:limit] + f"\n[cut here: {len(text) - limit} more characters]"
 
 
-def _declared_urls(package: str) -> tuple[str, dict[str, str]] | None:
-    """The version of an installed distribution and the pages its own metadata names."""
-    try:
-        meta = importlib.metadata.metadata(package)
-    except importlib.metadata.PackageNotFoundError:
-        return None
+def _distributions() -> list:
+    """The libraries installed for the application: read from their metadata files, never imported. With
+    one interpreter for the engine and the application, every place that interpreter looks, as before."""
+    if app_python() == sys.executable:
+        return list(importlib.metadata.distributions())
+    paths = app_paths()
+    # The application's whole import search path, not just purelib/platlib: an editable or .pth-added
+    # install keeps its metadata outside those two folders, and the no-argument form finds it because it
+    # walks sys.path. Scan the application interpreter's sys.path the same way.
+    folders = list(dict.fromkeys(p for p in paths.get("syspath", []) if p and os.path.isdir(p)))
+    if not folders:
+        folders = list(dict.fromkeys(paths[k] for k in ("purelib", "platlib") if paths.get(k)))
+    return list(importlib.metadata.distributions(path=folders)) if folders else []
+
+
+def _name_of(meta) -> str:
+    return re.sub(r"[-_.]+", "-", str(meta.get("Name", "") or "")).lower()
+
+
+def _urls_of(meta) -> dict[str, str]:
+    """The https pages one distribution's metadata names for itself."""
     urls = {}
-    for line in meta.get_all("Project-URL") or []:
+    for line in (meta.get_all("Project-URL") if hasattr(meta, "get_all") else None) or []:
         label, _, url = line.partition(",")
         if url.strip().startswith("https://"):
             urls[label.strip()] = url.strip()
-    if str(meta.get("Home-page", "")).startswith("https://"):
-        urls.setdefault("Homepage", meta["Home-page"])
-    return meta.get("Version", "?"), urls
+    if str(meta.get("Home-page", "") or "").startswith("https://"):
+        urls.setdefault("Homepage", meta.get("Home-page"))
+    return urls
+
+
+def _declared_urls(package: str) -> tuple[str, dict[str, str]] | None:
+    """The version of an installed distribution and the pages its own metadata names."""
+    wanted = re.sub(r"[-_.]+", "-", package).lower()
+    meta = next((d.metadata for d in _distributions() if _name_of(d.metadata) == wanted), None)
+    return None if meta is None else (meta.get("Version", "?"), _urls_of(meta))
 
 
 def _github_repo(urls: dict[str, str]) -> str:
@@ -404,14 +429,12 @@ def _page_allowed(url: str) -> bool:
     if parsed.scheme != "https" or not parsed.hostname:
         return False
     host, path = parsed.hostname.lower(), parsed.path
-    for dist in importlib.metadata.distributions():
-        declared = _declared_urls(dist.metadata.get("Name", "") or "")
-        if not declared:
-            continue
-        repo = _github_repo(declared[1])
+    for dist in _distributions():      # read once: each distribution's own pages, from its own metadata
+        urls = _urls_of(dist.metadata)
+        repo = _github_repo(urls)
         if repo and host in ("github.com", "raw.githubusercontent.com") and path.lower().startswith(f"/{repo.lower()}/"):
             return True
-        for known in declared[1].values():
+        for known in urls.values():
             known_host = (urllib.parse.urlparse(known).hostname or "").lower()
             if known_host == host and host not in ("github.com", "raw.githubusercontent.com", "pypi.org"):
                 return True
@@ -554,6 +577,17 @@ def tool_usages(name: str) -> str:
                 + (f"\n\nThe other {len(rest)}:\n" + "\n".join(rest) if rest else ""))
 
 
+def _lint_sees_the_app() -> list[str]:
+    """The import check runs on the engine's interpreter and reads the application's libraries: their
+    folders are added, last, to where it looks, so the check's own libraries stay the engine's. It reads
+    the application's; it does not import them."""
+    if app_python() == sys.executable:
+        return []
+    paths = app_paths()
+    folders = list(dict.fromkeys(paths[k] for k in ("purelib", "platlib") if paths.get(k)))
+    return [f"--init-hook=import sys; sys.path.extend({folders!r})"] if folders else []
+
+
 def tool_imports(value: str, run=subprocess.run) -> str:
     """Names that are imported and do not exist, and calls whose arguments do not fit: pylint, errors of
     those kinds only. It reads the code and the installed libraries; it runs neither."""
@@ -563,7 +597,7 @@ def tool_imports(value: str, run=subprocess.run) -> str:
     if not paths:
         return f"None of {value!r} is a tracked Python file or folder of this repository."
     try:
-        done = run([sys.executable, "-m", "pylint", "--disable=all", "--enable=E0611,E0401,E1123,E1120,E1101",
+        done = run([sys.executable, "-m", "pylint", *_lint_sees_the_app(), "--disable=all", "--enable=E0611,E0401,E1123,E1120,E1101",
                     "--score=n", "--reports=n", "--msg-template={path}:{line}: {msg}", *paths],
                    capture_output=True, text=True, timeout=180)
     except (OSError, subprocess.TimeoutExpired):
@@ -1064,7 +1098,7 @@ _SAFE_ENV = frozenset({
 def scrubbed_env() -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k in _SAFE_ENV or k.startswith("LC_")}
     env["CI"] = "true"
-    return env
+    return app_env(env)      # what runs the application's code runs on the application's interpreter
 
 
 def run_verify_isolated(command: str, timeout: int) -> tuple[bool, str]:
@@ -1220,7 +1254,7 @@ def run_pytest(args: list[str], cwd: str | pathlib.Path, timeout: int = 300) -> 
     """('pass' | 'fail' | 'absent' | 'skipped' | 'error', output) for one pytest
     invocation, in the same secret-free environment as the verify command."""
     try:
-        proc = subprocess.run([sys.executable, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider", *args],
+        proc = subprocess.run([app_python(), "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider", *args],
                               capture_output=True, text=True, timeout=timeout, cwd=str(cwd), env=scrubbed_env())
     except subprocess.TimeoutExpired:
         return "error", f"pytest exceeded {timeout}s"
