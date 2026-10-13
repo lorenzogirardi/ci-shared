@@ -145,6 +145,17 @@ shell and none runs the application's code (`lib.explore`, `lib.TOOL_KINDS`).
 The developer's requests go through the same function, so it is answered too; its prompt names only
 the reading ones.
 
+### Two interpreters in the agents' job
+
+The engine runs on its own Python (the version written in `reusable_agent-change.yml`); the
+application's checks run on the application's (the `FROM python:` line of the caller's Dockerfile, or
+the `python_version` input). The job installs both and names the application's in `AGENT_APP_PYTHON`.
+The engine puts it first on `PATH` for the verify command and for every pytest run (`lib.app_env`), and
+the look-ups read the application's libraries from their files and metadata, found by name and never
+imported (`module_file`, `_distributions`). With one interpreter for both, an image that moved to a
+Python a library of the engine had no build for left no agent job able to start (the consumer's #316).
+Without `AGENT_APP_PYTHON` the two are the same interpreter, as in a local run.
+
 ### The record of a run
 
 Every role writes what it did and found into the state (`journal`, a reducer channel); the next role
