@@ -1,6 +1,6 @@
 # Status — AI-native pipeline
 
-Written 2026-10-11 as a handoff and brought up to date on 2026-10-12 21:00 UTC: the work continues from another machine with no memory of
+Written 2026-10-11 as a handoff and brought up to date on 2026-10-13 09:30 UTC: the work continues from another machine with no memory of
 this session. Read `CLAUDE.md` first (intent, rules, tools, the 38 team actions), then this file.
 
 Engine: `lorenzogirardi/ci-shared` (tag `v3`, moved only by `release-tag.yml`; `v2` is frozen at `62b6f7f`).
@@ -27,9 +27,10 @@ merged · abandoned · reverted        + warnings and every role's verdict visib
 
 | Thing | State |
 |---|---|
-| `ci-shared` `main` and `v3` (what every consumer runs) | equal after every release; check with `git fetch --tags -f origin && git rev-parse origin/main v2^{commit}` |
+| `ci-shared` `main` and `v3` (what every consumer runs) | equal after every release; check with `git fetch --tags -f origin && git rev-parse origin/main v3^{commit}` |
 | Seen on the consumer on 2026-10-11/12 | a real change to the app through the whole graph, merged with no person in 6 minutes (flask #302); two changes to workflow files merged by the agents (flask #306, #307); the canary with one pull request (flask #305) |
-| The dependency bot | since flask #307 the graph reviews its pull requests too, next to the sweep. Seen on flask #313: reviewed and merged by the graph in 3 minutes, with two comments because both engines worked on it |
+| The dependency bot | one engine since 2026-10-13: the graph reviews, repairs and merges its pull requests; the sweep is being removed (ci-shared #69, #70, flask #326), and `scripts/pr_review_sweep.py` and `tests/test_pr_review_sweep.py` are still present in this tree until the removal lands. Seen: a bot's pull request reviewed and merged by the graph (flask #313). Not seen: one with red checks repaired by the graph |
+| **The night of 2026-10-13** | see the section "2026-10-13" below: the tag `v3`, an image update that stopped the agents, two interpreters in the agents' job, the canary failing twice for a missing test |
 | **The architect-first graph** | released on 2026-10-12 21:20 UTC (`62b6f7f`), pushed to `main` with no pull request by the owner's decision. Its first real run is the release canary, flask #314: the architect named the planted defect in its brief, the developer fixed it, QA added tests, certified in about two minutes. See the section below |
 | The model key | its monthly limit was reached on 2026-10-11 and every pull request was abandoned until the owner raised it; the comment said "the test steward could not produce a usable answer", the cause was only in the log. A commit abandoned for that is not tried again without a new push |
 | ci-shared #50 `feat/risk-level` | **closed by accident** on 2026-10-11 (the commit message of #58 said "resolved (#50": GitHub took it as a closing word). The branch is there. Not to be merged as it is: once the owner puts `risk-confirmed` on a pull request, every later commit merges without asking again. Step 4 of the plan |
@@ -75,22 +76,38 @@ key in the terminal that starts it, the session may not type it). In the pipelin
 A warning the runs raised and nothing acts on: `mcp` 2 refuses requests whose Host is not local, so
 `/api/mcp` may stop answering behind an ingress. Only the deploy check of the real pipeline can say.
 
+## 2026-10-13: what happened and what it changed
+
+| What | Seen in | What was done |
+|---|---|---|
+| The owner calls the architect-first graph version 3 | | `v3` is the tag that moves; `v2` is frozen at `62b6f7f`. The tags `v3` and `v3-next` were made by hand once, where `v2` was, so that the callers resolved from the first push (`46a6236`, flask #318) |
+| A base-image update with green checks stopped every agent job | flask #316: Python 3.15, repaired and merged by the sweep; a library of the engine (`ormsgpack`, for LangGraph) has no build for 3.15, and the job ran on the Dockerfile's Python | flask went back to 3.14 (#319). The agents' job installs two interpreters, the engine's own (3.13) and the application's (#65, #67). Tried before release on flask #322, against a throwaway base branch, with the image on 3.15 |
+| The release canary failed twice for the same reason | flask #320, #323: the pull request adds a function, the brief asked for no test, QA answered "covered" | a function a change adds that no test names is a fact computed from the diff: the brief asks for its test whatever the architect wrote, and QA that answers "covered" is asked once more (#66, #68). `v3` did not move either time: the gate held |
+| An agents' run of this repository ended at its 15 minutes | ci-shared #65, first attempt: the second developer found three real defects, the developer was fixing them, time ran out | corrected by hand and pushed again; merged. The budget and the 70 seconds of this repository's checks are a tight fit |
+| The second engine | | being removed in three steps (ci-shared #69, flask #326, ci-shared #70): 2,474 lines to delete, and `scripts/pr_review_sweep.py` and `tests/test_pr_review_sweep.py` are still present in this tree until the removal lands |
+
+A change to a reusable workflow file is not exercised by the canary: the consumer pins the workflow at
+the tag, and the candidate mode only changes which scripts are checked out. It is tried first on the
+consumer, in a pull request against a throwaway base branch (the merge gate only merges into `main`)
+whose caller points at the branch of this repository. flask #322 is the example.
+
+On flask #326 the agents put back a rule a person had removed on purpose (Renovate merging workflow
+updates by itself): the second developer argued that nobody else would merge them, since "the agents
+never touch workflow files". They do not write them; the gate merges them. The rule is as it was
+before; whether it stays is the owner's.
+
 ## Next actions, in order
 
-1. **Watch the new graph on real pull requests of the consumer**, and bring its `docs/13-agent-pipeline.md`
-   up to date. Not yet seen released: a dependency update with red checks, the architect's tools in use,
-   SRE and security side by side, the close sending work back, QA failing without ending a change.
-2. **Remove the sweep** once a dependency update with red checks is seen repaired by the released graph:
-   flask `renovate.json` (`rebaseWhen`, drop the workflow `automerge` rule), `agent-ci-failure.yml`
-   (drop the `renovate/` exclusion), delete `ai-review-sweep.yml`; here the Renovate exclusion in
-   `cmd_merge_gate`, `reusable_pr-review-sweep.yml`, the review part of `pr_review_sweep.py`,
-   `planner.md`, `reviewer-architect.md`, `invoke_with_retry`.
-3. **#50 (risk level).** Closed by accident, the branch is there. Fix the confirmation first: it must
+1. **Renovate will propose Python 3.15 again** (its hold is lifted). That pull request has red checks
+   until the image gets a compiler for `hiredis`: it is the first dependency update the graph has to
+   repair by itself. Watch it.
+2. **#50 (risk level).** Closed by accident, the branch is there. Fix the confirmation first: it must
    be bound to the commit that asked for it.
-4. **The consumer's release notes** (`release-notes.yml`): the one model call left outside the graph.
+3. **The consumer's release notes** (`release-notes.yml`): the one model call left outside the graph.
    The owner has not said whether it stays.
-5. Readable messages still to do: the canary's label and closing comment; awareness limited to what is
+4. Readable messages still to do: the canary's label and closing comment; awareness limited to what is
    new against the base.
+5. The time budget of a run against a repository whose checks are slow (this one): seen once, #65.
 6. Later, by the owner's choice: a subgraph for the developer pair; resuming from the checkpoints when
    `agents-run` is a bucket; the issue entry; interrupts for the risk level.
 7. Update the state column of the 38 actions in `CLAUDE.md` in each change that moves one.
@@ -225,12 +242,12 @@ How to look at a run:
 
 ## Not verified in a real run
 
-- The dependency bot waiting for the status `agent-review` before merging a workflow pull request.
-- A base-image update (`Dockerfile`, Python 3.15 when its image is published) taken to merge by the
-  agents alone.
+- A base-image update taken to merge by the graph alone (#316 was repaired by the sweep, since removed).
+- A dependency update with red checks repaired by the graph.
+- The close of the architect sending work back; QA failing without ending a change; `mode: ci` and
+  `mode: push` with two interpreters.
 - Trivy or TruffleHog reporting a finding (the image has no critical vulnerability, no secret was committed).
 - The fix pull request after a direct push to `main`.
-- A run actually ending at its 15-minute budget.
 - A change that goes on to be certified with a finding of the second developer left unresolved.
 - A change of behaviour made on purpose, where a test must be updated, since it left the canary.
 - The security role reporting the SBOM.
