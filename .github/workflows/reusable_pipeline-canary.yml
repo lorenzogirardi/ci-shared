@@ -26,7 +26,7 @@ on:
         default: false
     secrets:
       agent_push_token:
-        description: 'The same token the agents push with: pull requests opened with the job token start no workflow.'
+        description: 'The same token the agents push with: it pushes the canary branches and opens their pull requests, so their workflows start.'
         required: true
 
 permissions: {}
@@ -37,7 +37,7 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
-      pull-requests: write   # open and close the canary pull requests (the push token only pushes)
+      pull-requests: write   # close the canary pull requests (the push token opens them)
     steps:
       - uses: actions/checkout@v7
         with:

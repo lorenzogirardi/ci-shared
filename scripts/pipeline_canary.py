@@ -162,19 +162,14 @@ def open_scenario(repo: str, scenario: dict, base_branch: str, base_sha: str, ta
     if not push(f"HEAD:refs/heads/{branch}", token):
         return {"name": scenario["name"], "problems": [f"could not push {branch}: {LAST_PUSH_ERROR}"]}
     body = variant.get("body", "") + "\n\n_Opened by the pipeline canary; it is checked and closed automatically and never merged._"
-    # Opened with the job token (GH_TOKEN): the push token of the agents is not required to be able to open
-    # pull requests. A pull request opened that way starts no workflow, so the workflows are started by the
-    # push that follows, made with the push token.
+    # Opened with the push token, so the workflows start as they do for a person's pull request. Opened with
+    # the job token, GitHub held every workflow for an approval nobody gives, and each ended red with no job
+    # (every night on flask, e.g. run 38530741188); an empty commit pushed after it was what started them.
     made = run(["gh", "pr", "create", "--repo", repo, "--base", base_branch, "--head", branch,
-                "--title", variant["title"], "--body", body], check=False)
+                "--title", variant["title"], "--body", body], check=False, env={**os.environ, "GH_TOKEN": token})
     number = made.stdout.strip().rsplit("/", 1)[-1]
     if made.returncode != 0 or not number.isdigit():
         return {"name": scenario["name"], "branch": branch, "problems": [f"could not open the pull request: {made.stderr.strip()[:200]}"]}
-    git("-c", f"user.name={CANARY_AUTHOR}", "-c", "user.email=actions@github.com", "commit", "--quiet", "--allow-empty",
-        "-m", "chore: start the workflows on this pull request")
-    if not push(f"HEAD:refs/heads/{branch}", token):
-        return {"name": scenario["name"], "branch": branch, "pr": int(number), "expect": variant.get("expect", {}),
-                "problems": ["could not push the commit that starts the workflows"]}
     return {"name": scenario["name"], "branch": branch, "pr": int(number), "expect": variant.get("expect", {}), "problems": []}
 
 
@@ -206,7 +201,7 @@ def main() -> int:
 
     token = os.environ.get("AGENT_PUSH_TOKEN", "")
     if not token:
-        print("::error::AGENT_PUSH_TOKEN is not set: pull requests opened with the job token start no workflow.")
+        print("::error::AGENT_PUSH_TOKEN is not set: the canary pushes and opens its pull requests with it.")
         return 1
     config = json.loads(pathlib.Path(args.config).read_text())
     base = config.get("base", "main")
