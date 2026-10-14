@@ -185,11 +185,11 @@ Each consumer repo needs, in *Settings → Secrets and variables → Actions*:
   fixes and merges, so that the workflows of the branch it lands on start. Add
   *Workflows: read and write* for the merge gate to merge a change to
   `.github/workflows/` too; without it GitHub refuses that merge and such a
-  change waits for a person. No agent edits a workflow file either way. It does
-  not need to open pull requests: those are opened with the job's own token.
+  change waits for a person. No agent edits a workflow file either way. The
+  canary also opens its pull requests with it, so their workflows start.
 - *Settings → Actions → General → Workflow permissions*: **Allow GitHub
-  Actions to create and approve pull requests**, for the canary and for the
-  fix pull request after a direct push.
+  Actions to create and approve pull requests**, for the fix pull request
+  after a direct push.
 - For the canary: a small module nothing imports, its tests, and
   `.github/canary.json` describing the scenarios (edits to make, and what must
   be true afterwards). One pull request is opened per scenario, on every run

@@ -342,9 +342,10 @@ These are the reasons behind choices that otherwise look arbitrary.
   builds no image and leaves the guard blind. So fixes are pushed, and pull requests merged, with a
   separate push token (`AUTOFIX_PUSH_TOKEN`: Contents and Pull requests read/write, and Workflows
   read/write if changes to workflow files are to be merged with no person).
-- **A pull request opened with the job token starts no checks either.** The canary and the fix after a
-  direct push open the pull request with the job token (the push token is not required to be able to),
-  then push one commit with the push token, which starts them. The repository must allow Actions to
+- **A pull request opened with the job token starts no checks either.** GitHub holds its workflows for an
+  approval nobody gives, and they end red with no job. The canary opens its pull requests with the push
+  token, so they start as for a person's. The fix after a direct push still opens it with the job token,
+  then pushes one commit with the push token, which starts them. The repository must allow Actions to
   create pull requests.
 - **No token without the `workflow` permission can change `.github/workflows/`, a merge included.**
   The patch policy keeps every agent from editing those files (`validate_patch`): an agent that can

@@ -108,8 +108,8 @@ def failing_agent_workflows(runs: list[dict], names: tuple[str, ...], last_succe
 
 
 def never_started(run_: dict) -> bool:
-    """A pull request opened with the job token (the canary's, the agent's own fix) makes GitHub record a run
-    that fails at once without a single job; the real run is the one started by the push that follows. That
+    """A pull request opened with the job token (the agent's own fix after a direct push) makes GitHub record a
+    run that fails without a single job; the real run is the one started by the push that follows. That
     phantom is not an agent workflow failing."""
     return (run_.get("event") == "pull_request"
             and ((run_.get("triggering_actor") or run_.get("actor") or {}).get("login") == "github-actions[bot]"))
